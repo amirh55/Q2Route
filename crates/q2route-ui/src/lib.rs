@@ -1,8 +1,10 @@
-//! Q2Route desktop UI library: IPC client, views and settings.
+//! Q2Route desktop UI library: IPC client, views, settings and tray.
 
 pub mod app;
 pub mod client;
 pub mod settings;
+pub mod tray;
+pub mod tray_icon_render;
 pub mod views;
 
 /// Formats a byte rate: `512 B/s`, `120 KB/s`, `2.4 MB/s` (decimal units).

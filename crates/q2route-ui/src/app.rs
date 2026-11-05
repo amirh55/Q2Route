@@ -8,9 +8,10 @@ use tokio::sync::oneshot;
 
 use crate::client::Client;
 use crate::settings::UiSettings;
+use crate::tray::{Tray, TrayAction};
 use crate::views::{dashboard, placeholder, proxies::ProxiesView, settings as settings_view};
 
-/// How often the UI (and later the tray) refreshes from `Client::latest()`.
+/// How often the UI and the tray refresh from `Client::latest()`.
 pub const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,18 +83,53 @@ pub struct App {
     pub settings: UiSettings,
     pub requests: Requests,
     proxies: ProxiesView,
+    tray: Option<Tray>,
+    /// Set by the tray's Exit: the next close request is not turned into hide.
+    exiting: bool,
+    hide_on_start: bool,
+    /// True while we keep the window hidden in the tray.
+    hidden: bool,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, client: Client, settings: UiSettings) -> App {
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
+    /// `hidden` (`--minimized`): start in the tray. eframe always shows the
+    /// window after its first frame, so it is hidden again from the first
+    /// `logic` call; without a tray icon it stays visible.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        client: Client,
+        settings: UiSettings,
+        hidden: bool,
+    ) -> App {
+        let ctx = &cc.egui_ctx;
+        ctx.set_theme(egui::Theme::Dark);
+        let mut requests = Requests::default();
+        let tray = Tray::new(ctx)
+            .map_err(|e| requests.last_error = Some(format!("Tray icon: {e}")))
+            .ok();
         App {
             client,
             page: Page::Dashboard,
             settings,
-            requests: Requests::default(),
+            requests,
             proxies: ProxiesView::default(),
+            hide_on_start: hidden && tray.is_some(),
+            tray,
+            exiting: false,
+            hidden: false,
         }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn nav(&mut self, ui: &mut egui::Ui) {
@@ -114,8 +150,40 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
+        if std::mem::take(&mut self.hide_on_start) {
+            self.hide_window(ctx);
+        }
+        // A second instance shows us with ShowWindow behind winit's back;
+        // re-send Visible(true) so winit's own visibility flag matches again.
+        let shown = frame.winit_window().and_then(|w| w.is_visible());
+        if self.hidden && shown == Some(true) {
+            self.show_window(ctx);
+        }
+        let actions = match self.tray.as_mut() {
+            Some(tray) => {
+                tray.tick(self.client.latest().as_ref());
+                tray.poll()
+            }
+            None => vec![],
+        };
+        for a in actions {
+            match a {
+                TrayAction::Open => self.show_window(ctx),
+                TrayAction::Exit => {
+                    // Closes the UI only; the service keeps routing.
+                    self.exiting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                TrayAction::Send(r) => self.requests.send(&self.client, r),
+            }
+        }
+        let close = ctx.input(|i| i.viewport().close_requested());
+        if close && !self.exiting && self.settings.close_to_tray && self.tray.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
         ctx.request_repaint_after(REFRESH);
     }
 

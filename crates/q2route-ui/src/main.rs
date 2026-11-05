@@ -46,6 +46,7 @@ fn main() -> eframe::Result {
     if !single_instance() {
         return Ok(());
     }
+    let hidden = std::env::args().any(|a| a == "--minimized");
     let settings = UiSettings::load();
     let client = Client::connect(PIPE_NAME);
     let options = eframe::NativeOptions {
@@ -58,6 +59,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, client, settings)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, client, settings, hidden)))),
     )
 }
