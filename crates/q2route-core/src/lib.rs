@@ -2,8 +2,10 @@
 
 pub mod config;
 pub mod decide;
+pub mod ipc;
 pub mod matchers;
 pub mod peek;
 pub mod process_tree;
+pub mod proxy;
 pub mod ruleset;
 pub use config::*;
