@@ -8,4 +8,14 @@ name = "q2route"
 path = "src/main.rs"
 
 [dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 q2route-core = { path = "../q2route-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+toml = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security"] }
+
+[dev-dependencies]
+q2route-service = { path = "../q2route-service" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7"
