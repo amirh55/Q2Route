@@ -40,6 +40,8 @@ pub struct PktMeta {
     pub syn: bool,
     /// TCP RST.
     pub rst: bool,
+    /// TCP SYN+ACK (a local server answering an inbound connection).
+    pub syn_ack: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,19 @@ impl FlowCache {
         });
     }
 
+    /// A Socket-layer ACCEPT: a local server accepted `remote`. The flow is
+    /// Direct: the remote connected to the real IP, so replying from it
+    /// reveals nothing (otherwise the SYN-ACK would be decided as an
+    /// outgoing flow and dropped by a proxied catch-all).
+    pub fn on_accept(&self, local: SocketAddr, remote: SocketAddr) {
+        let id = FlowId {
+            proto: PROTO_TCP,
+            local,
+            remote,
+        };
+        self.put(id, true);
+    }
+
     /// Drops entries idle past [`TCP_CACHE_IDLE`] / [`UDP_CACHE_IDLE`].
     pub fn sweep(&self, now: Instant) {
         self.lock().retain(|id, e| {
@@ -216,8 +231,14 @@ pub fn classify(
         }
         PROTO_TCP => {
             // A non-Direct flow without a NAT entry is never sent; the app
-            // gets an RST so it fails fast (but an RST is never answered).
-            let stop = if m.rst { Action::Drop } else { Action::Reset };
+            // gets an RST so it fails fast. An RST is never answered, and a
+            // SYN-ACK whose ACCEPT event has not arrived yet is only dropped
+            // (its retransmit passes once the accept is cached as Direct).
+            let stop = if m.rst || m.syn_ack {
+                Action::Drop
+            } else {
+                Action::Reset
+            };
             match cache.get(&id) {
                 Some(true) => Action::Pass,
                 Some(false) if nat_has => Action::Redirect,
@@ -324,6 +345,7 @@ pub fn parse(p: &[u8]) -> Option<PktMeta> {
         },
         syn: flags & TCP_SYN != 0 && flags & TCP_ACK == 0,
         rst: flags & TCP_RST != 0,
+        syn_ack: flags & TCP_SYN != 0 && flags & TCP_ACK != 0,
     })
 }
 
@@ -423,6 +445,7 @@ mod tests {
             },
             syn,
             rst: false,
+            syn_ack: false,
         }
     }
     fn tcp(syn: bool) -> PktMeta {
@@ -710,6 +733,45 @@ mod tests {
         );
         assert_eq!(run(&u, &c, false, APP_PID, block(), &n), Action::Drop);
         assert_eq!(n.get(), 1, "re-decided under the new rules");
+    }
+
+    #[test]
+    fn accepted_inbound_flow_is_direct() {
+        // A local server accepted 8.8.8.8:40000 -> 192.168.1.5:8080; its
+        // replies (SYN-ACK, data) go direct: the remote already knows the IP.
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let local = "192.168.1.5:8080".parse().unwrap();
+        let remote = "8.8.8.8:40000".parse().unwrap();
+        c.on_accept(local, remote);
+        let syn_ack = PktMeta {
+            syn_ack: true,
+            ..meta(PROTO_TCP, "192.168.1.5:8080", "8.8.8.8:40000", false)
+        };
+        assert_eq!(run(&syn_ack, &c, false, APP_PID, proxy(), &n), Action::Pass);
+        let data = meta(PROTO_TCP, "192.168.1.5:8080", "8.8.8.8:40000", false);
+        assert_eq!(run(&data, &c, false, APP_PID, proxy(), &n), Action::Pass);
+        assert_eq!(n.get(), 0, "never decided as an outgoing flow");
+    }
+
+    #[test]
+    fn syn_ack_before_accept_event_is_dropped_not_reset() {
+        // The Socket-layer ACCEPT event can lag the SYN-ACK: drop it (it is
+        // retransmitted) rather than RST the server's new connection.
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let syn_ack = PktMeta {
+            syn_ack: true,
+            ..meta(PROTO_TCP, "192.168.1.5:8080", "8.8.8.8:40000", false)
+        };
+        assert_eq!(run(&syn_ack, &c, false, APP_PID, proxy(), &n), Action::Drop);
+        c.on_accept(syn_ack.flow.local, syn_ack.flow.remote);
+        assert_eq!(run(&syn_ack, &c, false, APP_PID, proxy(), &n), Action::Pass);
+    }
+
+    #[test]
+    fn parse_sets_syn_ack() {
+        assert!(parse(&build_v4_tcp(true, true)).unwrap().syn_ack);
+        assert!(!parse(&build_v4_tcp(true, false)).unwrap().syn_ack);
+        assert!(!parse(&build_v4_tcp(false, true)).unwrap().syn_ack);
     }
 
     #[test]

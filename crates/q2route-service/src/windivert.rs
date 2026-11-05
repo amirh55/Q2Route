@@ -284,6 +284,46 @@ extern "C" {
         addr: *mut Address,
         flags: u64,
     ) -> i32;
+    fn WinDivertHelperCompileFilter(
+        filter: *const c_char,
+        layer: u32,
+        object: *mut c_char,
+        obj_len: u32,
+        error_str: *mut *const c_char,
+        error_pos: *mut u32,
+    ) -> i32;
+}
+
+/// Validates `filter` for `layer` without opening a handle (no admin or
+/// driver needed). `Err` carries WinDivert's message and position.
+pub fn check_filter(filter: &str, layer: Layer) -> Result<(), String> {
+    let f = CString::new(filter).map_err(|_| "filter contains NUL".to_string())?;
+    let mut err: *const c_char = ptr::null();
+    let mut pos = 0u32;
+    // SAFETY: `f` is NUL-terminated and outlives the call; a null object
+    // buffer only validates; `err`/`pos` are valid out-pointers.
+    let ok = unsafe {
+        WinDivertHelperCompileFilter(
+            f.as_ptr(),
+            layer.raw(),
+            ptr::null_mut(),
+            0,
+            &mut err,
+            &mut pos,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let msg = if err.is_null() {
+        "invalid filter".to_string()
+    } else {
+        // SAFETY: WinDivert returns a pointer to a static NUL-terminated string.
+        unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Err(format!("{msg} at {pos}"))
 }
 
 /// An open WinDivert handle. Closed on drop.

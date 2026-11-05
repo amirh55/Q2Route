@@ -1,7 +1,8 @@
 //! WinDivert capture loops (dedicated OS threads, blocking recv).
 //!
 //! * Socket layer (sniff): CONNECT / BIND / CLOSE events feed the TCP and UDP
-//!   flow tables (pid lookup).
+//!   flow tables (pid lookup); TCP ACCEPT events mark inbound connections to
+//!   local servers Direct.
 //! * Network layer: every outbound, non-loopback TCP/UDP packet. Relay
 //!   replies (`A:relay_port -> D:pa`) are restored to the app; everything else
 //!   goes through [`classify`], which only ever passes Direct flows.
@@ -25,12 +26,12 @@ use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verd
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
 use crate::winapi;
 use crate::windivert::{
-    calc_checksums_addr, Address, Handle, EVENT_SOCKET_BIND, EVENT_SOCKET_CLOSE,
-    EVENT_SOCKET_CONNECT,
+    calc_checksums_addr, Address, Handle, EVENT_SOCKET_ACCEPT, EVENT_SOCKET_BIND,
+    EVENT_SOCKET_CLOSE, EVENT_SOCKET_CONNECT,
 };
 
-pub const SOCKET_FILTER: &str =
-    "((tcp or udp) and (event == CONNECT or event == CLOSE)) or (udp and event == BIND)";
+pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event == CLOSE)) \
+     or (udp and event == BIND) or (tcp and event == ACCEPT)";
 pub const NETWORK_FILTER: &str = "outbound and !loopback and (tcp or udp)";
 /// Threads receiving from the Network-layer handle.
 pub const NETWORK_THREADS: usize = 4;
@@ -114,6 +115,12 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>) {
         };
         match addr.event() {
             EVENT_SOCKET_CONNECT | EVENT_SOCKET_BIND => table.on_connect(&s),
+            // Inbound connection to a local server: the remote already
+            // knows the real IP, so its replies go direct.
+            EVENT_SOCKET_ACCEPT if s.protocol == PROTO_TCP => {
+                table.on_connect(&s);
+                run.cache.on_accept(s.local, s.remote);
+            }
             EVENT_SOCKET_CLOSE => {
                 table.on_close(&s);
                 // A new socket reusing this local port must not inherit
@@ -314,4 +321,17 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
         tracing::info!("flow {proto} pid={pid} exe={exe} dst={} {what}", f.remote);
     }
     (pid, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windivert::{check_filter, Layer};
+
+    #[test]
+    fn filters_compile() {
+        check_filter(SOCKET_FILTER, Layer::Socket).unwrap();
+        check_filter(NETWORK_FILTER, Layer::Network).unwrap();
+        assert!(check_filter("tcp and event == NOPE", Layer::Socket).is_err());
+    }
 }
