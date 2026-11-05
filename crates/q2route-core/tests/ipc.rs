@@ -89,6 +89,7 @@ async fn eof_and_bad_json() {
 
 #[test]
 fn pipe_name() {
-    assert_eq!(PIPE_NAME, r"\.\pipe\q2route");
+    assert_eq!(PIPE_NAME, r"\\.\pipe\q2route");
+    assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
     let _ = ProxyKind::Socks5;
 }

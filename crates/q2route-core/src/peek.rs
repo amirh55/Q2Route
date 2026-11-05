@@ -19,6 +19,8 @@ const HTTP_METHODS: [&[u8]; 9] = [
 /// Give up looking for the end of HTTP headers after this many bytes.
 const MAX_HTTP_HEAD: usize = 16 * 1024;
 
+/// Returns `NeedMore` until the whole first TLS record has arrived, so callers
+/// must bound the wait with their own timeout and buffer cap.
 pub fn peek_host(buf: &[u8]) -> PeekResult {
     match buf.first() {
         None => PeekResult::NeedMore,

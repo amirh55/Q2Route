@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PIPE_NAME: &str = r"\.\pipe\q2route";
+pub const PIPE_NAME: &str = r"\\.\pipe\q2route";
 /// Maximum accepted frame body (16 MiB).
 pub const MAX_MSG: usize = 16 * 1024 * 1024;
 
@@ -76,6 +76,8 @@ pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, m: &T) ->
     w.flush().await
 }
 
+/// Not cancel-safe: dropping the future mid-read loses framing. Do not use it
+/// directly inside `select!`; run it in a dedicated reader task.
 pub async fn read_msg<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let mut hdr = [0u8; 4];
     r.read_exact(&mut hdr).await?;
