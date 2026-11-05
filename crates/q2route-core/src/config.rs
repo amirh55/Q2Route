@@ -256,4 +256,57 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Apply `f` to a clone, validate, and commit only on success (rollback by construction).
+    fn mutate(&mut self, f: impl FnOnce(&mut Config) -> Result<(), ConfigError>) -> Result<(), ConfigError> {
+        let mut next = self.clone();
+        f(&mut next)?;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    fn group_mut<'a>(&'a mut self, id: &str) -> Result<&'a mut Group, ConfigError> {
+        self.groups
+            .iter_mut()
+            .find(|g| g.id == id)
+            .ok_or_else(|| ConfigError::Invalid(format!("unknown group '{id}'")))
+    }
+
+    pub fn set_group_action(&mut self, id: &str, a: Action) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            c.group_mut(id)?.action = a;
+            Ok(())
+        })
+    }
+
+    pub fn set_group_enabled(&mut self, id: &str, on: bool) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            c.group_mut(id)?.enabled = on;
+            Ok(())
+        })
+    }
+
+    /// Insert a proxy, or replace the one with the same id.
+    pub fn upsert_proxy(&mut self, p: ProxyProfile) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            match c.proxies.iter_mut().find(|x| x.id == p.id) {
+                Some(slot) => *slot = p,
+                None => c.proxies.push(p),
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete a proxy; fails if unknown or still referenced (validation catches references).
+    pub fn delete_proxy(&mut self, id: &str) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            let n = c.proxies.len();
+            c.proxies.retain(|p| p.id != id);
+            if c.proxies.len() == n {
+                return Err(ConfigError::Invalid(format!("unknown proxy '{id}'")));
+            }
+            Ok(())
+        })
+    }
 }

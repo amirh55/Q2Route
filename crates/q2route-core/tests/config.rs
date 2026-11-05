@@ -111,3 +111,59 @@ fn validate_rejects() {
     c.default_proxy = "nope".into();
     assert!(c.validate().is_err());
 }
+
+#[test]
+fn toggle_persists_across_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut c = Config::seed();
+    c.set_group_action("steam", Action::Proxy("v2ray".into())).unwrap();
+    c.set_group_enabled("steam", true).unwrap();
+    c.save(&path).unwrap();
+    let l = Config::load(&path).unwrap();
+    let steam = l.groups.iter().find(|g| g.id == "steam").unwrap();
+    assert_eq!(steam.action, Action::Proxy("v2ray".into()));
+    assert!(steam.enabled);
+}
+
+#[test]
+fn group_helpers_reject_unknown_and_roll_back() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    assert!(c.set_group_action("nope", Action::Direct).is_err());
+    assert!(c.set_group_enabled("nope", false).is_err());
+    assert!(c.set_group_action("steam", Action::Proxy("ghost".into())).is_err());
+    assert_eq!(c, before);
+}
+
+#[test]
+fn delete_proxy_in_use_fails() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    assert!(c.delete_proxy("v2ray").is_err());
+    assert_eq!(c, before);
+}
+
+#[test]
+fn upsert_and_delete_proxy() {
+    let mut c = Config::seed();
+    let p = ProxyProfile {
+        id: "alt".into(),
+        name: "Alt".into(),
+        kind: ProxyKind::Http,
+        host: "127.0.0.1".into(),
+        port: 8080,
+        username: None,
+        password: None,
+    };
+    c.upsert_proxy(p.clone()).unwrap();
+    assert_eq!(c.proxies.len(), 2);
+    let mut p2 = p;
+    p2.port = 9090;
+    c.upsert_proxy(p2).unwrap();
+    assert_eq!(c.proxies.len(), 2);
+    assert_eq!(c.proxies[1].port, 9090);
+    c.delete_proxy("alt").unwrap();
+    assert_eq!(c.proxies.len(), 1);
+    assert!(c.delete_proxy("alt").is_err());
+}
