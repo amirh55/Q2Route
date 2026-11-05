@@ -168,7 +168,94 @@ fn run_service() -> Result<()> {
     result
 }
 
+/// Windows Firewall rule letting reflected inbound connections reach the
+/// relay listener (LocalSystem service, random port, so no prompt appears).
+const FIREWALL_RULE: &str = "Q2Route relay";
+
+fn firewall_add_args(exe: &std::path::Path) -> Vec<String> {
+    vec![
+        "advfirewall".into(),
+        "firewall".into(),
+        "add".into(),
+        "rule".into(),
+        format!("name=\"{FIREWALL_RULE}\""),
+        "dir=in".into(),
+        "action=allow".into(),
+        format!("program=\"{}\"", exe.display()),
+        "enable=yes".into(),
+        "profile=any".into(),
+        "protocol=TCP".into(),
+    ]
+}
+
+fn firewall_delete_args() -> Vec<String> {
+    vec![
+        "advfirewall".into(),
+        "firewall".into(),
+        "delete".into(),
+        "rule".into(),
+        format!("name=\"{FIREWALL_RULE}\""),
+    ]
+}
+
+/// The command line as a user would type it (for warnings).
+fn netsh_line(args: &[String]) -> String {
+    format!("netsh {}", args.join(" "))
+}
+
+/// Runs netsh with `args` passed verbatim (netsh does its own `key="value"`
+/// parsing, so the arguments must not be re-quoted).
+fn netsh(args: &[String]) -> std::result::Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("netsh");
+    for a in args {
+        cmd.raw_arg(a);
+    }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} {}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Idempotent: deletes any old rule, then adds it. Never fails the install.
+fn add_firewall_rule(exe: &std::path::Path) {
+    let _ = netsh(&firewall_delete_args());
+    let add = firewall_add_args(exe);
+    match netsh(&add) {
+        Ok(()) => println!("firewall rule '{FIREWALL_RULE}' added"),
+        Err(e) => {
+            tracing::error!("cannot add firewall rule: {e}");
+            eprintln!(
+                "warning: cannot add the Windows Firewall rule ({e}).\n\
+                 Proxied traffic may be blocked. Run as administrator:\n  {}",
+                netsh_line(&add)
+            );
+        }
+    }
+}
+
+fn remove_firewall_rule() {
+    let del = firewall_delete_args();
+    match netsh(&del) {
+        Ok(()) => println!("firewall rule '{FIREWALL_RULE}' removed"),
+        Err(e) => {
+            tracing::error!("cannot remove firewall rule: {e}");
+            eprintln!(
+                "warning: cannot remove the Windows Firewall rule ({e}). Run as administrator:\n  {}",
+                netsh_line(&del)
+            );
+        }
+    }
+}
+
 fn install() -> Result<()> {
+    let exe = std::env::current_exe()?;
     let mgr = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -179,7 +266,7 @@ fn install() -> Result<()> {
         service_type: SERVICE_TYPE,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: std::env::current_exe()?,
+        executable_path: exe.clone(),
         launch_arguments: vec!["run".into()],
         dependencies: vec![],
         account_name: None, // LocalSystem
@@ -187,6 +274,8 @@ fn install() -> Result<()> {
     };
     let svc = mgr.create_service(&info, ServiceAccess::START | ServiceAccess::CHANGE_CONFIG)?;
     svc.set_description("Q2Route per-app traffic router")?;
+    // Before the start, so the relay is reachable from the first flow.
+    add_firewall_rule(&exe);
     svc.start::<&str>(&[])?;
     println!("service {SERVICE_NAME} installed and started");
     Ok(())
@@ -209,6 +298,7 @@ fn uninstall() -> Result<()> {
     }
     svc.delete()?;
     println!("service {SERVICE_NAME} removed");
+    remove_firewall_rule();
     Ok(())
 }
 
@@ -233,5 +323,27 @@ fn main() {
         eprintln!("error: {e}");
         tracing::error!("{cmd} failed: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_add_command() {
+        let exe = std::path::Path::new(r"C:\Program Files\Q2Route\q2route-service.exe");
+        assert_eq!(
+            netsh_line(&firewall_add_args(exe)),
+            r#"netsh advfirewall firewall add rule name="Q2Route relay" dir=in action=allow program="C:\Program Files\Q2Route\q2route-service.exe" enable=yes profile=any protocol=TCP"#
+        );
+    }
+
+    #[test]
+    fn firewall_delete_command() {
+        assert_eq!(
+            netsh_line(&firewall_delete_args()),
+            r#"netsh advfirewall firewall delete rule name="Q2Route relay""#
+        );
     }
 }
