@@ -286,6 +286,46 @@ fn sweep_expires_idle_entries() {
 }
 
 #[test]
+fn relay_attached_entry_is_never_idle_swept() {
+    let nat = nat_with_entry();
+    let t0 = Instant::now();
+    assert!(
+        nat.attach(50000, Ipv4Addr::new(9, 9, 9, 9)).is_none(),
+        "wrong ip"
+    );
+    let (o, token) = nat.attach(50000, DST).unwrap();
+    assert_eq!(o.dst, sa(DST, 443));
+    // A long-idle proxied connection keeps its entry while the relay holds it.
+    nat.sweep(t0 + IDLE_TIMEOUT + Duration::from_secs(3600));
+    assert!(nat.get(50000).is_some());
+    // The relay connection ends: the entry lingers, then goes.
+    nat.release(50000, token);
+    nat.sweep(Instant::now());
+    assert!(nat.get(50000).is_some(), "lingers for the final packets");
+    nat.sweep(Instant::now() + CLOSE_LINGER + Duration::from_secs(1));
+    assert!(nat.get(50000).is_none());
+}
+
+#[test]
+fn stale_release_does_not_touch_a_reused_port() {
+    let nat = nat_with_entry();
+    let (_, old) = nat.attach(50000, DST).unwrap();
+    // The app reuses the port for a new connection (new SYN, new entry).
+    nat.insert(
+        50000,
+        OriginalDst {
+            dst: sa(DST, 443),
+            pid: 4242,
+        },
+    );
+    let (_, new) = nat.attach(50000, DST).unwrap();
+    assert_ne!(old, new);
+    nat.release(50000, old);
+    nat.sweep(Instant::now() + CLOSE_LINGER + IDLE_TIMEOUT + Duration::from_secs(1));
+    assert!(nat.get(50000).is_some(), "new connection's entry kept");
+}
+
+#[test]
 fn malformed_packets_never_panic() {
     let nat = nat_with_entry();
     let good = tcp4(sa(APP, 50000), sa(DST, 443), SYN, b"data");

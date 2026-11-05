@@ -17,13 +17,16 @@ use q2route_core::config::Protocol;
 use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, MatchReason, Route};
 use q2route_core::process_tree::ProcessTree;
 
-use crate::classify::{classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP};
+use crate::classify::{
+    build_rst_to_app, classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP,
+};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{OrigDstLookup, RelayCtx};
 use crate::winapi;
 use crate::windivert::{
-    Address, Handle, EVENT_SOCKET_BIND, EVENT_SOCKET_CLOSE, EVENT_SOCKET_CONNECT,
+    calc_checksums_addr, Address, Handle, EVENT_SOCKET_BIND, EVENT_SOCKET_CLOSE,
+    EVENT_SOCKET_CONNECT,
 };
 
 pub const SOCKET_FILTER: &str =
@@ -73,11 +76,14 @@ impl RunState {
 pub struct NatLookup(pub Arc<NatTable>);
 
 impl OrigDstLookup for NatLookup {
-    fn lookup(&self, peer: SocketAddr) -> Option<OriginalDst> {
+    fn attach(&self, peer: SocketAddr) -> Option<(OriginalDst, u64)> {
         let SocketAddr::V4(peer) = peer else {
             return None;
         };
-        self.0.get(peer.port()).filter(|o| o.dst.ip() == peer.ip())
+        self.0.attach(peer.port(), *peer.ip())
+    }
+    fn release(&self, peer: SocketAddr, token: u64) {
+        self.0.release(peer.port(), token);
     }
 }
 
@@ -128,29 +134,67 @@ pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>) {
             Err(_) => return,
         };
         let pkt = &mut buf[..n];
-        if route_packet(pkt, &mut addr, &shared, &run) {
-            if let Err(e) = h.send(pkt, &addr) {
-                tracing::debug!("reinject failed: {e}");
+        match route_packet(pkt, &mut addr, &shared, &run) {
+            Out::Send => {
+                if let Err(e) = h.send(pkt, &addr) {
+                    tracing::debug!("reinject failed: {e}");
+                }
+            }
+            Out::Drop => {}
+            Out::ResetApp => {
+                // The packet itself is dropped; only an RST from the
+                // original destination goes back *inbound* to the app.
+                let Some(mut rst) = build_rst_to_app(pkt) else {
+                    continue;
+                };
+                let mut a = addr;
+                a.set_outbound(false);
+                calc_checksums_addr(&mut rst, &mut a);
+                if let Err(e) = h.send(&rst, &a) {
+                    tracing::debug!("rst inject failed: {e}");
+                }
             }
         }
     }
 }
 
-/// Decides one captured packet; may rewrite it (NAT). Returns whether to
-/// (re)inject it. Every `true` comes from: an inbound packet (never captured
-/// by the filter), a restored relay reply, a NAT-rewritten packet, or
-/// `classify` returning `Pass` (Direct flow / own socket).
-fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunState) -> bool {
+/// What to do with a captured packet.
+#[derive(Debug, PartialEq, Eq)]
+enum Out {
+    /// (Re)inject it (possibly rewritten).
+    Send,
+    Drop,
+    /// Drop it and inject an RST toward the app.
+    ResetApp,
+}
+
+impl From<bool> for Out {
+    fn from(send: bool) -> Out {
+        if send {
+            Out::Send
+        } else {
+            Out::Drop
+        }
+    }
+}
+
+/// Decides one captured packet; may rewrite it (NAT). Every `Send` comes
+/// from: an inbound packet (never captured by the filter), a restored relay
+/// reply, a NAT-rewritten packet, or `classify` returning `Pass` (Direct
+/// flow / own socket). `ResetApp` never sends the packet itself.
+fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunState) -> Out {
     if !addr.outbound() {
-        return true;
+        return Out::Send;
     }
     // Captured but not understood (e.g. odd IPv6 extension headers): drop
     // rather than risk passing a non-Direct flow.
-    let Some(m) = parse(pkt) else { return false };
+    let Some(m) = parse(pkt) else {
+        return Out::Drop;
+    };
     let f = m.flow;
     let tcp4 = f.proto == PROTO_TCP && f.local.is_ipv4();
     if tcp4 && f.local.port() == run.relay_port {
-        return restore_inbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten;
+        return (restore_inbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into();
     }
     // The relay's direct upstream sockets are IPv4 TCP only.
     let own_port = tcp4 && shared.relay.own_ports.contains(&f.local.port());
@@ -163,17 +207,25 @@ fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunSt
         decide_flow(shared, run, &f)
     });
     match action {
-        Action::Pass => true,
-        Action::Drop => false,
+        Action::Pass => Out::Send,
+        Action::Drop => Out::Drop,
+        Action::Reset => {
+            tracing::debug!(
+                "non-direct flow {} -> {} has no NAT entry: RST to app",
+                f.local,
+                f.remote
+            );
+            Out::ResetApp
+        }
         Action::NewRedirect { pid } => {
             let SocketAddr::V4(dst) = f.remote else {
-                return false;
+                return Out::Drop;
             };
             run.nat.insert(f.local.port(), OriginalDst { dst, pid });
-            redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten
+            (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
         Action::Redirect => {
-            redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten
+            (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
     }
 }

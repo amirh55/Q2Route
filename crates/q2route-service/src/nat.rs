@@ -12,8 +12,15 @@
 //! relay. An RST in either direction removes the entry immediately; once a
 //! FIN has been seen in both directions the entry lingers for
 //! [`CLOSE_LINGER`] so the final ACK (and FIN retransmits) are still
-//! redirected, then [`NatTable::sweep`] removes it. Idle entries expire after
-//! [`IDLE_TIMEOUT`]. The engine should call `sweep` periodically.
+//! redirected, then [`NatTable::sweep`] removes it. The engine should call
+//! `sweep` periodically.
+//!
+//! **The relay owns an entry's lifetime** once its connection has looked it
+//! up ([`NatTable::attach`]): such an entry is never idle-expired, however
+//! long the connection is quiet, and [`NatTable::release`] (called when the
+//! relay connection ends) starts the [`CLOSE_LINGER`]. Only entries no relay
+//! connection ever attached (e.g. a SYN that never reached the relay) expire
+//! after [`IDLE_TIMEOUT`].
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -43,6 +50,10 @@ pub enum Verdict {
 
 struct Entry {
     o: OriginalDst,
+    /// Identifies this entry across port reuse (see [`NatTable::release`]).
+    token: u64,
+    /// A live relay connection holds this entry.
+    attached: bool,
     last_seen: Instant,
     fin_from_app: bool,
     fin_from_relay: bool,
@@ -53,6 +64,7 @@ struct Entry {
 #[derive(Default)]
 pub struct NatTable {
     map: Mutex<HashMap<u16, Entry>>,
+    next_token: std::sync::atomic::AtomicU64,
 }
 
 const TCP_FIN: u8 = 0x01;
@@ -65,8 +77,13 @@ impl NatTable {
 
     /// Inserts (or replaces, e.g. on port reuse) the entry for `app_port`.
     pub fn insert(&self, app_port: u16, o: OriginalDst) {
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let e = Entry {
             o,
+            token,
+            attached: false,
             last_seen: Instant::now(),
             fin_from_app: false,
             fin_from_relay: false,
@@ -83,11 +100,32 @@ impl NatTable {
         self.lock().remove(&app_port);
     }
 
-    /// Removes entries idle for longer than [`IDLE_TIMEOUT`] and closed
-    /// entries older than [`CLOSE_LINGER`].
+    /// The relay accepted the connection from peer `ip:app_port`: returns
+    /// the original destination and a token for [`NatTable::release`], and
+    /// marks the entry as held by a live relay connection (never idle-swept).
+    pub fn attach(&self, app_port: u16, ip: Ipv4Addr) -> Option<(OriginalDst, u64)> {
+        let mut g = self.lock();
+        let e = g.get_mut(&app_port).filter(|e| *e.o.dst.ip() == ip)?;
+        e.attached = true;
+        Some((e.o, e.token))
+    }
+
+    /// The relay connection that attached `token` ended: the entry lingers
+    /// for [`CLOSE_LINGER`] (final ACK / FIN retransmits), then is swept. A
+    /// stale token (the port was reused by a newer flow) is ignored.
+    pub fn release(&self, app_port: u16, token: u64) {
+        let mut g = self.lock();
+        if let Some(e) = g.get_mut(&app_port).filter(|e| e.token == token) {
+            e.attached = false;
+            e.closed_at.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Removes closed entries older than [`CLOSE_LINGER`], and entries no
+    /// relay connection holds that were idle longer than [`IDLE_TIMEOUT`].
     pub fn sweep(&self, now: Instant) {
         self.lock().retain(|_, e| {
-            now.saturating_duration_since(e.last_seen) <= IDLE_TIMEOUT
+            (e.attached || now.saturating_duration_since(e.last_seen) <= IDLE_TIMEOUT)
                 && e.closed_at
                     .is_none_or(|c| now.saturating_duration_since(c) <= CLOSE_LINGER)
         });

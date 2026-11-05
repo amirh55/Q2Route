@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -39,8 +40,27 @@ const COPY_BUF: usize = 16 * 1024;
 const NO_GROUP: &str = "(none)";
 
 /// Maps an accepted peer address back to the flow's original destination.
+/// The relay owns the NAT entry while its connection lives: it attaches the
+/// entry on accept and releases it when the connection ends, so a quiet
+/// connection is never black-holed by the NAT's idle sweep.
 pub trait OrigDstLookup: Send + Sync {
-    fn lookup(&self, peer: SocketAddr) -> Option<OriginalDst>;
+    /// Original destination for `peer` plus a token for [`Self::release`].
+    fn attach(&self, peer: SocketAddr) -> Option<(OriginalDst, u64)>;
+    /// The relay connection that attached `token` has ended.
+    fn release(&self, peer: SocketAddr, token: u64);
+}
+
+/// Releases the NAT entry when the relay connection ends (also on cancel).
+struct Hold<'a> {
+    lookup: &'a dyn OrigDstLookup,
+    peer: SocketAddr,
+    token: u64,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.lookup.release(self.peer, self.token);
+    }
 }
 
 pub struct RelayCtx {
@@ -52,6 +72,26 @@ pub struct RelayCtx {
     /// Local ports of the relay's direct upstream sockets; capture skips them.
     pub own_ports: Arc<DashSet<u16>>,
     pub events: broadcast::Sender<Event>,
+    /// A relayed connection with no bytes in either direction for this long
+    /// is closed ([`RELAY_IDLE_TIMEOUT`] in production).
+    pub idle_timeout: Duration,
+}
+
+/// Production idle timeout of a relayed connection.
+pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// TCP keepalive on both relay sockets, so dead peers are noticed long
+/// before the idle timeout (the Windows default first probe is after 2 h).
+const KEEPALIVE_TIME: Duration = Duration::from_secs(120);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Turns on SO_KEEPALIVE (with [`KEEPALIVE_TIME`] / [`KEEPALIVE_INTERVAL`]).
+fn set_keepalive(s: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(s).set_tcp_keepalive(&ka) {
+        tracing::debug!("cannot set keepalive: {e}");
+    }
 }
 
 /// Accepts until `cancel` fires, then closes every in-flight connection and
@@ -141,10 +181,17 @@ async fn handle(
     lookup: &dyn OrigDstLookup,
     ctx: &RelayCtx,
 ) {
-    let Some(orig) = lookup.lookup(normalize_peer(peer)) else {
+    let peer = normalize_peer(peer);
+    let Some((orig, token)) = lookup.attach(peer) else {
         tracing::debug!("no original destination for {peer}; closing");
         return;
     };
+    let _hold = Hold {
+        lookup,
+        peer,
+        token,
+    };
+    set_keepalive(&client);
     let mut buf = Vec::new();
     let mut domain = String::new();
     let mut decision = decide_flow(ctx, &orig, None);
@@ -231,9 +278,34 @@ impl Drop for OwnPort<'_> {
     }
 }
 
+/// Time of the last byte relayed in either direction.
+struct Activity {
+    base: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Activity {
+        Activity {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+    fn touch(&self) {
+        let ms = self.base.elapsed().as_millis() as u64;
+        self.last_ms.store(ms, Ordering::Relaxed);
+    }
+    fn idle_for(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.base.elapsed().saturating_sub(last)
+    }
+}
+
 /// Sends the peeked bytes upstream, then copies both ways until both
-/// directions are closed (or either fails).
+/// directions are closed (or either fails), or until no byte has moved in
+/// either direction for `ctx.idle_timeout`.
 async fn pump(client: TcpStream, upstream: TcpStream, peeked: &[u8], ctx: &RelayCtx, group: &str) {
+    set_keepalive(&upstream);
     let _active = ctx.stats.open(group);
     let (mut cr, mut cw) = client.into_split();
     let (mut ur, mut uw) = upstream.into_split();
@@ -243,15 +315,38 @@ async fn pump(client: TcpStream, upstream: TcpStream, peeked: &[u8], ctx: &Relay
         }
         ctx.stats.add(group, peeked.len() as u64, 0);
     }
-    let up = copy(&mut cr, &mut uw, |n| ctx.stats.add(group, n, 0));
-    let down = copy(&mut ur, &mut cw, |n| ctx.stats.add(group, 0, n));
+    let activity = Activity::new();
+    let up = copy(&mut cr, &mut uw, |n| {
+        activity.touch();
+        ctx.stats.add(group, n, 0)
+    });
+    let down = copy(&mut ur, &mut cw, |n| {
+        activity.touch();
+        ctx.stats.add(group, 0, n)
+    });
     tokio::pin!(up, down);
-    let ok = tokio::select! {
-        r = &mut up => r.is_ok() && down.await.is_ok(),
-        r = &mut down => r.is_ok() && up.await.is_ok(),
+    let both = async {
+        tokio::select! {
+            r = &mut up => r.is_ok() && down.await.is_ok(),
+            r = &mut down => r.is_ok() && up.await.is_ok(),
+        }
     };
-    if !ok {
-        tracing::debug!("relay connection ended with an error");
+    let idle = async {
+        loop {
+            let quiet = activity.idle_for();
+            if quiet >= ctx.idle_timeout {
+                return;
+            }
+            tokio::time::sleep(ctx.idle_timeout - quiet).await;
+        }
+    };
+    tokio::select! {
+        ok = both => {
+            if !ok {
+                tracing::debug!("relay connection ended with an error");
+            }
+        }
+        () = idle => tracing::debug!("relay connection idle for {:?}; closing", ctx.idle_timeout),
     }
 }
 
@@ -275,6 +370,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keepalive_is_enabled() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        assert!(!socket2::SockRef::from(&c).keepalive().unwrap());
+        set_keepalive(&c);
+        assert!(socket2::SockRef::from(&c).keepalive().unwrap());
+    }
 
     #[test]
     fn mapped_peer_becomes_v4() {

@@ -14,7 +14,9 @@ use q2route_core::decide::{Decision, Route};
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 
+const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
 const TCP_ACK: u8 = 0x10;
 
 /// Cached TCP decisions expire after this long without packets.
@@ -36,6 +38,8 @@ pub struct PktMeta {
     pub flow: FlowId,
     /// TCP SYN without ACK (a connection attempt).
     pub syn: bool,
+    /// TCP RST.
+    pub rst: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +48,10 @@ pub enum Action {
     Pass,
     /// Never send.
     Drop,
+    /// Never send; instead inject an RST toward the app (see
+    /// [`build_rst_to_app`]) so a non-Direct TCP flow that lost its NAT
+    /// entry fails fast instead of hanging. Nothing goes to the remote.
+    Reset,
     /// The flow has a NAT entry: reflect it to the relay (drop if that fails).
     Redirect,
     /// Insert a NAT entry for this new flow owned by `pid`, then redirect.
@@ -206,20 +214,25 @@ pub fn classify(
                 Action::Drop
             }
         }
-        PROTO_TCP => match cache.get(&id) {
-            Some(true) => Action::Pass,
-            Some(false) if nat_has => Action::Redirect,
-            Some(false) => Action::Drop,
-            None if nat_has => {
-                cache.put(id, false);
-                Action::Redirect
+        PROTO_TCP => {
+            // A non-Direct flow without a NAT entry is never sent; the app
+            // gets an RST so it fails fast (but an RST is never answered).
+            let stop = if m.rst { Action::Drop } else { Action::Reset };
+            match cache.get(&id) {
+                Some(true) => Action::Pass,
+                Some(false) if nat_has => Action::Redirect,
+                Some(false) => stop,
+                None if nat_has => {
+                    cache.put(id, false);
+                    Action::Redirect
+                }
+                // A flow that predates Q2Route: only a Direct flow may continue.
+                None => match decide_now(&mut call) {
+                    (_, true) => Action::Pass,
+                    (_, false) => stop,
+                },
             }
-            // A flow that predates Q2Route: only a Direct flow may continue.
-            None => match decide_now(&mut call) {
-                (_, true) => Action::Pass,
-                (_, false) => Action::Drop,
-            },
-        },
+        }
         PROTO_UDP => {
             let direct = match cache.get(&id) {
                 Some(d) => d,
@@ -310,7 +323,70 @@ pub fn parse(p: &[u8]) -> Option<PktMeta> {
             remote: SocketAddr::new(dst, be16(l4, 2)),
         },
         syn: flags & TCP_SYN != 0 && flags & TCP_ACK == 0,
+        rst: flags & TCP_RST != 0,
     })
+}
+
+fn be32(p: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]])
+}
+
+/// Builds the RST an outbound TCP packet `A:pa -> D:pd` would get from
+/// `D:pd` (RFC 793 reset generation): `seq = SEG.ACK` if the packet has ACK,
+/// else `seq = 0, ack = SEG.SEQ + SEG.LEN` with RST|ACK. The result is
+/// addressed `D:pd -> A:pa`, to be injected **inbound** to the app, with
+/// checksums still to be computed. `None` for SYN, RST, non-TCP, IP
+/// fragments, IPv6 extension headers or malformed packets.
+pub fn build_rst_to_app(p: &[u8]) -> Option<Vec<u8>> {
+    let (ip_len, l4_end) = match p.first()? >> 4 {
+        4 => {
+            if p.len() < 20 || p[9] != PROTO_TCP || be16(p, 6) & 0x3fff != 0 {
+                return None;
+            }
+            (usize::from(p[0] & 0x0f) * 4, usize::from(be16(p, 2)))
+        }
+        6 => {
+            if p.len() < 40 || p[6] != PROTO_TCP {
+                return None;
+            }
+            (40, 40 + usize::from(be16(p, 4)))
+        }
+        _ => return None,
+    };
+    if ip_len < 20 || l4_end > p.len() || l4_end < ip_len + 20 {
+        return None;
+    }
+    let t = &p[ip_len..l4_end];
+    let hdr = usize::from(t[12] >> 4) * 4;
+    let flags = t[13];
+    if hdr < 20 || hdr > t.len() || flags & (TCP_SYN | TCP_RST) != 0 {
+        return None;
+    }
+    let (seq, ack, out_flags) = if flags & TCP_ACK != 0 {
+        (be32(t, 8), 0, TCP_RST)
+    } else {
+        let seg_len = (t.len() - hdr) as u32 + u32::from(flags & TCP_FIN != 0);
+        (0, be32(t, 4).wrapping_add(seg_len), TCP_RST | TCP_ACK)
+    };
+    let mut tcp = [0u8; 20];
+    tcp[0..2].copy_from_slice(&t[2..4]); // from the original dst port
+    tcp[2..4].copy_from_slice(&t[0..2]); // to the app's port
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = 5 << 4;
+    tcp[13] = out_flags;
+    let mut out = Vec::with_capacity(60);
+    if p[0] >> 4 == 4 {
+        out.extend_from_slice(&[0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, PROTO_TCP, 0, 0]);
+        out.extend_from_slice(&p[16..20]); // src = original dst
+        out.extend_from_slice(&p[12..16]); // dst = the app
+    } else {
+        out.extend_from_slice(&[0x60, 0, 0, 0, 0, 20, PROTO_TCP, 64]);
+        out.extend_from_slice(&p[24..40]);
+        out.extend_from_slice(&p[8..24]);
+    }
+    out.extend_from_slice(&tcp);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -346,6 +422,7 @@ mod tests {
                 remote: remote.parse().unwrap(),
             },
             syn,
+            rst: false,
         }
     }
     fn tcp(syn: bool) -> PktMeta {
@@ -413,12 +490,18 @@ mod tests {
         let (c, n) = (FlowCache::default(), Cell::new(0));
         run(&tcp(true), &c, false, APP_PID, proxy(), &n);
         // NAT entry swept / reset: the packet must not leave direct, even
-        // if the rules now say Direct.
+        // if the rules now say Direct; the app gets an RST so it fails fast.
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
-            Action::Drop
+            Action::Reset
         );
         assert_eq!(n.get(), 1);
+        // An RST of that flow is only dropped (never answer an RST).
+        let rst = PktMeta {
+            rst: true,
+            ..tcp(false)
+        };
+        assert_eq!(run(&rst, &c, false, APP_PID, direct(), &n), Action::Drop);
     }
 
     #[test]
@@ -426,17 +509,17 @@ mod tests {
         let (c, n) = (FlowCache::default(), Cell::new(0));
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, proxy(), &n),
-            Action::Drop
+            Action::Reset
         );
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, proxy(), &n),
-            Action::Drop
+            Action::Reset
         );
         assert_eq!(n.get(), 1, "cached after the first decision");
         let c = FlowCache::default();
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, Decision::NeedDomain, &n),
-            Action::Drop
+            Action::Reset
         );
     }
 
@@ -460,7 +543,7 @@ mod tests {
         // and is remembered as non-Direct once the entry goes away
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
-            Action::Drop
+            Action::Reset
         );
     }
 
@@ -484,7 +567,7 @@ mod tests {
         );
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
-            Action::Drop
+            Action::Reset
         );
     }
 
@@ -529,7 +612,7 @@ mod tests {
         let ack = PktMeta { syn: false, ..syn };
         // decide() maps proxied IPv6 to Block; even a Proxy answer must not pass.
         assert_eq!(run(&syn, &c, false, APP_PID, proxy(), &n), Action::Drop);
-        assert_eq!(run(&ack, &c, false, APP_PID, direct(), &n), Action::Drop);
+        assert_eq!(run(&ack, &c, false, APP_PID, direct(), &n), Action::Reset);
         assert_eq!(run(&syn, &c, false, APP_PID, block(), &n), Action::Drop);
         let c = FlowCache::default();
         assert_eq!(
@@ -570,12 +653,12 @@ mod tests {
         assert_eq!(run(&u, &c, false, APP_PID, block(), &n), Action::Drop);
         assert_eq!(
             run(&direct_tcp, &c, false, APP_PID, proxy(), &n),
-            Action::Drop
+            Action::Reset
         );
         // The proxied flow stays non-Direct even if the rules now say Direct.
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
-            Action::Drop
+            Action::Reset
         );
     }
 
@@ -605,9 +688,9 @@ mod tests {
         // Stray packets of the closed proxied flow still never leave direct.
         assert_eq!(
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
-            Action::Drop
+            Action::Reset
         );
-        assert_eq!(run(&d, &c, false, APP_PID, proxy(), &n), Action::Drop);
+        assert_eq!(run(&d, &c, false, APP_PID, proxy(), &n), Action::Reset);
     }
 
     #[test]
@@ -657,6 +740,103 @@ mod tests {
         let mut out = Vec::new();
         b.write(&mut out, b"hi").unwrap();
         out
+    }
+
+    #[test]
+    fn parse_sets_rst() {
+        let mut out = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 168, 1, 5], [1, 2, 3, 4], 64)
+            .tcp(50000, 443, 1, 65535)
+            .rst()
+            .write(&mut out, b"")
+            .unwrap();
+        let m = parse(&out).unwrap();
+        assert!(m.rst && !m.syn);
+        assert!(!parse(&build_v4_tcp(false, true)).unwrap().rst);
+    }
+
+    #[test]
+    fn rst_to_app_v4_with_ack() {
+        // App A:50000 -> D:443, seq 1, ack 9, payload "hi".
+        let pkt = build_v4_tcp(false, true);
+        let rst = build_rst_to_app(&pkt).unwrap();
+        let s = etherparse::SlicedPacket::from_ip(&rst).unwrap();
+        let Some(etherparse::NetSlice::Ipv4(ip)) = s.net else {
+            panic!("not ipv4")
+        };
+        assert_eq!(ip.header().source(), [1, 2, 3, 4], "from the original dst");
+        assert_eq!(ip.header().destination(), [192, 168, 1, 5]);
+        let Some(etherparse::TransportSlice::Tcp(t)) = s.transport else {
+            panic!("not tcp")
+        };
+        assert_eq!((t.source_port(), t.destination_port()), (443, 50000));
+        assert!(t.rst() && !t.syn() && !t.fin());
+        assert!(!t.ack(), "RST answering an ACK carries no ACK");
+        assert_eq!(t.sequence_number(), 9, "seq = the dropped packet's ack");
+        assert!(t.payload().is_empty());
+    }
+
+    #[test]
+    fn rst_to_app_v4_without_ack() {
+        // A non-SYN segment without ACK: RST|ACK, ack = seq + len.
+        let mut out = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 168, 1, 5], [1, 2, 3, 4], 64)
+            .tcp(50000, 443, 100, 65535)
+            .fin()
+            .write(&mut out, b"abc")
+            .unwrap();
+        let rst = build_rst_to_app(&out).unwrap();
+        let s = etherparse::SlicedPacket::from_ip(&rst).unwrap();
+        let Some(etherparse::TransportSlice::Tcp(t)) = s.transport else {
+            panic!("not tcp")
+        };
+        assert!(t.rst() && t.ack());
+        assert_eq!(t.sequence_number(), 0);
+        assert_eq!(t.acknowledgment_number(), 100 + 3 + 1, "data + FIN");
+    }
+
+    #[test]
+    fn rst_to_app_v6() {
+        let src: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut out = Vec::new();
+        etherparse::PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
+            .tcp(50000, 443, 1, 65535)
+            .ack(77)
+            .write(&mut out, b"x")
+            .unwrap();
+        let rst = build_rst_to_app(&out).unwrap();
+        let s = etherparse::SlicedPacket::from_ip(&rst).unwrap();
+        let Some(etherparse::NetSlice::Ipv6(ip)) = s.net else {
+            panic!("not ipv6")
+        };
+        assert_eq!(ip.header().source_addr(), dst);
+        assert_eq!(ip.header().destination_addr(), src);
+        let Some(etherparse::TransportSlice::Tcp(t)) = s.transport else {
+            panic!("not tcp")
+        };
+        assert_eq!((t.source_port(), t.destination_port()), (443, 50000));
+        assert!(t.rst());
+        assert_eq!(t.sequence_number(), 77);
+    }
+
+    #[test]
+    fn rst_never_built_for_rst_syn_or_udp() {
+        let mut out = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 168, 1, 5], [1, 2, 3, 4], 64)
+            .tcp(50000, 443, 1, 65535)
+            .rst()
+            .write(&mut out, b"")
+            .unwrap();
+        assert!(build_rst_to_app(&out).is_none());
+        assert!(build_rst_to_app(&build_v4_tcp(true, false)).is_none());
+        let mut u = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [8, 8, 4, 4], 64)
+            .udp(5000, 443)
+            .write(&mut u, b"q")
+            .unwrap();
+        assert!(build_rst_to_app(&u).is_none());
+        assert!(build_rst_to_app(&[0x45, 0, 0]).is_none());
     }
 
     #[test]

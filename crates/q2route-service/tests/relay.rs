@@ -25,11 +25,33 @@ use tokio_util::sync::CancellationToken;
 struct FixedLookup(SocketAddrV4);
 
 impl OrigDstLookup for FixedLookup {
-    fn lookup(&self, _peer: SocketAddr) -> Option<OriginalDst> {
-        Some(OriginalDst {
-            dst: self.0,
-            pid: 4242,
-        })
+    fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
+        Some((
+            OriginalDst {
+                dst: self.0,
+                pid: 4242,
+            },
+            1,
+        ))
+    }
+    fn release(&self, _peer: SocketAddr, _token: u64) {}
+}
+
+/// Like `FixedLookup`, but reports every release.
+struct RecordingLookup(SocketAddrV4, mpsc::UnboundedSender<u64>);
+
+impl OrigDstLookup for RecordingLookup {
+    fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
+        Some((
+            OriginalDst {
+                dst: self.0,
+                pid: 4242,
+            },
+            77,
+        ))
+    }
+    fn release(&self, _peer: SocketAddr, token: u64) {
+        let _ = self.1.send(token);
     }
 }
 
@@ -99,6 +121,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         stats: Arc::new(Stats::default()),
         own_ports: Arc::new(DashSet::new()),
         events,
+        idle_timeout: Duration::from_secs(7200),
     })
 }
 
@@ -363,4 +386,93 @@ async fn cancel_closes_inflight() {
         .unwrap()
         .unwrap();
     assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn connection_end_releases_nat_entry() {
+    let (origin, _, mut peers) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, mut released) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    tokio::spawn(run_relay(
+        l,
+        Arc::new(RecordingLookup(v4(origin), tx)),
+        ctx(cfg),
+        cancel.clone(),
+    ));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"x").await.unwrap();
+    let mut b = [0u8; 1];
+    client.read_exact(&mut b).await.unwrap();
+    peers.recv().await.unwrap();
+    assert!(released.try_recv().is_err(), "released while alive");
+    drop(client);
+    let token = tokio::time::timeout(Duration::from_secs(3), released.recv())
+        .await
+        .expect("release not called after close")
+        .unwrap();
+    assert_eq!(token, 77);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn blocked_connection_releases_nat_entry() {
+    let cfg = config(vec![], vec![group("rest", Action::Block, &[], true)]);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, mut released) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    tokio::spawn(run_relay(
+        l,
+        Arc::new(RecordingLookup("5.5.5.5:8000".parse().unwrap(), tx)),
+        ctx(cfg),
+        cancel.clone(),
+    ));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    assert_closed(&mut client, Duration::from_secs(2)).await;
+    let token = tokio::time::timeout(Duration::from_secs(2), released.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(token, 77);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn idle_connection_is_closed_after_idle_timeout() {
+    let (origin, _, mut peers) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let c = ctx(cfg);
+    // Same RelayCtx shape as production, with a short idle timeout.
+    let c = Arc::new(RelayCtx {
+        idle_timeout: Duration::from_millis(400),
+        rules: ArcSwap::new(c.rules.load_full()),
+        cfg: ArcSwap::new(c.cfg.load_full()),
+        tree: c.tree.clone(),
+        excluded: ArcSwap::new(c.excluded.load_full()),
+        stats: c.stats.clone(),
+        own_ports: c.own_ports.clone(),
+        events: c.events.clone(),
+    });
+    let r = start(v4(origin), c).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    // Activity keeps it open past one idle period.
+    for i in 0..4 {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.write_all(b"k").await.unwrap();
+        let mut b = [0u8; 1];
+        client.read_exact(&mut b).await.unwrap();
+    }
+    let t0 = Instant::now();
+    peers.recv().await.unwrap();
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        t0.elapsed() >= Duration::from_millis(300),
+        "closed too early"
+    );
+    r.cancel.cancel();
 }

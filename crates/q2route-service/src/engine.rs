@@ -31,7 +31,7 @@ use crate::packet_loop::{
     network_loop, socket_loop, NatLookup, RunState, Shared, NETWORK_FILTER, NETWORK_THREADS,
     SOCKET_FILTER,
 };
-use crate::relay::{run_relay, RelayCtx};
+use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
 use crate::winapi;
 use crate::windivert::{Handle, Layer, FLAG_RECV_ONLY, FLAG_SNIFF};
@@ -87,6 +87,7 @@ impl Engine {
             stats: Arc::new(Stats::default()),
             own_ports: Arc::new(DashSet::new()),
             events,
+            idle_timeout: RELAY_IDLE_TIMEOUT,
         });
         let shared = Arc::new(Shared {
             relay,

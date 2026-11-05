@@ -2118,6 +2118,7 @@ dependencies = [
  "dashmap",
  "etherparse",
  "q2route-core",
+ "socket2",
  "tokio",
  "tokio-util",
  "tracing",
