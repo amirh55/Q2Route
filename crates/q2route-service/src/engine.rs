@@ -413,7 +413,7 @@ impl Inner {
                 let tx = &inner.relay().events;
                 // The proxy watcher is always subscribed; only snapshot for UIs.
                 if tx.receiver_count() > 1 {
-                    let _ = tx.send(Event::Snapshot(inner.snapshot()));
+                    let _ = tx.send(Event::Snapshot(Box::new(inner.snapshot())));
                 }
             }
         });

@@ -55,7 +55,7 @@ fn serve(name: &str) -> (Arc<Fake>, CancellationToken) {
         loop {
             tokio::select! {
                 _ = c.cancelled() => break,
-                _ = tick.tick() => { let _ = events.send(Event::Snapshot(snapshot())); }
+                _ = tick.tick() => { let _ = events.send(Event::Snapshot(Box::new(snapshot()))); }
             }
         }
     });

@@ -27,7 +27,7 @@ fn enabled_group_bad_pattern_names_group() {
 fn bad_pattern_errors() {
     let mut cfg = Config::seed();
     cfg.groups[2].rules.push(Rule { domains: vec!["*.".into()], ..Rule::default() });
-    let e = RuleSet::compile(&cfg).err().expect("error");
+    let e = RuleSet::compile(&cfg).expect_err("error");
     assert!(e.to_string().contains("games"), "{e}");
 }
 

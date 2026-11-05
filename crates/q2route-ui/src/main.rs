@@ -6,10 +6,13 @@ use q2route_core::ipc::PIPE_NAME;
 use q2route_ui::app::App;
 use q2route_ui::client::Client;
 use q2route_ui::settings::UiSettings;
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    FindWindowExW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
 const TITLE: &str = "Q2Route";
@@ -29,17 +32,69 @@ fn single_instance() -> bool {
     if handle.is_null() || unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
         return true;
     }
-    let title = wide(TITLE);
-    // SAFETY: `title` is NUL-terminated; the HWND is only passed back to user32.
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !hwnd.is_null() {
+    if let Some(hwnd) = find_own_window() {
+        // SAFETY: `hwnd` came from FindWindowExW and is only passed back to user32.
+        unsafe {
             ShowWindow(hwnd, SW_SHOW);
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         }
     }
     false
+}
+
+/// File name of the executable that owns `hwnd`, e.g. `q2route.exe`.
+fn window_image_name(hwnd: HWND) -> Option<String> {
+    let mut pid = 0u32;
+    // SAFETY: valid out-pointer; a stale HWND just yields pid 0.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: plain handle request; checked for null and closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` holds `len` u16s; `process` is a live handle closed right after.
+    let ok = unsafe {
+        let ok =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        CloseHandle(process);
+        ok
+    };
+    if ok == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit('\\').next().map(str::to_string)
+}
+
+/// The top-level window titled "Q2Route" that belongs to a `q2route.exe`
+/// process (hidden windows included), so an unrelated window with the same
+/// title is never focused.
+fn find_own_window() -> Option<HWND> {
+    let title = wide(TITLE);
+    let mut after: HWND = std::ptr::null_mut();
+    loop {
+        // SAFETY: `title` is NUL-terminated; `after` is null or a previous result.
+        after = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                after,
+                std::ptr::null(),
+                title.as_ptr(),
+            )
+        };
+        if after.is_null() {
+            return None;
+        }
+        if window_image_name(after).is_some_and(|n| n.eq_ignore_ascii_case("q2route.exe")) {
+            return Some(after);
+        }
+    }
 }
 
 fn main() -> eframe::Result {

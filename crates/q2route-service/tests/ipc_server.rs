@@ -35,7 +35,7 @@ impl Fake {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    _ = tick.tick() => { let _ = tx.send(Event::Snapshot(snapshot())); }
+                    _ = tick.tick() => { let _ = tx.send(Event::Snapshot(Box::new(snapshot()))); }
                 }
             }
         });

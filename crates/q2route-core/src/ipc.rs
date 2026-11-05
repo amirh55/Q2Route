@@ -53,7 +53,7 @@ pub enum Response {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Event {
     /// Sent ~4x per second after `Subscribe`.
-    Snapshot(StateSnapshot),
+    Snapshot(Box<StateSnapshot>),
     ProxyDown { id: ProfileId },
     ProxyUp { id: ProfileId },
 }

@@ -162,7 +162,7 @@ fn apply(sh: &Shared, ev: Event) {
     let mut latest = sh.latest.lock().expect("latest lock");
     let (id, up) = match ev {
         Event::Snapshot(s) => {
-            *latest = Some(s);
+            *latest = Some(*s);
             return;
         }
         Event::ProxyDown { id } => (id, false),

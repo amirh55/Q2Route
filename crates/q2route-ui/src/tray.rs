@@ -32,6 +32,7 @@ pub enum TrayAction {
 struct MenuModel {
     connected: bool,
     running: bool,
+    /// (id, label, action); disabled groups are labelled "<name> (off)".
     groups: Vec<(GroupId, String, Action)>,
     proxies: Vec<(ProfileId, String)>,
 }
@@ -53,7 +54,13 @@ impl MenuModel {
                 .config
                 .groups
                 .iter()
-                .map(|g| (g.id.clone(), g.name.clone(), g.action.clone()))
+                .map(|g| {
+                    (
+                        g.id.clone(),
+                        group_label(&g.name, g.enabled),
+                        g.action.clone(),
+                    )
+                })
                 .collect(),
             proxies: s
                 .config
@@ -108,6 +115,15 @@ impl MenuModel {
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&exit);
         (menu, actions)
+    }
+}
+
+/// Tray submenu label: disabled groups get an "(off)" suffix.
+pub fn group_label(name: &str, enabled: bool) -> String {
+    if enabled {
+        name.to_string()
+    } else {
+        format!("{name} (off)")
     }
 }
 
@@ -234,6 +250,16 @@ mod tests {
             total_up_bps: 120_000,
             total_down_bps: 2_400_000,
         }
+    }
+
+    #[test]
+    fn disabled_groups_marked_off() {
+        let m = MenuModel::of(Some(&snap(true)));
+        let labels: Vec<&str> = m.groups.iter().map(|(_, l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Iranian sites", "Steam (off)", "Games", "Everything else"]
+        );
     }
 
     #[test]

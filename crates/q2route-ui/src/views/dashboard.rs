@@ -189,7 +189,7 @@ fn card(ui: &mut egui::Ui, s: &StateSnapshot, g: &Group, client: &Client, req: &
                 let (up, down) = stats.map_or((0, 0), |st| (st.up_bps, st.down_bps));
                 ui.weak(format!("↑ {}  ↓ {}", format_speed(up), format_speed(down)));
                 ui.add_space(4.0);
-                ui.add_enabled_ui(g.enabled, |ui| action_switch(ui, s, g, client, req));
+                action_switch(ui, s, g, client, req);
             });
         });
 }

@@ -51,7 +51,7 @@ async fn server_msgs_roundtrip() {
             error: None,
         })),
         ServerMsg::Response(Response::Error("x".into())),
-        ServerMsg::Event(Event::Snapshot(snap)),
+        ServerMsg::Event(Event::Snapshot(Box::new(snap))),
         ServerMsg::Event(Event::ProxyDown { id: "v2ray".into() }),
         ServerMsg::Event(Event::ProxyUp { id: "v2ray".into() }),
     ];
