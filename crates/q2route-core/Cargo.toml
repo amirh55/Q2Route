@@ -8,6 +8,8 @@ edition.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+ipnet = "2"
+globset = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
