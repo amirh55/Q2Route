@@ -99,6 +99,9 @@ fn direct(reason: MatchReason) -> Decision {
     Decision::Final(Route::Direct, MatchInfo { group_id: None, reason })
 }
 
+/// Decide the route for a new flow. Steps run in order: always-direct destination,
+/// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all.
+/// Returns `NeedDomain` when the outcome may depend on a domain not yet known.
 pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f: &FlowInfo) -> Decision {
     // 1. Always-direct destinations (LAN, multicast, DNS, NTP).
     if rs.lan_direct {
@@ -113,12 +116,9 @@ pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f:
     }
     let proc = tree.get(f.pid);
     let ancestors = tree.ancestors(f.pid);
-    // 3. Always-direct apps (the process or any ancestor).
-    if proc
-        .into_iter()
-        .chain(ancestors.iter().copied())
-        .any(|p| rs.always_direct.iter().any(|m| m.matches(&p.exe)))
-    {
+    // 3. Always-direct apps: the process's OWN exe only. Children of a proxy GUI
+    //    (e.g. a browser launched from v2rayN.exe) must still be routed normally.
+    if proc.is_some_and(|p| rs.always_direct.iter().any(|m| m.matches(&p.exe))) {
         return direct(MatchReason::AlwaysDirectApp);
     }
 

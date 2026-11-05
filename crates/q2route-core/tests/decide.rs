@@ -34,6 +34,8 @@ fn tree() -> ProcessTree {
     add(40, 0, r"C:\Program Files\Google\Chrome\chrome.exe", 4);
     add(50, 0, r"C:\Tools\v2ray.exe", 5);
     add(60, 0, r"C:\Windows\System32\svchost.exe", 6);
+    add(70, 0, r"C:\Tools\v2rayN.exe", 7);
+    add(80, 70, r"C:\Program Files\Google\Chrome\chrome.exe", 8);
     t
 }
 
@@ -212,6 +214,14 @@ fn empty_rule_matches_nothing_and_no_catch_all_is_direct() {
 fn unknown_pid_falls_to_catch_all() {
     assert_eq!(
         d(Protocol::Tcp, 999, "1.2.3.4:8000", None),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn child_of_proxy_gui_not_direct() {
+    assert_eq!(
+        d(Protocol::Tcp, 80, "1.1.1.1:443", Some("x.com")),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
 }
