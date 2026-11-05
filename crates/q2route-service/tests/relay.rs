@@ -1,0 +1,316 @@
+//! Relay tests: localhost mocks, with `RuleSet::lan_direct = false` so that
+//! loopback destinations are routed by the rules under test.
+
+use std::collections::HashSet;
+use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use dashmap::DashSet;
+use q2route_core::config::{Action, Config, Group, ProxyKind, ProxyProfile, Rule, Settings};
+use q2route_core::ipc::Event;
+use q2route_core::process_tree::ProcessTree;
+use q2route_core::ruleset::RuleSet;
+use q2route_service::nat::OriginalDst;
+use q2route_service::relay::{run_relay, OrigDstLookup, RelayCtx};
+use q2route_service::stats::Stats;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+struct FixedLookup(SocketAddrV4);
+
+impl OrigDstLookup for FixedLookup {
+    fn lookup(&self, _peer: SocketAddr) -> Option<OriginalDst> {
+        Some(OriginalDst { dst: self.0, pid: 4242 })
+    }
+}
+
+fn fixture() -> Vec<u8> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../q2route-core/tests/data/clienthello.bin");
+    std::fs::read(p).unwrap()
+}
+
+fn v4(a: SocketAddr) -> SocketAddrV4 {
+    match a {
+        SocketAddr::V4(a) => a,
+        SocketAddr::V6(_) => panic!("expected v4"),
+    }
+}
+
+fn group(id: &str, action: Action, domains: &[&str], catch_all: bool) -> Group {
+    let rules = if domains.is_empty() {
+        vec![]
+    } else {
+        vec![Rule { domains: domains.iter().map(|s| s.to_string()).collect(), ..Rule::default() }]
+    };
+    Group { id: id.into(), name: id.into(), enabled: true, action, rules, catch_all }
+}
+
+fn socks_profile(port: u16) -> ProxyProfile {
+    ProxyProfile {
+        id: "mock".into(),
+        name: "Mock".into(),
+        kind: ProxyKind::Socks5,
+        host: "127.0.0.1".into(),
+        port,
+        username: None,
+        password: None,
+    }
+}
+
+fn config(proxies: Vec<ProxyProfile>, groups: Vec<Group>) -> Config {
+    Config {
+        proxies,
+        groups,
+        always_direct: vec![],
+        default_proxy: "mock".into(),
+        settings: Settings::default(),
+    }
+}
+
+fn ctx(cfg: Config) -> Arc<RelayCtx> {
+    let mut rules = RuleSet::compile(&cfg).unwrap();
+    rules.lan_direct = false;
+    let (events, _) = broadcast::channel(16);
+    Arc::new(RelayCtx {
+        rules: ArcSwap::from_pointee(rules),
+        cfg: ArcSwap::from_pointee(cfg),
+        tree: Arc::new(RwLock::new(ProcessTree::default())),
+        excluded: ArcSwap::from_pointee(HashSet::new()),
+        stats: Arc::new(Stats::default()),
+        own_ports: Arc::new(DashSet::new()),
+        events,
+    })
+}
+
+struct Relay {
+    addr: SocketAddr,
+    cancel: CancellationToken,
+    task: JoinHandle<std::io::Result<()>>,
+}
+
+async fn start(dst: SocketAddrV4, c: Arc<RelayCtx>) -> Relay {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_relay(l, Arc::new(FixedLookup(dst)), c, cancel.clone()));
+    Relay { addr, cancel, task }
+}
+
+struct SocksReq {
+    atyp: u8,
+    host: Vec<u8>,
+    port: u16,
+    first: Vec<u8>,
+    at: Instant,
+}
+
+/// One-shot mock SOCKS5 (no auth): reports the CONNECT request and the first
+/// `want` tunnelled bytes.
+async fn mock_socks(want: usize) -> (u16, mpsc::Receiver<SocksReq>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut g = [0u8; 3];
+        s.read_exact(&mut g).await.unwrap();
+        assert_eq!(g, [5, 1, 0]);
+        s.write_all(&[5, 0]).await.unwrap();
+        let mut h = [0u8; 4];
+        s.read_exact(&mut h).await.unwrap();
+        let at = Instant::now();
+        let host = match h[3] {
+            1 => {
+                let mut a = vec![0u8; 4];
+                s.read_exact(&mut a).await.unwrap();
+                a
+            }
+            3 => {
+                let mut n = [0u8; 1];
+                s.read_exact(&mut n).await.unwrap();
+                let mut a = vec![0u8; n[0] as usize];
+                s.read_exact(&mut a).await.unwrap();
+                a
+            }
+            x => panic!("unexpected atyp {x}"),
+        };
+        let mut p = [0u8; 2];
+        s.read_exact(&mut p).await.unwrap();
+        s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut first = vec![0u8; want];
+        s.read_exact(&mut first).await.unwrap();
+        tx.send(SocksReq { atyp: h[3], host, port: u16::from_be_bytes(p), first, at })
+            .await
+            .unwrap();
+        // Keep the tunnel open until the relay closes it.
+        let mut sink = [0u8; 64];
+        while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+    });
+    (port, rx)
+}
+
+/// Mock origin: counts accepts, reports each peer's port, echoes until EOF.
+async fn mock_origin() -> (SocketAddr, Arc<AtomicUsize>, mpsc::UnboundedReceiver<u16>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let c = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, peer) = l.accept().await.unwrap();
+            c.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(peer.port());
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    (addr, count, rx)
+}
+
+/// Waits for the peer to close: read returns 0 or an error.
+async fn assert_closed(c: &mut TcpStream, within: Duration) {
+    let mut b = [0u8; 64];
+    let r = tokio::time::timeout(within, async {
+        loop {
+            match c.read(&mut b).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(r.is_ok(), "client socket was not closed");
+}
+
+#[tokio::test]
+async fn proxied_via_socks_with_domain() {
+    let hello = fixture();
+    let (sport, mut reqs) = mock_socks(hello.len()).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![
+            group("ir", Action::Proxy("mock".into()), &["*.ir"], false),
+            group("rest", Action::Block, &[], true),
+        ],
+    );
+    let r = start("5.5.5.5:443".parse().unwrap(), ctx(cfg)).await;
+    let mut c = TcpStream::connect(r.addr).await.unwrap();
+    c.write_all(&hello).await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv()).await.unwrap().unwrap();
+    assert_eq!(req.atyp, 3);
+    assert_eq!(req.host, b"www.digikala.ir");
+    assert_eq!(req.port, 443);
+    assert_eq!(req.first, hello);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn direct_records_own_port() {
+    let (origin, _, mut peers) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let c = ctx(cfg);
+    let r = start(v4(origin), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut b = [0u8; 4];
+    client.read_exact(&mut b).await.unwrap();
+    assert_eq!(&b, b"ping");
+    let upstream_port = peers.recv().await.unwrap();
+    assert!(c.own_ports.contains(&upstream_port), "own_ports missing upstream port");
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while c.own_ports.contains(&upstream_port) {
+        assert!(Instant::now() < deadline, "own_ports not cleared after close");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn proxy_down_fails_closed() {
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let (origin, accepts, _) = mock_origin().await;
+    let cfg = config(vec![socks_profile(dead_port)], vec![group("rest", Action::Proxy("mock".into()), &[], true)]);
+    let c = ctx(cfg);
+    let mut events = c.events.subscribe();
+    let r = start(v4(origin), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let _ = client.write_all(b"hello").await;
+    assert_closed(&mut client, Duration::from_secs(6)).await;
+    let ev = tokio::time::timeout(Duration::from_secs(1), events.recv()).await.unwrap().unwrap();
+    assert_eq!(ev, Event::ProxyDown { id: "mock".into() });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0, "fell back to a direct connection");
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn server_first_timeout() {
+    let (sport, mut reqs) = mock_socks(0).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![
+            group("ir", Action::Direct, &["*.ir"], false),
+            group("rest", Action::Proxy("mock".into()), &[], true),
+        ],
+    );
+    let r = start("5.5.5.5:443".parse().unwrap(), ctx(cfg)).await;
+    let t0 = Instant::now();
+    let _client = TcpStream::connect(r.addr).await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(3), reqs.recv()).await.unwrap().unwrap();
+    let waited = req.at - t0;
+    assert!(waited >= Duration::from_millis(250), "decided too early: {waited:?}");
+    assert!(waited < Duration::from_secs(2), "decided too late: {waited:?}");
+    assert_eq!(req.atyp, 1);
+    assert_eq!(req.host, [5, 5, 5, 5]);
+    assert_eq!(req.port, 443);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn stats_counted() {
+    let (origin, _, _) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let c = ctx(cfg);
+    let r = start(v4(origin), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let data: Vec<u8> = (0..10240u32).map(|i| i as u8).collect();
+    client.write_all(&data).await.unwrap();
+    let mut back = vec![0u8; data.len()];
+    client.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, data);
+    let (up, down) = c.stats.bytes("rest");
+    assert!(up >= 10240, "up = {up}");
+    assert!(down >= 10240, "down = {down}");
+    let (groups, _, _) = c.stats.snapshot();
+    assert_eq!(groups["rest"].active, 1);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn cancel_closes_inflight() {
+    let (origin, _, mut peers) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let r = start(v4(origin), ctx(cfg)).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"x").await.unwrap();
+    let mut b = [0u8; 1];
+    client.read_exact(&mut b).await.unwrap();
+    peers.recv().await.unwrap();
+    r.cancel.cancel();
+    assert_closed(&mut client, Duration::from_secs(2)).await;
+    let res = tokio::time::timeout(Duration::from_secs(2), r.task).await.unwrap().unwrap();
+    assert!(res.is_ok());
+}
