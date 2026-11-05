@@ -135,6 +135,39 @@ fn validate_rejects() {
     let mut c = Config::seed();
     c.default_proxy = "nope".into();
     assert!(c.validate().is_err());
+
+    // Ruling R18: the catch-all must exist and be enabled.
+    let mut c = Config::seed();
+    c.groups.pop();
+    assert!(c.validate().is_err(), "missing catch-all");
+
+    let mut c = Config::seed();
+    c.groups.last_mut().unwrap().enabled = false;
+    assert!(c.validate().is_err(), "disabled catch-all");
+
+    let mut c = Config::seed();
+    c.groups.clear();
+    assert!(c.validate().is_err(), "no groups at all");
+}
+
+#[test]
+fn catch_all_cannot_be_disabled() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    assert!(c.set_group_enabled("everything-else", false).is_err());
+    assert_eq!(c, before);
+    // Other groups still toggle.
+    c.set_group_enabled("games", false).unwrap();
+}
+
+#[test]
+fn load_rejects_disabled_catch_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut c = Config::seed();
+    c.groups.last_mut().unwrap().enabled = false;
+    std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+    assert!(Config::load(&path).is_err());
 }
 
 #[test]

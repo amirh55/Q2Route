@@ -57,7 +57,8 @@ impl MenuModel {
                 .map(|g| {
                     (
                         g.id.clone(),
-                        group_label(&g.name, g.enabled),
+                        // The catch-all is always on (Ruling R18).
+                        group_label(&g.name, g.enabled || g.catch_all),
                         g.action.clone(),
                     )
                 })
@@ -260,6 +261,14 @@ mod tests {
             labels,
             ["Iranian sites", "Steam (off)", "Games", "Everything else"]
         );
+    }
+
+    #[test]
+    fn catch_all_never_marked_off() {
+        let mut s = snap(true);
+        s.config.groups.last_mut().unwrap().enabled = false;
+        let m = MenuModel::of(Some(&s));
+        assert_eq!(m.groups.last().unwrap().1, "Everything else");
     }
 
     #[test]

@@ -284,7 +284,13 @@ impl Config {
                 return bad(format!("catch-all group '{}' must be last", g.id));
             }
         }
-        Ok(())
+        // Ruling R18: an enabled catch-all must always exist, so unmatched
+        // traffic is never silently routed some other way.
+        match self.groups.last() {
+            Some(g) if g.catch_all && g.enabled => Ok(()),
+            Some(g) if g.catch_all => bad(format!("catch-all group '{}' must be enabled", g.id)),
+            _ => bad("a catch-all group (last) is required".into()),
+        }
     }
 
     /// Apply `f` to a clone, validate, and commit only on success (rollback by construction).
@@ -313,9 +319,16 @@ impl Config {
         })
     }
 
+    /// Enables or disables a group. The catch-all cannot be disabled (Ruling R18).
     pub fn set_group_enabled(&mut self, id: &str, on: bool) -> Result<(), ConfigError> {
         self.mutate(|c| {
-            c.group_mut(id)?.enabled = on;
+            let g = c.group_mut(id)?;
+            if g.catch_all && !on {
+                return Err(ConfigError::Invalid(format!(
+                    "the catch-all group '{id}' cannot be disabled"
+                )));
+            }
+            g.enabled = on;
             Ok(())
         })
     }

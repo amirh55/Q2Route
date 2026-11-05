@@ -281,7 +281,7 @@ fn ipv6_proxy_blocked_m1() {
 }
 
 #[test]
-fn empty_rule_matches_nothing_and_no_catch_all_is_direct() {
+fn empty_rule_matches_nothing_and_no_catch_all_is_block() {
     let mut c = cfg();
     c.groups.retain(|g| g.id == "games");
     c.groups[0].rules.push(Rule::default());
@@ -295,7 +295,26 @@ fn empty_rule_matches_nothing_and_no_catch_all_is_direct() {
             "1.2.3.4:443",
             Some("x.com")
         ),
-        fin(Route::Direct, None, MatchReason::NoMatch)
+        fin(Route::Block, None, MatchReason::NoMatch)
+    );
+}
+
+#[test]
+fn disabled_catch_all_blocks_never_direct() {
+    // Ruling R18: a RuleSet without an enabled catch-all must fail closed.
+    let mut c = cfg();
+    c.groups.last_mut().unwrap().enabled = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "1.2.3.4:8443",
+            None
+        ),
+        fin(Route::Block, None, MatchReason::NoMatch)
     );
 }
 

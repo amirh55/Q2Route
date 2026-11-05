@@ -30,8 +30,12 @@ pub enum MatchReason {
     AlwaysDirectApp,
     ExcludedPid,
     Own,
-    Inherited { from_pid: u32 },
+    Inherited {
+        from_pid: u32,
+    },
     CatchAll,
+    /// No group matched and the rule set has no enabled catch-all. Fails
+    /// closed: the route is [`Route::Block`], never Direct (Ruling R18).
     NoMatch,
 }
 
@@ -108,7 +112,8 @@ fn direct(reason: MatchReason) -> Decision {
 }
 
 /// Decide the route for a new flow. Steps run in order: always-direct destination,
-/// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all.
+/// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all
+/// (or Block when there is none).
 /// Returns `NeedDomain` when the outcome may depend on a domain not yet known.
 pub fn decide(
     rs: &RuleSet,
@@ -194,6 +199,14 @@ pub fn decide(
                 reason: MatchReason::CatchAll,
             },
         ),
-        None => direct(MatchReason::NoMatch),
+        // Fail closed (Ruling R18): without a catch-all, unmatched traffic
+        // is blocked, never sent direct from the real IP.
+        None => Decision::Final(
+            Route::Block,
+            MatchInfo {
+                group_id: None,
+                reason: MatchReason::NoMatch,
+            },
+        ),
     }
 }

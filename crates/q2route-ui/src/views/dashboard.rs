@@ -159,6 +159,12 @@ fn header(ui: &mut egui::Ui, s: &StateSnapshot, client: &Client, req: &mut Reque
     });
 }
 
+/// The catch-all cannot be disabled (Ruling R18), so its card has no
+/// Enabled checkbox.
+pub fn has_enabled_toggle(g: &Group) -> bool {
+    !g.catch_all
+}
+
 fn card(ui: &mut egui::Ui, s: &StateSnapshot, g: &Group, client: &Client, req: &mut Requests) {
     egui::Frame::new()
         .fill(CARD)
@@ -169,10 +175,11 @@ fn card(ui: &mut egui::Ui, s: &StateSnapshot, g: &Group, client: &Client, req: &
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let mut enabled = g.enabled;
-                    if ui
-                        .checkbox(&mut enabled, "")
-                        .on_hover_text("Enabled")
-                        .changed()
+                    if has_enabled_toggle(g)
+                        && ui
+                            .checkbox(&mut enabled, "")
+                            .on_hover_text("Enabled")
+                            .changed()
                     {
                         req.send(
                             client,
@@ -265,5 +272,12 @@ mod tests {
             s,
             ["*.ir", "steam.exe + children", "No rules yet", "catch-all"]
         );
+    }
+
+    #[test]
+    fn catch_all_has_no_enabled_toggle() {
+        let cfg = Config::seed();
+        let shown: Vec<bool> = cfg.groups.iter().map(has_enabled_toggle).collect();
+        assert_eq!(shown, [true, true, true, false]);
     }
 }
