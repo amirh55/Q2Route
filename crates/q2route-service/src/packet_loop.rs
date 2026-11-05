@@ -108,7 +108,12 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>) {
         };
         match addr.event() {
             EVENT_SOCKET_CONNECT | EVENT_SOCKET_BIND => table.on_connect(&s),
-            EVENT_SOCKET_CLOSE => table.on_close(&s),
+            EVENT_SOCKET_CLOSE => {
+                table.on_close(&s);
+                // A new socket reusing this local port must not inherit
+                // the old socket's decision.
+                run.cache.on_socket_closed(s.protocol, s.local);
+            }
             _ => {}
         }
     }
@@ -147,7 +152,8 @@ fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunSt
     if tcp4 && f.local.port() == run.relay_port {
         return restore_inbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten;
     }
-    let own_port = f.proto == PROTO_TCP && shared.relay.own_ports.contains(&f.local.port());
+    // The relay's direct upstream sockets are IPv4 TCP only.
+    let own_port = tcp4 && shared.relay.own_ports.contains(&f.local.port());
     let nat_has = tcp4
         && run
             .nat
@@ -186,7 +192,7 @@ fn lookup_pid(run: &RunState, f: &FlowId) -> u32 {
             remote: f.remote,
         })
         .or_else(|| table.pid_for_local(f.local))
-        .or_else(|| winapi::owner_pid(f.proto, f.local))
+        .or_else(|| winapi::owner_pid(f.proto, f.local, f.remote))
         .unwrap_or(0)
 }
 

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -52,12 +53,16 @@ pub enum Action {
 struct CacheEntry {
     direct: bool,
     last_seen: Instant,
+    /// Rules generation the decision was made under.
+    generation: u64,
 }
 
 /// Per-flow route cache: `true` = Direct. Thread-safe.
 #[derive(Default)]
 pub struct FlowCache {
     map: Mutex<HashMap<FlowId, CacheEntry>>,
+    /// Bumped by [`FlowCache::on_rules_changed`].
+    generation: AtomicU64,
 }
 
 impl FlowCache {
@@ -65,22 +70,56 @@ impl FlowCache {
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Current rules generation. Read it *before* loading the rules for a
+    /// decision and store the decision with [`FlowCache::put_at`].
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     /// Cached decision (`true` = Direct); refreshes the entry's idle timer.
+    /// A decision made under older rules counts as uncached, except a
+    /// non-Direct TCP one (such a flow must never continue direct).
     pub fn get(&self, id: &FlowId) -> Option<bool> {
+        let current = self.generation();
         let mut g = self.lock();
         let e = g.get_mut(id)?;
+        if e.generation != current && (id.proto != PROTO_TCP || e.direct) {
+            g.remove(id);
+            return None;
+        }
         e.last_seen = Instant::now();
         Some(e.direct)
     }
 
+    /// Stores a decision made under the current rules generation.
     pub fn put(&self, id: FlowId, direct: bool) {
+        self.put_at(id, direct, self.generation());
+    }
+
+    /// Stores a decision made under rules generation `generation`.
+    pub fn put_at(&self, id: FlowId, direct: bool, generation: u64) {
         self.lock().insert(
             id,
             CacheEntry {
                 direct,
                 last_seen: Instant::now(),
+                generation,
             },
         );
+    }
+
+    /// A Socket-layer CLOSE for `local` (an unspecified ip matches any local
+    /// ip with that port): forgets its UDP decisions and its Direct TCP
+    /// decisions, so a new socket reusing the port is decided afresh.
+    /// Non-Direct TCP decisions stay, so the closed flow's stray packets
+    /// (FIN retransmits, final ACK) are still never sent direct.
+    pub fn on_socket_closed(&self, proto: u8, local: SocketAddr) {
+        let same_local = |l: &SocketAddr| {
+            l.port() == local.port() && (local.ip().is_unspecified() || l.ip() == local.ip())
+        };
+        self.lock().retain(|id, e| {
+            !(id.proto == proto && same_local(&id.local) && (proto != PROTO_TCP || e.direct))
+        });
     }
 
     /// Drops entries idle past [`TCP_CACHE_IDLE`] / [`UDP_CACHE_IDLE`].
@@ -101,6 +140,9 @@ impl FlowCache {
     /// non-Direct TCP decisions are kept: such a flow went to the relay and
     /// must never continue direct.
     pub fn on_rules_changed(&self) {
+        // Bump first: a decision still being made under the old rules is
+        // stored with the old generation and so ignored by `get`.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.lock()
             .retain(|id, e| id.proto == PROTO_TCP && !e.direct);
     }
@@ -138,11 +180,14 @@ pub fn classify(
         return Action::Pass;
     }
     let id = m.flow;
+    // Read before `decide` loads the rules (the engine swaps rules, then
+    // bumps the generation), so an old-rules decision is never trusted.
+    let generation = cache.generation();
     // Decides now and remembers the outcome; returns (pid, is_direct).
     let decide_now = |decide: &mut dyn FnMut() -> (u32, Decision)| -> (u32, bool) {
         let (pid, d) = decide();
         let direct = pid == own_pid || matches!(d, Decision::Final(Route::Direct, _));
-        cache.put(id, direct);
+        cache.put_at(id, direct, generation);
         (pid, direct)
     };
     // Every path below calls `decide` at most once.
@@ -532,6 +577,56 @@ mod tests {
             run(&tcp(false), &c, false, APP_PID, direct(), &n),
             Action::Drop
         );
+    }
+
+    #[test]
+    fn socket_close_forgets_udp_decision_for_reused_port() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let u = meta(PROTO_UDP, "10.0.0.2:5000", "8.8.4.4:443", false);
+        assert_eq!(run(&u, &c, false, APP_PID, direct(), &n), Action::Pass);
+        // The socket closes; a proxied app reuses the port for the same remote.
+        c.on_socket_closed(PROTO_UDP, "10.0.0.2:5000".parse().unwrap());
+        assert_eq!(run(&u, &c, false, APP_PID + 1, block(), &n), Action::Drop);
+        // A wildcard-bound close also matches the concrete local address.
+        assert_eq!(run(&u, &c, false, APP_PID, block(), &n), Action::Drop);
+        c.put(u.flow, true);
+        c.on_socket_closed(PROTO_UDP, "0.0.0.0:5000".parse().unwrap());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn socket_close_keeps_proxied_tcp_but_forgets_direct_tcp() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let d = meta(PROTO_TCP, "192.168.1.5:50001", "5.6.7.8:443", false);
+        run(&tcp(true), &c, false, APP_PID, proxy(), &n);
+        run(&d, &c, false, APP_PID, direct(), &n);
+        c.on_socket_closed(PROTO_TCP, tcp(true).flow.local);
+        c.on_socket_closed(PROTO_TCP, d.flow.local);
+        // Stray packets of the closed proxied flow still never leave direct.
+        assert_eq!(
+            run(&tcp(false), &c, false, APP_PID, direct(), &n),
+            Action::Drop
+        );
+        assert_eq!(run(&d, &c, false, APP_PID, proxy(), &n), Action::Drop);
+    }
+
+    #[test]
+    fn decision_made_with_old_rules_is_not_trusted_after_rule_change() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let u = meta(PROTO_UDP, "10.0.0.2:5000", "8.8.4.4:443", false);
+        // A packet thread is mid-decision (old rules: Direct) while the
+        // rules are swapped and the cache is invalidated.
+        let a = classify(&u, false, OWN_PID, &c, false, || {
+            c.on_rules_changed();
+            (APP_PID, direct())
+        });
+        assert_eq!(
+            a,
+            Action::Pass,
+            "that one packet was decided under the old rules"
+        );
+        assert_eq!(run(&u, &c, false, APP_PID, block(), &n), Action::Drop);
+        assert_eq!(n.get(), 1, "re-decided under the new rules");
     }
 
     #[test]

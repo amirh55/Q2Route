@@ -14,9 +14,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
-    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_CLASS, TCP_TABLE_OWNER_PID_ALL,
-    TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_TIME_WAIT, MIB_UDP6ROW_OWNER_PID,
+    MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_CLASS,
+    TCP_TABLE_OWNER_PID_ALL, TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -235,42 +235,62 @@ pub fn listener_pid(port: u16, ip: IpAddr) -> Option<u32> {
 }
 
 /// Owner pid of the local TCP (`proto == 6`) or UDP (`proto == 17`) socket
-/// bound to `local` (an exact address match is preferred over a wildcard
-/// bind). Used when the Socket-layer event for a flow has not arrived yet.
-pub fn owner_pid(proto: u8, local: SocketAddr) -> Option<u32> {
-    let mut exact = None;
-    let mut wildcard = None;
-    let mut consider = |addr: IpAddr, port: u32, pid: u32| {
-        if port_from_dw(port) != local.port() {
+/// bound to `local`. Used when the Socket-layer event for a flow has not
+/// arrived yet. Preference: for TCP a row also matching `remote`, then an
+/// exact local address, then a wildcard bind. Rows owned by pid 0 and TCP
+/// rows in TIME_WAIT (no live owner) are skipped.
+pub fn owner_pid(proto: u8, local: SocketAddr, remote: SocketAddr) -> Option<u32> {
+    // best[0]: local + remote match, best[1]: exact local, best[2]: wildcard.
+    let mut best: [Option<u32>; 3] = [None; 3];
+    let unmap = |addr: IpAddr| match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
+        v4 => v4,
+    };
+    let mut consider = |addr: IpAddr, port: u32, peer: Option<SocketAddr>, pid: u32| {
+        if pid == 0 || port_from_dw(port) != local.port() {
             return;
         }
-        let addr = match addr {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
-            v4 => v4,
+        let addr = unmap(addr);
+        let rank = if addr == local.ip() || addr.is_unspecified() {
+            if peer == Some(remote) {
+                0
+            } else if addr == local.ip() {
+                1
+            } else {
+                2
+            }
+        } else {
+            return;
         };
-        if addr == local.ip() {
-            exact.get_or_insert(pid);
-        } else if addr.is_unspecified() {
-            wildcard.get_or_insert(pid);
-        }
+        best[rank].get_or_insert(pid);
     };
     // dwLocalAddr is in network byte order as laid out in memory.
     let v4 = |dw: u32| IpAddr::V4(Ipv4Addr::from(dw.to_ne_bytes()));
     let v6 = |b: [u8; 16]| IpAddr::V6(Ipv6Addr::from(b));
+    let time_wait = MIB_TCP_STATE_TIME_WAIT.0 as u32;
     match proto {
         6 => {
             if let Some(buf) = tcp_table(AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL) {
                 let off = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
                 // SAFETY: buffer was filled by GetExtendedTcpTable(AF_INET, OWNER_PID).
                 for r in unsafe { rows::<MIB_TCPROW_OWNER_PID>(&buf, off) } {
-                    consider(v4(r.dwLocalAddr), r.dwLocalPort, r.dwOwningPid);
+                    if r.dwState == time_wait {
+                        continue;
+                    }
+                    let peer = SocketAddr::new(v4(r.dwRemoteAddr), port_from_dw(r.dwRemotePort));
+                    consider(v4(r.dwLocalAddr), r.dwLocalPort, Some(peer), r.dwOwningPid);
                 }
             }
             if let Some(buf) = tcp_table(AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL) {
                 let off = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
                 // SAFETY: buffer was filled by GetExtendedTcpTable(AF_INET6, OWNER_PID).
                 for r in unsafe { rows::<MIB_TCP6ROW_OWNER_PID>(&buf, off) } {
-                    consider(v6(r.ucLocalAddr), r.dwLocalPort, r.dwOwningPid);
+                    if r.dwState == time_wait {
+                        continue;
+                    }
+                    let peer =
+                        SocketAddr::new(unmap(v6(r.ucRemoteAddr)), port_from_dw(r.dwRemotePort));
+                    consider(v6(r.ucLocalAddr), r.dwLocalPort, Some(peer), r.dwOwningPid);
                 }
             }
         }
@@ -279,20 +299,20 @@ pub fn owner_pid(proto: u8, local: SocketAddr) -> Option<u32> {
                 let off = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
                 // SAFETY: buffer was filled by GetExtendedUdpTable(AF_INET, OWNER_PID).
                 for r in unsafe { rows::<MIB_UDPROW_OWNER_PID>(&buf, off) } {
-                    consider(v4(r.dwLocalAddr), r.dwLocalPort, r.dwOwningPid);
+                    consider(v4(r.dwLocalAddr), r.dwLocalPort, None, r.dwOwningPid);
                 }
             }
             if let Some(buf) = udp_table(AF_INET6.0 as u32) {
                 let off = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
                 // SAFETY: buffer was filled by GetExtendedUdpTable(AF_INET6, OWNER_PID).
                 for r in unsafe { rows::<MIB_UDP6ROW_OWNER_PID>(&buf, off) } {
-                    consider(v6(r.ucLocalAddr), r.dwLocalPort, r.dwOwningPid);
+                    consider(v6(r.ucLocalAddr), r.dwLocalPort, None, r.dwOwningPid);
                 }
             }
         }
         _ => {}
     }
-    exact.or(wildcard)
+    best.into_iter().flatten().next()
 }
 
 /// Exe path, parent and start time of a single process (Ruling R5: on-demand
@@ -384,13 +404,17 @@ mod tests {
     fn owner_pid_finds_tcp_and_udp_sockets() {
         let me = Some(std::process::id());
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        assert_eq!(owner_pid(6, c.local_addr().unwrap()), me);
+        let server = l.local_addr().unwrap();
+        let c = std::net::TcpStream::connect(server).unwrap();
+        let local = c.local_addr().unwrap();
+        assert_eq!(owner_pid(6, local, server), me, "local + remote match");
+        let other: SocketAddr = "9.9.9.9:9".parse().unwrap();
+        assert_eq!(owner_pid(6, local, other), me, "local-only match");
         let u = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = u.local_addr().unwrap().port();
         let any_local = SocketAddr::from(([192, 168, 77, 1], port));
-        assert_eq!(owner_pid(17, any_local), me, "wildcard bind matches");
-        assert_eq!(owner_pid(99, c.local_addr().unwrap()), None);
+        assert_eq!(owner_pid(17, any_local, other), me, "wildcard bind matches");
+        assert_eq!(owner_pid(99, local, server), None);
     }
 
     #[test]
