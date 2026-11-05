@@ -386,6 +386,18 @@ pub fn calc_checksums(pkt: &mut [u8]) {
     }
 }
 
+/// Like [`calc_checksums`], but also sets the IP/TCP/UDP checksum-valid
+/// flags in `addr`, as WinDivert recommends before reinjecting a modified
+/// packet. Returns `false` if the helper failed.
+pub fn calc_checksums_addr(pkt: &mut [u8], addr: &mut Address) -> bool {
+    let Ok(len) = len_u32(pkt.len()) else {
+        return false;
+    };
+    // SAFETY: `pkt` points to `len` writable bytes and `addr` to a valid,
+    // writable WINDIVERT_ADDRESS; the helper parses within `len` bytes only.
+    unsafe { WinDivertHelperCalcChecksums(pkt.as_mut_ptr().cast(), len, addr, 0) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

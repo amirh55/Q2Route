@@ -19,13 +19,18 @@ q2route-core = { path = "../q2route-core" }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
+windows-service = "0.8"
 
 [dev-dependencies]
 etherparse = "0.21"

@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::windivert::{calc_checksums, Address};
+use crate::windivert::{calc_checksums_addr, Address};
 
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const CLOSE_LINGER: Duration = Duration::from_secs(10);
@@ -174,7 +174,7 @@ fn swap_ips(p: &mut [u8]) {
 /// Reinjects the rewritten packet as inbound with fresh checksums.
 fn finish(p: &mut [u8], addr: &mut Address) -> Verdict {
     addr.set_outbound(false);
-    calc_checksums(p);
+    calc_checksums_addr(p, addr);
     Verdict::Rewritten
 }
 
