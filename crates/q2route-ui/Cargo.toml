@@ -1,0 +1,11 @@
+[package]
+name = "q2route-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "q2route"
+path = "src/main.rs"
+
+[dependencies]
+q2route-core = { path = "../q2route-core" }

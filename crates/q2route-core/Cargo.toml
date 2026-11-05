@@ -1,0 +1,5 @@
+[package]
+name = "q2route-core"
+version.workspace = true
+edition.workspace = true
+
