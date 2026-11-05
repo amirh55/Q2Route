@@ -15,7 +15,10 @@ pub enum MatchError {
     #[error("invalid app pattern '{0}'")]
     App(String),
     #[error("group '{group}': {source}")]
-    Group { group: String, source: Box<MatchError> },
+    Group {
+        group: String,
+        source: Box<MatchError>,
+    },
 }
 
 fn norm_host(h: &str) -> String {
@@ -36,11 +39,19 @@ impl DomainPattern {
         let t = s.trim();
         if let Some(k) = t.strip_prefix("keyword:") {
             let k = k.trim().to_lowercase();
-            return if k.is_empty() { Err(bad()) } else { Ok(Self::Keyword(k)) };
+            return if k.is_empty() {
+                Err(bad())
+            } else {
+                Ok(Self::Keyword(k))
+            };
         }
         if let Some(rest) = t.strip_prefix("*.") {
             let r = norm_host(rest);
-            return if r.is_empty() { Err(bad()) } else { Ok(Self::Suffix(r)) };
+            return if r.is_empty() {
+                Err(bad())
+            } else {
+                Ok(Self::Suffix(r))
+            };
         }
         let h = norm_host(t);
         if h.is_empty() || h.contains('*') {
@@ -94,7 +105,10 @@ impl PortRange {
         let bad = || MatchError::Port(s.to_string());
         let t = s.trim();
         let (lo, hi) = match t.split_once('-') {
-            Some((a, b)) => (a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?),
+            Some((a, b)) => (
+                a.trim().parse().map_err(|_| bad())?,
+                b.trim().parse().map_err(|_| bad())?,
+            ),
             None => {
                 let p = t.parse().map_err(|_| bad())?;
                 (p, p)
@@ -167,7 +181,13 @@ impl AppMatcher {
 /// Destinations that always go Direct: loopback, private/LAN, link-local, multicast, broadcast.
 pub fn is_always_direct_dst(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(a) => a.is_loopback() || a.is_private() || a.is_link_local() || a.is_multicast() || a.is_broadcast(),
+        IpAddr::V4(a) => {
+            a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_multicast()
+                || a.is_broadcast()
+        }
         IpAddr::V6(a) => {
             let first = a.segments()[0];
             a.is_loopback() || (first & 0xffc0) == 0xfe80 || (first & 0xff00) == 0xff00

@@ -77,7 +77,10 @@ impl XorShift {
 
 #[test]
 fn tls_sni() {
-    assert_eq!(peek_host(&fixture()), PeekResult::Host("www.digikala.ir".into()));
+    assert_eq!(
+        peek_host(&fixture()),
+        PeekResult::Host("www.digikala.ir".into())
+    );
 }
 
 #[test]
@@ -108,7 +111,10 @@ fn http_host() {
 
 #[test]
 fn http_partial_needs_more() {
-    assert_eq!(peek_host(b"GET / HTTP/1.1\r\nUser-Agent: x\r\n"), PeekResult::NeedMore);
+    assert_eq!(
+        peek_host(b"GET / HTTP/1.1\r\nUser-Agent: x\r\n"),
+        PeekResult::NeedMore
+    );
     assert_eq!(peek_host(b"GET / HT"), PeekResult::NeedMore);
     assert_eq!(peek_host(b"GE"), PeekResult::NeedMore);
     // Complete headers but no Host header.

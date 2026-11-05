@@ -16,7 +16,10 @@ fn cfg() -> Config {
             name: "Filtered game".into(),
             enabled: true,
             action: Action::Proxy("v2ray".into()),
-            rules: vec![Rule { apps: vec!["fgame.exe".into()], ..Rule::default() }],
+            rules: vec![Rule {
+                apps: vec!["fgame.exe".into()],
+                ..Rule::default()
+            }],
             catch_all: false,
         },
     );
@@ -26,10 +29,20 @@ fn cfg() -> Config {
 fn tree() -> ProcessTree {
     let mut t = ProcessTree::default();
     let mut add = |pid, parent, exe: &str, st| {
-        t.insert(ProcInfo { pid, parent, exe: PathBuf::from(exe), start_time: st });
+        t.insert(ProcInfo {
+            pid,
+            parent,
+            exe: PathBuf::from(exe),
+            start_time: st,
+        });
     };
     add(10, 0, r"C:\Program Files (x86)\Steam\steam.exe", 1);
-    add(20, 10, r"C:\Program Files (x86)\Steam\bin\steamwebhelper.exe", 2);
+    add(
+        20,
+        10,
+        r"C:\Program Files (x86)\Steam\bin\steamwebhelper.exe",
+        2,
+    );
     add(30, 10, r"C:\Games\fgame.exe", 3);
     add(40, 0, r"C:\Program Files\Google\Chrome\chrome.exe", 4);
     add(50, 0, r"C:\Tools\v2ray.exe", 5);
@@ -39,17 +52,47 @@ fn tree() -> ProcessTree {
     t
 }
 
-fn run(rs: &RuleSet, ex: &HashSet<u32>, proto: Protocol, pid: u32, dst: &str, domain: Option<&str>) -> Decision {
+fn run(
+    rs: &RuleSet,
+    ex: &HashSet<u32>,
+    proto: Protocol,
+    pid: u32,
+    dst: &str,
+    domain: Option<&str>,
+) -> Decision {
     let dst: SocketAddr = dst.parse().unwrap();
-    decide(rs, &tree(), ex, &FlowInfo { proto, pid, dst, domain })
+    decide(
+        rs,
+        &tree(),
+        ex,
+        &FlowInfo {
+            proto,
+            pid,
+            dst,
+            domain,
+        },
+    )
 }
 
 fn d(proto: Protocol, pid: u32, dst: &str, domain: Option<&str>) -> Decision {
-    run(&RuleSet::compile(&cfg()).unwrap(), &HashSet::new(), proto, pid, dst, domain)
+    run(
+        &RuleSet::compile(&cfg()).unwrap(),
+        &HashSet::new(),
+        proto,
+        pid,
+        dst,
+        domain,
+    )
 }
 
 fn fin(route: Route, gid: Option<&str>, reason: MatchReason) -> Decision {
-    Decision::Final(route, MatchInfo { group_id: gid.map(String::from), reason })
+    Decision::Final(
+        route,
+        MatchInfo {
+            group_id: gid.map(String::from),
+            reason,
+        },
+    )
 }
 
 fn proxy() -> Route {
@@ -66,7 +109,10 @@ fn ir_domain_direct() {
 
 #[test]
 fn unknown_domain_443_needs_peek() {
-    assert_eq!(d(Protocol::Tcp, 40, "1.2.3.4:443", None), Decision::NeedDomain);
+    assert_eq!(
+        d(Protocol::Tcp, 40, "1.2.3.4:443", None),
+        Decision::NeedDomain
+    );
 }
 
 #[test]
@@ -92,7 +138,11 @@ fn server_first_no_domain() {
 fn steam_child_inherits() {
     assert_eq!(
         d(Protocol::Tcp, 20, "8.8.8.8:443", Some("example.com")),
-        fin(Route::Direct, Some("steam"), MatchReason::Inherited { from_pid: 10 })
+        fin(
+            Route::Direct,
+            Some("steam"),
+            MatchReason::Inherited { from_pid: 10 }
+        )
     );
 }
 
@@ -107,10 +157,17 @@ fn steam_itself_is_own() {
 #[test]
 fn inherited_unknown_domain_needs_peek_only_on_web_ports() {
     // The *.ir rule (own pass) needs the domain on 443.
-    assert_eq!(d(Protocol::Tcp, 20, "8.8.8.8:443", None), Decision::NeedDomain);
+    assert_eq!(
+        d(Protocol::Tcp, 20, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
     assert_eq!(
         d(Protocol::Tcp, 20, "8.8.8.8:27015", None),
-        fin(Route::Direct, Some("steam"), MatchReason::Inherited { from_pid: 10 })
+        fin(
+            Route::Direct,
+            Some("steam"),
+            MatchReason::Inherited { from_pid: 10 }
+        )
     );
 }
 
@@ -121,11 +178,29 @@ fn inherited_rule_other_conditions_must_hold() {
     let rs = RuleSet::compile(&c).unwrap();
     let ex = HashSet::new();
     assert_eq!(
-        run(&rs, &ex, Protocol::Tcp, 20, "8.8.8.8:27015", Some("example.com")),
-        fin(Route::Direct, Some("steam"), MatchReason::Inherited { from_pid: 10 })
+        run(
+            &rs,
+            &ex,
+            Protocol::Tcp,
+            20,
+            "8.8.8.8:27015",
+            Some("example.com")
+        ),
+        fin(
+            Route::Direct,
+            Some("steam"),
+            MatchReason::Inherited { from_pid: 10 }
+        )
     );
     assert_eq!(
-        run(&rs, &ex, Protocol::Tcp, 20, "8.8.8.8:443", Some("example.com")),
+        run(
+            &rs,
+            &ex,
+            Protocol::Tcp,
+            20,
+            "8.8.8.8:443",
+            Some("example.com")
+        ),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
 }
@@ -169,7 +244,14 @@ fn lan_rule_off() {
     let mut rs = RuleSet::compile(&cfg()).unwrap();
     rs.lan_direct = false;
     assert_eq!(
-        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "127.0.0.1:443", Some("x.com")),
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "127.0.0.1:443",
+            Some("x.com")
+        ),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
 }
@@ -205,7 +287,14 @@ fn empty_rule_matches_nothing_and_no_catch_all_is_direct() {
     c.groups[0].rules.push(Rule::default());
     let rs = RuleSet::compile(&c).unwrap();
     assert_eq!(
-        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", Some("x.com")),
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "1.2.3.4:443",
+            Some("x.com")
+        ),
         fin(Route::Direct, None, MatchReason::NoMatch)
     );
 }

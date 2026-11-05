@@ -148,7 +148,12 @@ pub struct Config {
 
 impl Config {
     pub fn seed() -> Config {
-        let group = |id: &str, name: &str, enabled: bool, action: Action, rules: Vec<Rule>, catch_all: bool| Group {
+        let group = |id: &str,
+                     name: &str,
+                     enabled: bool,
+                     action: Action,
+                     rules: Vec<Rule>,
+                     catch_all: bool| Group {
             id: id.into(),
             name: name.into(),
             enabled,
@@ -172,7 +177,10 @@ impl Config {
                     "Iranian sites",
                     true,
                     Action::Direct,
-                    vec![Rule { domains: vec!["*.ir".into()], ..Rule::default() }],
+                    vec![Rule {
+                        domains: vec!["*.ir".into()],
+                        ..Rule::default()
+                    }],
                     false,
                 ),
                 group(
@@ -180,16 +188,35 @@ impl Config {
                     "Steam",
                     false,
                     Action::Direct,
-                    vec![Rule { apps: vec!["steam.exe".into()], include_children: true, ..Rule::default() }],
+                    vec![Rule {
+                        apps: vec!["steam.exe".into()],
+                        include_children: true,
+                        ..Rule::default()
+                    }],
                     false,
                 ),
                 group("games", "Games", true, Action::Direct, vec![], false),
-                group("everything-else", "Everything else", true, Action::Proxy("v2ray".into()), vec![], true),
+                group(
+                    "everything-else",
+                    "Everything else",
+                    true,
+                    Action::Proxy("v2ray".into()),
+                    vec![],
+                    true,
+                ),
             ],
-            always_direct: ["v2ray.exe", "xray.exe", "sing-box.exe", "v2rayN.exe", "nekoray.exe", "hiddify.exe", "clash*.exe"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            always_direct: [
+                "v2ray.exe",
+                "xray.exe",
+                "sing-box.exe",
+                "v2rayN.exe",
+                "nekoray.exe",
+                "hiddify.exe",
+                "clash*.exe",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             default_proxy: "v2ray".into(),
             settings: Settings::default(),
         }
@@ -238,7 +265,10 @@ impl Config {
             }
         }
         if !pids.contains(self.default_proxy.as_str()) {
-            return bad(format!("default_proxy '{}' is not a known proxy", self.default_proxy));
+            return bad(format!(
+                "default_proxy '{}' is not a known proxy",
+                self.default_proxy
+            ));
         }
         let mut gids = HashSet::new();
         for (i, g) in self.groups.iter().enumerate() {
@@ -258,7 +288,10 @@ impl Config {
     }
 
     /// Apply `f` to a clone, validate, and commit only on success (rollback by construction).
-    fn mutate(&mut self, f: impl FnOnce(&mut Config) -> Result<(), ConfigError>) -> Result<(), ConfigError> {
+    fn mutate(
+        &mut self,
+        f: impl FnOnce(&mut Config) -> Result<(), ConfigError>,
+    ) -> Result<(), ConfigError> {
         let mut next = self.clone();
         f(&mut next)?;
         next.validate()?;

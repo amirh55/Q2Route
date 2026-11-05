@@ -54,8 +54,12 @@ pub enum Response {
 pub enum Event {
     /// Sent ~4x per second after `Subscribe`.
     Snapshot(Box<StateSnapshot>),
-    ProxyDown { id: ProfileId },
-    ProxyUp { id: ProfileId },
+    ProxyDown {
+        id: ProfileId,
+    },
+    ProxyUp {
+        id: ProfileId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -67,7 +71,10 @@ pub enum ServerMsg {
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, m: &T) -> io::Result<()> {
     let body = serde_json::to_vec(m).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_MSG {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
     }
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -83,7 +90,10 @@ pub async fn read_msg<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> i
     r.read_exact(&mut hdr).await?;
     let len = u32::from_le_bytes(hdr) as usize;
     if len > MAX_MSG {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;

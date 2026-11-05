@@ -77,7 +77,9 @@ fn eval_conditions(rule: &CompiledRule, f: &FlowInfo) -> RuleOutcome {
         return match f.domain {
             Some(d) if rule.domains.iter().any(|m| m.matches(d)) => RuleOutcome::Match,
             Some(_) => RuleOutcome::NoMatch,
-            None if f.proto == Protocol::Tcp && matches!(f.dst.port(), 80 | 443) => RuleOutcome::NeedDomain,
+            None if f.proto == Protocol::Tcp && matches!(f.dst.port(), 80 | 443) => {
+                RuleOutcome::NeedDomain
+            }
             None => RuleOutcome::NoMatch,
         };
     }
@@ -96,17 +98,31 @@ fn finalize(action: &Action, f: &FlowInfo, info: MatchInfo) -> Decision {
 }
 
 fn direct(reason: MatchReason) -> Decision {
-    Decision::Final(Route::Direct, MatchInfo { group_id: None, reason })
+    Decision::Final(
+        Route::Direct,
+        MatchInfo {
+            group_id: None,
+            reason,
+        },
+    )
 }
 
 /// Decide the route for a new flow. Steps run in order: always-direct destination,
 /// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all.
 /// Returns `NeedDomain` when the outcome may depend on a domain not yet known.
-pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f: &FlowInfo) -> Decision {
+pub fn decide(
+    rs: &RuleSet,
+    tree: &ProcessTree,
+    excluded_pids: &HashSet<u32>,
+    f: &FlowInfo,
+) -> Decision {
     // 1. Always-direct destinations (LAN, multicast, DNS, NTP).
     if rs.lan_direct {
         let port = f.dst.port();
-        if is_always_direct_dst(f.dst.ip()) || port == 53 || (f.proto == Protocol::Udp && port == 123) {
+        if is_always_direct_dst(f.dst.ip())
+            || port == 53
+            || (f.proto == Protocol::Udp && port == 123)
+        {
             return direct(MatchReason::AlwaysDirectDst);
         }
     }
@@ -131,7 +147,10 @@ pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f:
             }
             match eval_conditions(r, f) {
                 RuleOutcome::Match => {
-                    let info = MatchInfo { group_id: Some(g.id.clone()), reason: MatchReason::Own };
+                    let info = MatchInfo {
+                        group_id: Some(g.id.clone()),
+                        reason: MatchReason::Own,
+                    };
                     return finalize(&g.action, f, info);
                 }
                 RuleOutcome::NeedDomain => return Decision::NeedDomain,
@@ -144,7 +163,10 @@ pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f:
     for anc in &ancestors {
         for g in rs.groups.iter().filter(|g| !g.catch_all) {
             for r in &g.rules {
-                if r.apps.is_empty() || !r.include_children || !r.apps.iter().any(|m| m.matches(&anc.exe)) {
+                if r.apps.is_empty()
+                    || !r.include_children
+                    || !r.apps.iter().any(|m| m.matches(&anc.exe))
+                {
                     continue;
                 }
                 match eval_conditions(r, f) {
@@ -164,7 +186,14 @@ pub fn decide(rs: &RuleSet, tree: &ProcessTree, excluded_pids: &HashSet<u32>, f:
 
     // 6. Catch-all.
     match rs.groups.iter().find(|g| g.catch_all) {
-        Some(g) => finalize(&g.action, f, MatchInfo { group_id: Some(g.id.clone()), reason: MatchReason::CatchAll }),
+        Some(g) => finalize(
+            &g.action,
+            f,
+            MatchInfo {
+                group_id: Some(g.id.clone()),
+                reason: MatchReason::CatchAll,
+            },
+        ),
         None => direct(MatchReason::NoMatch),
     }
 }

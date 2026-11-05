@@ -97,7 +97,9 @@ async fn socks5_mock(
         }
         _ => panic!("bad atyp"),
     }
-    s.write_all(&[5, rep, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    s.write_all(&[5, rep, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
     if rep == 0 {
         echo(s).await;
     }
@@ -226,7 +228,10 @@ async fn http_connect_ok() {
     assert_eq!(&b, b"ping");
     drop(s);
     let req = srv.await.unwrap();
-    assert!(req.starts_with("CONNECT digikala.ir:443 HTTP/1.1\r\n"), "{req}");
+    assert!(
+        req.starts_with("CONNECT digikala.ir:443 HTTP/1.1\r\n"),
+        "{req}"
+    );
     assert!(req.contains("Proxy-Authorization: Basic dTpw\r\n"), "{req}");
 }
 
@@ -268,7 +273,11 @@ async fn socks4a_domain_and_ip() {
             let mut rest = Vec::new();
             let mut b = [0u8; 1];
             // userid NUL, then (SOCKS4a only) host NUL
-            let nuls = if h[4..7] == [0, 0, 0] && h[7] != 0 { 2 } else { 1 };
+            let nuls = if h[4..7] == [0, 0, 0] && h[7] != 0 {
+                2
+            } else {
+                1
+            };
             for _ in 0..nuls {
                 loop {
                     s.read_exact(&mut b).await.unwrap();

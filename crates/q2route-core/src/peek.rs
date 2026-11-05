@@ -13,7 +13,14 @@ pub enum PeekResult {
 }
 
 const HTTP_METHODS: [&[u8]; 9] = [
-    b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"CONNECT ", b"OPTIONS ", b"TRACE ",
+    b"GET ",
+    b"POST ",
+    b"HEAD ",
+    b"PUT ",
+    b"DELETE ",
+    b"CONNECT ",
+    b"OPTIONS ",
+    b"TRACE ",
     b"PATCH ",
 ];
 /// Give up looking for the end of HTTP headers after this many bytes.
@@ -45,10 +52,12 @@ impl<'a> Cur<'a> {
         self.take(1).map(|b| b[0] as usize)
     }
     fn u16(&mut self) -> Option<usize> {
-        self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        self.take(2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
     }
     fn u24(&mut self) -> Option<usize> {
-        self.take(3).map(|b| (b[0] as usize) << 16 | (b[1] as usize) << 8 | b[2] as usize)
+        self.take(3)
+            .map(|b| (b[0] as usize) << 16 | (b[1] as usize) << 8 | b[2] as usize)
     }
 }
 
@@ -125,7 +134,11 @@ fn peek_http(buf: &[u8]) -> PeekResult {
         }
     }
     if !is_http {
-        return if maybe { PeekResult::NeedMore } else { PeekResult::NotFound };
+        return if maybe {
+            PeekResult::NeedMore
+        } else {
+            PeekResult::NotFound
+        };
     }
     let (mut head, complete) = match find(buf, b"\r\n\r\n") {
         Some(i) => (&buf[..i], true),
@@ -138,9 +151,14 @@ fn peek_http(buf: &[u8]) -> PeekResult {
     // Skip the request line.
     for line in head.split(|&b| b == b'\n').skip(1) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
         if line[..colon].eq_ignore_ascii_case(b"host") {
-            return match std::str::from_utf8(&line[colon + 1..]).ok().and_then(normalize) {
+            return match std::str::from_utf8(&line[colon + 1..])
+                .ok()
+                .and_then(normalize)
+            {
                 Some(h) => PeekResult::Host(h),
                 None => PeekResult::NotFound,
             };

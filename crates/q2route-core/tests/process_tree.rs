@@ -2,7 +2,12 @@ use q2route_core::process_tree::*;
 use std::path::PathBuf;
 
 fn p(pid: u32, parent: u32, name: &str, start: u64) -> ProcInfo {
-    ProcInfo { pid, parent, exe: PathBuf::from(name), start_time: start }
+    ProcInfo {
+        pid,
+        parent,
+        exe: PathBuf::from(name),
+        start_time: start,
+    }
 }
 
 fn pids(v: Vec<&ProcInfo>) -> Vec<u32> {

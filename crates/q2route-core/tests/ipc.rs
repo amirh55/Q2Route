@@ -15,8 +15,14 @@ async fn roundtrip_over_duplex() {
         Request::GetState,
         Request::Start,
         Request::Stop,
-        Request::SetGroupAction { group_id: "g".into(), action: Action::Direct },
-        Request::SetGroupEnabled { group_id: "g".into(), enabled: false },
+        Request::SetGroupAction {
+            group_id: "g".into(),
+            action: Action::Direct,
+        },
+        Request::SetGroupEnabled {
+            group_id: "g".into(),
+            enabled: false,
+        },
         Request::UpsertProxy(profile()),
         Request::DeleteProxy { id: "v2ray".into() },
         Request::TestProxy { id: "v2ray".into() },
@@ -37,7 +43,14 @@ async fn server_msgs_roundtrip() {
     let snap = StateSnapshot {
         running: true,
         config: Config::seed(),
-        groups: HashMap::from([("g".to_string(), GroupStats { up_bps: 1, down_bps: 2, active: 3 })]),
+        groups: HashMap::from([(
+            "g".to_string(),
+            GroupStats {
+                up_bps: 1,
+                down_bps: 2,
+                active: 3,
+            },
+        )]),
         proxy_up: HashMap::from([("v2ray".to_string(), true)]),
         total_up_bps: 10,
         total_down_bps: 20,
@@ -68,7 +81,9 @@ async fn server_msgs_roundtrip() {
 #[tokio::test]
 async fn oversize_rejected() {
     let (mut a, mut b) = duplex(64);
-    a.write_all(&(17u32 * 1024 * 1024).to_le_bytes()).await.unwrap();
+    a.write_all(&(17u32 * 1024 * 1024).to_le_bytes())
+        .await
+        .unwrap();
     let e = read_msg::<_, Request>(&mut b).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::InvalidData);
 }

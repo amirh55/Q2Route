@@ -30,7 +30,10 @@ pub struct RuleSet {
     pub lan_direct: bool,
 }
 
-fn all<T>(items: &[String], f: impl Fn(&str) -> Result<T, MatchError>) -> Result<Vec<T>, MatchError> {
+fn all<T>(
+    items: &[String],
+    f: impl Fn(&str) -> Result<T, MatchError>,
+) -> Result<Vec<T>, MatchError> {
     items.iter().map(|s| f(s)).collect()
 }
 
@@ -38,7 +41,10 @@ impl RuleSet {
     pub fn compile(cfg: &Config) -> Result<RuleSet, MatchError> {
         let mut groups = Vec::new();
         for g in cfg.groups.iter().filter(|g| g.enabled) {
-            let wrap = |e: MatchError| MatchError::Group { group: g.id.clone(), source: Box::new(e) };
+            let wrap = |e: MatchError| MatchError::Group {
+                group: g.id.clone(),
+                source: Box::new(e),
+            };
             let mut rules = Vec::new();
             for r in &g.rules {
                 rules.push(CompiledRule {
@@ -50,9 +56,18 @@ impl RuleSet {
                     include_children: r.include_children,
                 });
             }
-            groups.push(CompiledGroup { id: g.id.clone(), action: g.action.clone(), rules, catch_all: g.catch_all });
+            groups.push(CompiledGroup {
+                id: g.id.clone(),
+                action: g.action.clone(),
+                rules,
+                catch_all: g.catch_all,
+            });
         }
         let always_direct = all(&cfg.always_direct, AppMatcher::parse)?;
-        Ok(RuleSet { groups, always_direct, lan_direct: true })
+        Ok(RuleSet {
+            groups,
+            always_direct,
+            lan_direct: true,
+        })
     }
 }

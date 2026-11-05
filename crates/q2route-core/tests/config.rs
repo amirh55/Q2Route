@@ -3,7 +3,11 @@ use q2route_core::*;
 #[test]
 fn seed_matches_spec() {
     let c = Config::seed();
-    let g: Vec<_> = c.groups.iter().map(|g| (g.name.as_str(), g.action.clone(), g.enabled)).collect();
+    let g: Vec<_> = c
+        .groups
+        .iter()
+        .map(|g| (g.name.as_str(), g.action.clone(), g.enabled))
+        .collect();
     assert_eq!(
         g,
         vec![
@@ -22,11 +26,22 @@ fn seed_matches_spec() {
     assert!(c.groups[3].catch_all && c.groups[3].rules.is_empty());
     assert_eq!(c.proxies.len(), 1);
     let p = &c.proxies[0];
-    assert_eq!((p.id.as_str(), p.kind, p.host.as_str(), p.port), ("v2ray", ProxyKind::Socks5, "127.0.0.1", 10808));
+    assert_eq!(
+        (p.id.as_str(), p.kind, p.host.as_str(), p.port),
+        ("v2ray", ProxyKind::Socks5, "127.0.0.1", 10808)
+    );
     assert_eq!(c.default_proxy, "v2ray");
     assert_eq!(
         c.always_direct,
-        ["v2ray.exe", "xray.exe", "sing-box.exe", "v2rayN.exe", "nekoray.exe", "hiddify.exe", "clash*.exe"]
+        [
+            "v2ray.exe",
+            "xray.exe",
+            "sing-box.exe",
+            "v2rayN.exe",
+            "nekoray.exe",
+            "hiddify.exe",
+            "clash*.exe"
+        ]
     );
     assert_eq!(c.settings.peek_timeout_ms, 300);
     assert!(c.settings.last_running);
@@ -54,8 +69,18 @@ fn load_missing_creates_seed() {
 fn action_toml_shape() {
     // Semantic shape: Proxy is a single-key table `{ proxy = "v2ray" }`, Direct a bare string.
     let v = toml::Value::try_from(Action::Proxy("v2ray".into())).unwrap();
-    assert_eq!(v, toml::Value::Table([("proxy".to_string(), "v2ray".into())].into_iter().collect()));
-    assert_eq!(toml::Value::try_from(Action::Direct).unwrap(), toml::Value::String("direct".into()));
+    assert_eq!(
+        v,
+        toml::Value::Table(
+            [("proxy".to_string(), "v2ray".into())]
+                .into_iter()
+                .collect()
+        )
+    );
+    assert_eq!(
+        toml::Value::try_from(Action::Direct).unwrap(),
+        toml::Value::String("direct".into())
+    );
     // Hand-written inline form parses back.
     #[derive(serde::Deserialize)]
     struct W {
@@ -117,7 +142,8 @@ fn toggle_persists_across_load() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let mut c = Config::seed();
-    c.set_group_action("steam", Action::Proxy("v2ray".into())).unwrap();
+    c.set_group_action("steam", Action::Proxy("v2ray".into()))
+        .unwrap();
     c.set_group_enabled("steam", true).unwrap();
     c.save(&path).unwrap();
     let l = Config::load(&path).unwrap();
@@ -132,7 +158,9 @@ fn group_helpers_reject_unknown_and_roll_back() {
     let before = c.clone();
     assert!(c.set_group_action("nope", Action::Direct).is_err());
     assert!(c.set_group_enabled("nope", false).is_err());
-    assert!(c.set_group_action("steam", Action::Proxy("ghost".into())).is_err());
+    assert!(c
+        .set_group_action("steam", Action::Proxy("ghost".into()))
+        .is_err());
     assert_eq!(c, before);
 }
 

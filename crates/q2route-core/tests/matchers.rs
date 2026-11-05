@@ -61,7 +61,9 @@ fn port_range() {
 #[test]
 fn app_matchers() {
     let n = AppMatcher::parse("steam*.exe").unwrap();
-    assert!(n.matches(Path::new(r"C:\Program Files (x86)\Steam\steamwebhelper.exe")));
+    assert!(n.matches(Path::new(
+        r"C:\Program Files (x86)\Steam\steamwebhelper.exe"
+    )));
     assert!(n.matches(Path::new(r"C:\x\STEAM.EXE")));
     assert!(!n.matches(Path::new(r"C:\steam\game.exe")));
     let f = AppMatcher::parse(r"C:\Games\").unwrap();

@@ -105,7 +105,12 @@ fn normalize_peer(peer: SocketAddr) -> SocketAddr {
 fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Decision {
     let rules = ctx.rules.load();
     let excluded = ctx.excluded.load();
-    let f = FlowInfo { proto: Protocol::Tcp, pid: orig.pid, dst: SocketAddr::V4(orig.dst), domain };
+    let f = FlowInfo {
+        proto: Protocol::Tcp,
+        pid: orig.pid,
+        dst: SocketAddr::V4(orig.dst),
+        domain,
+    };
     let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
     decide(&rules, &tree, &excluded, &f)
 }
@@ -130,7 +135,12 @@ async fn peek(client: &mut TcpStream, buf: &mut Vec<u8>, limit: Duration) -> Opt
     None
 }
 
-async fn handle(mut client: TcpStream, peer: SocketAddr, lookup: &dyn OrigDstLookup, ctx: &RelayCtx) {
+async fn handle(
+    mut client: TcpStream,
+    peer: SocketAddr,
+    lookup: &dyn OrigDstLookup,
+    ctx: &RelayCtx,
+) {
     let Some(orig) = lookup.lookup(normalize_peer(peer)) else {
         tracing::debug!("no original destination for {peer}; closing");
         return;
@@ -162,7 +172,9 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, lookup: &dyn OrigDstLoo
                 Target::Domain(domain, orig.dst.port())
             };
             let upstream = match profile {
-                Some(p) => connect_via(&p, &target, PROXY_TIMEOUT).await.map_err(|e| e.to_string()),
+                Some(p) => connect_via(&p, &target, PROXY_TIMEOUT)
+                    .await
+                    .map_err(|e| e.to_string()),
                 None => Err("unknown proxy profile".to_string()),
             };
             match upstream {
@@ -176,15 +188,25 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, lookup: &dyn OrigDstLoo
             }
         }
         Route::Direct => {
-            let Ok(sock) = TcpSocket::new_v4() else { return };
+            let Ok(sock) = TcpSocket::new_v4() else {
+                return;
+            };
             // Bind first so the local port is known (and skipped by capture)
             // before the SYN leaves.
-            if sock.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).is_err() {
+            if sock
+                .bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                .is_err()
+            {
                 return;
             }
-            let Ok(port) = sock.local_addr().map(|a| a.port()) else { return };
+            let Ok(port) = sock.local_addr().map(|a| a.port()) else {
+                return;
+            };
             ctx.own_ports.insert(port);
-            let _own = OwnPort { ports: &ctx.own_ports, port };
+            let _own = OwnPort {
+                ports: &ctx.own_ports,
+                port,
+            };
             match sock.connect(SocketAddr::V4(orig.dst)).await {
                 Ok(up) => pump(client, up, &buf, ctx, group).await,
                 Err(e) => tracing::debug!("direct connect to {} failed: {e}", orig.dst),

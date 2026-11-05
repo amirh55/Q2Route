@@ -90,11 +90,18 @@ impl Stats {
                 if let Some(secs) = elapsed.map(|e| e.as_secs_f64()) {
                     let (pu, pd) = s.prev.get(e.key()).copied().unwrap_or((0, 0));
                     let bps = |d: u64| (d as f64 / secs) as u64;
-                    rates.insert(e.key().clone(), (bps(up.saturating_sub(pu)), bps(down.saturating_sub(pd))));
+                    rates.insert(
+                        e.key().clone(),
+                        (bps(up.saturating_sub(pu)), bps(down.saturating_sub(pd))),
+                    );
                 }
                 cur.insert(e.key().clone(), (up, down));
             }
-            *s = Sample { at: Some(now), prev: cur, rates };
+            *s = Sample {
+                at: Some(now),
+                prev: cur,
+                rates,
+            };
         }
         let (mut tu, mut td) = (0, 0);
         let mut out = HashMap::new();
@@ -103,7 +110,14 @@ impl Stats {
             tu += up_bps;
             td += down_bps;
             let active = e.active.load(Ordering::Relaxed);
-            out.insert(e.key().clone(), GroupStats { up_bps, down_bps, active });
+            out.insert(
+                e.key().clone(),
+                GroupStats {
+                    up_bps,
+                    down_bps,
+                    active,
+                },
+            );
         }
         (out, tu, td)
     }
@@ -118,7 +132,14 @@ mod tests {
         let s = Stats::default();
         let g = s.open("a");
         let (m, _, _) = s.snapshot();
-        assert_eq!(m["a"], GroupStats { up_bps: 0, down_bps: 0, active: 1 });
+        assert_eq!(
+            m["a"],
+            GroupStats {
+                up_bps: 0,
+                down_bps: 0,
+                active: 1
+            }
+        );
         s.add("a", 1000, 500);
         std::thread::sleep(WINDOW);
         let (m, tu, td) = s.snapshot();
