@@ -22,7 +22,7 @@ use crate::classify::{
 };
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
-use crate::relay::{OrigDstLookup, RelayCtx};
+use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
 use crate::winapi;
 use crate::windivert::{
     calc_checksums_addr, Address, Handle, EVENT_SOCKET_BIND, EVENT_SOCKET_CLOSE,
@@ -302,5 +302,16 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
     let rules = shared.relay.rules.load();
     let excluded = shared.relay.excluded.load();
     let tree = shared.relay.tree.read().unwrap_or_else(|e| e.into_inner());
-    (pid, decide(&rules, &tree, &excluded, &info))
+    let d = decide(&rules, &tree, &excluded, &info);
+    // One line per decided flow (decide_flow runs only when the flow cache
+    // cannot answer). LAN / DNS / NTP flows are frequent and uninteresting.
+    let proto = if proto == Protocol::Tcp { "tcp" } else { "udp" };
+    let exe = exe_name(&tree, pid);
+    let what = describe(&d);
+    if matches!(&d, Decision::Final(_, i) if i.reason == MatchReason::AlwaysDirectDst) {
+        tracing::debug!("flow {proto} pid={pid} exe={exe} dst={} {what}", f.remote);
+    } else {
+        tracing::info!("flow {proto} pid={pid} exe={exe} dst={} {what}", f.remote);
+    }
+    (pid, d)
 }

@@ -18,7 +18,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ProfileId, Protocol};
-use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, Route};
+use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, MatchReason, Route};
 use q2route_core::ipc::Event;
 use q2route_core::peek::{peek_host, PeekResult};
 use q2route_core::process_tree::ProcessTree;
@@ -214,8 +214,26 @@ async fn handle(
         }
     };
     let group = group_of(&info);
+    // One line per relayed flow: the decision plus how it turned out.
+    let what = describe(&Decision::Final(route.clone(), info.clone()));
+    let exe = exe_name(
+        &ctx.tree.read().unwrap_or_else(|e| e.into_inner()),
+        orig.pid,
+    );
+    let shown_domain = if domain.is_empty() {
+        "-".to_string()
+    } else {
+        domain.clone()
+    };
+    let log = |outcome: &str| {
+        tracing::info!(
+            "relay pid={} exe={exe} dst={} domain={shown_domain} {what}: {outcome}",
+            orig.pid,
+            orig.dst
+        )
+    };
     match route {
-        Route::Block => {}
+        Route::Block => log("blocked"),
         Route::Proxy(id) => {
             let profile = ctx.cfg.load().proxies.iter().find(|p| p.id == id).cloned();
             let target = if domain.is_empty() {
@@ -231,6 +249,7 @@ async fn handle(
             };
             match upstream {
                 Ok(up) => {
+                    log(&format!("proxied via '{id}'"));
                     // First success since the relay saw it down: it is back.
                     if ctx.proxy_down.remove(&id).is_some() {
                         let _ = ctx.events.send(Event::ProxyUp { id: id.clone() });
@@ -239,7 +258,7 @@ async fn handle(
                 }
                 Err((down, e)) => {
                     // Fail closed: drop the client, never connect direct.
-                    tracing::warn!("proxy '{id}' failed for {}: {e}", orig.dst);
+                    log(&format!("proxy failed: {e} (closed, no direct fallback)"));
                     drop(client);
                     // Only an unreachable / silent proxy is "down"; a refused
                     // target or auth/protocol error is not a banner alarm.
@@ -271,8 +290,11 @@ async fn handle(
                 port,
             };
             match sock.connect(SocketAddr::V4(orig.dst)).await {
-                Ok(up) => pump(client, up, &buf, ctx, group).await,
-                Err(e) => tracing::debug!("direct connect to {} failed: {e}", orig.dst),
+                Ok(up) => {
+                    log("direct");
+                    pump(client, up, &buf, ctx, group).await
+                }
+                Err(e) => log(&format!("direct connect failed: {e}")),
             }
         }
     }
@@ -280,6 +302,30 @@ async fn handle(
 
 fn group_of(info: &MatchInfo) -> &str {
     info.group_id.as_deref().unwrap_or(NO_GROUP)
+}
+
+/// `route=.. group=.. reason=..` for the one-line-per-flow decision log.
+pub(crate) fn describe(d: &Decision) -> String {
+    let Decision::Final(route, info) = d else {
+        return "route=NeedDomain (peek)".into();
+    };
+    let route = match route {
+        Route::Direct => "Direct".to_string(),
+        Route::Block => "Block".to_string(),
+        Route::Proxy(id) => format!("Proxy({id})"),
+    };
+    let reason = match &info.reason {
+        MatchReason::Inherited { from_pid } => format!("Inherited(from_pid={from_pid})"),
+        r => format!("{r:?}"),
+    };
+    format!("route={route} group={} reason={reason}", group_of(info))
+}
+
+/// The process's exe file name (e.g. `chrome.exe`), or `?` if unknown.
+pub(crate) fn exe_name(tree: &ProcessTree, pid: u32) -> String {
+    tree.get(pid)
+        .and_then(|p| p.exe.file_name())
+        .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Removes a port from `own_ports` when the direct upstream is gone.
@@ -394,6 +440,55 @@ mod tests {
         assert!(!socket2::SockRef::from(&c).keepalive().unwrap());
         set_keepalive(&c);
         assert!(socket2::SockRef::from(&c).keepalive().unwrap());
+    }
+
+    #[test]
+    fn decision_log_fields() {
+        use q2route_core::decide::MatchReason;
+        let d = Decision::Final(
+            Route::Direct,
+            MatchInfo {
+                group_id: Some("steam".into()),
+                reason: MatchReason::Inherited { from_pid: 10 },
+            },
+        );
+        assert_eq!(
+            describe(&d),
+            "route=Direct group=steam reason=Inherited(from_pid=10)"
+        );
+        let d = Decision::Final(
+            Route::Proxy("v2ray".into()),
+            MatchInfo {
+                group_id: Some("everything-else".into()),
+                reason: MatchReason::CatchAll,
+            },
+        );
+        assert_eq!(
+            describe(&d),
+            "route=Proxy(v2ray) group=everything-else reason=CatchAll"
+        );
+        let d = Decision::Final(
+            Route::Block,
+            MatchInfo {
+                group_id: None,
+                reason: MatchReason::NoMatch,
+            },
+        );
+        assert_eq!(describe(&d), "route=Block group=(none) reason=NoMatch");
+        assert_eq!(describe(&Decision::NeedDomain), "route=NeedDomain (peek)");
+    }
+
+    #[test]
+    fn exe_name_is_file_name() {
+        let mut t = ProcessTree::default();
+        t.insert(q2route_core::process_tree::ProcInfo {
+            pid: 5,
+            parent: 0,
+            exe: r"C:\Program Files\Steam\bin\steamwebhelper.exe".into(),
+            start_time: 1,
+        });
+        assert_eq!(exe_name(&t, 5), "steamwebhelper.exe");
+        assert_eq!(exe_name(&t, 6), "?");
     }
 
     #[test]
