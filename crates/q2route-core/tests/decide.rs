@@ -155,11 +155,15 @@ fn steam_itself_is_own() {
 }
 
 #[test]
-fn inherited_unknown_domain_needs_peek_only_on_web_ports() {
-    // The *.ir rule (own pass) needs the domain on 443.
+fn inherited_direct_skips_peek_when_domain_cannot_change_route() {
+    // *.ir would say Direct, and so does Steam without it: no peek (spec 5.4).
     assert_eq!(
         d(Protocol::Tcp, 20, "8.8.8.8:443", None),
-        Decision::NeedDomain
+        fin(
+            Route::Direct,
+            Some("steam"),
+            MatchReason::Inherited { from_pid: 10 }
+        )
     );
     assert_eq!(
         d(Protocol::Tcp, 20, "8.8.8.8:27015", None),
@@ -330,6 +334,81 @@ fn unknown_pid_falls_to_catch_all() {
 fn child_of_proxy_gui_not_direct() {
     assert_eq!(
         d(Protocol::Tcp, 80, "1.1.1.1:443", Some("x.com")),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn steam_child_443_with_direct_groups_is_final_direct() {
+    assert_eq!(
+        d(Protocol::Tcp, 20, "1.2.3.4:443", None),
+        fin(
+            Route::Direct,
+            Some("steam"),
+            MatchReason::Inherited { from_pid: 10 }
+        )
+    );
+    assert_eq!(
+        d(Protocol::Tcp, 10, "1.2.3.4:443", None),
+        fin(Route::Direct, Some("steam"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn chrome_443_still_needs_domain() {
+    // catch-all Proxy vs Iranian Direct: the domain decides.
+    assert_eq!(
+        d(Protocol::Tcp, 40, "1.2.3.4:443", None),
+        Decision::NeedDomain
+    );
+}
+
+#[test]
+fn later_domain_rule_with_other_route_still_needs_domain() {
+    // *.ir Direct, then x.com Proxy, then Steam Direct: the second domain
+    // rule could change the route, so the peek is still needed.
+    let mut c = cfg();
+    c.groups.insert(
+        1,
+        Group {
+            id: "xcom".into(),
+            name: "x.com".into(),
+            enabled: true,
+            action: Action::Proxy("v2ray".into()),
+            rules: vec![Rule {
+                domains: vec!["x.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 20, "1.2.3.4:443", None),
+        Decision::NeedDomain
+    );
+    // ...but with the domain known it is decided normally.
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            20,
+            "1.2.3.4:443",
+            Some("x.com")
+        ),
+        fin(proxy(), Some("xcom"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn proxied_domain_group_with_proxied_fallback_skips_peek() {
+    // Both outcomes are the same proxy: no peek needed.
+    let mut c = cfg();
+    c.groups[0].action = Action::Proxy("v2ray".into());
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
 }

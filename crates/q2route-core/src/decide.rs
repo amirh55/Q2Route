@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::config::{Action, GroupId, ProfileId, Protocol};
 use crate::matchers::is_always_direct_dst;
 use crate::process_tree::ProcessTree;
-use crate::ruleset::{CompiledRule, RuleSet};
+use crate::ruleset::{CompiledGroup, CompiledRule, RuleSet};
 
 #[derive(Debug, Clone)]
 pub struct FlowInfo<'a> {
@@ -114,7 +114,7 @@ fn direct(reason: MatchReason) -> Decision {
 /// Decide the route for a new flow. Steps run in order: always-direct destination,
 /// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all
 /// (or Block when there is none).
-/// Returns `NeedDomain` when the outcome may depend on a domain not yet known.
+/// Returns `NeedDomain` only when the route may depend on a domain not yet known.
 pub fn decide(
     rs: &RuleSet,
     tree: &ProcessTree,
@@ -143,52 +143,61 @@ pub fn decide(
         return direct(MatchReason::AlwaysDirectApp);
     }
 
-    // 4. Own pass.
+    // 4. Own pass, then 5. inherited pass (nearest ancestor first): the
+    //    candidate rules in evaluation order.
     let own_exe: Option<&Path> = proc.map(|p| p.exe.as_path());
+    let mut cands: Vec<Candidate> = Vec::new();
     for g in rs.groups.iter().filter(|g| !g.catch_all) {
         for r in &g.rules {
-            if !r.apps.is_empty() && !own_exe.is_some_and(|e| r.apps.iter().any(|m| m.matches(e))) {
-                continue;
-            }
-            match eval_conditions(r, f) {
-                RuleOutcome::Match => {
-                    let info = MatchInfo {
-                        group_id: Some(g.id.clone()),
-                        reason: MatchReason::Own,
-                    };
-                    return finalize(&g.action, f, info);
-                }
-                RuleOutcome::NeedDomain => return Decision::NeedDomain,
-                RuleOutcome::NoMatch => {}
+            if r.apps.is_empty() || own_exe.is_some_and(|e| r.apps.iter().any(|m| m.matches(e))) {
+                cands.push((g, r, MatchReason::Own));
             }
         }
     }
-
-    // 5. Inherited pass: nearest ancestor first.
     for anc in &ancestors {
         for g in rs.groups.iter().filter(|g| !g.catch_all) {
             for r in &g.rules {
-                if r.apps.is_empty()
-                    || !r.include_children
-                    || !r.apps.iter().any(|m| m.matches(&anc.exe))
+                if !r.apps.is_empty()
+                    && r.include_children
+                    && r.apps.iter().any(|m| m.matches(&anc.exe))
                 {
-                    continue;
-                }
-                match eval_conditions(r, f) {
-                    RuleOutcome::Match => {
-                        let info = MatchInfo {
-                            group_id: Some(g.id.clone()),
-                            reason: MatchReason::Inherited { from_pid: anc.pid },
-                        };
-                        return finalize(&g.action, f, info);
-                    }
-                    RuleOutcome::NeedDomain => return Decision::NeedDomain,
-                    RuleOutcome::NoMatch => {}
+                    cands.push((g, r, MatchReason::Inherited { from_pid: anc.pid }));
                 }
             }
         }
     }
+    eval_from(rs, &cands, f)
+}
 
+type Candidate<'r> = (&'r CompiledGroup, &'r CompiledRule, MatchReason);
+
+/// Evaluates `cands` in order, then the catch-all (6.). A rule that needs
+/// the domain only forces `NeedDomain` if knowing the domain could change
+/// the route: when the rest of the evaluation (that rule not matching)
+/// gives the same route as the rule itself, that outcome is final (spec
+/// 5.4: direct flows that need no peek must not be slowed down).
+fn eval_from(rs: &RuleSet, cands: &[Candidate], f: &FlowInfo) -> Decision {
+    for (i, (g, r, reason)) in cands.iter().enumerate() {
+        let info = || MatchInfo {
+            group_id: Some(g.id.clone()),
+            reason: reason.clone(),
+        };
+        match eval_conditions(r, f) {
+            RuleOutcome::Match => return finalize(&g.action, f, info()),
+            RuleOutcome::NoMatch => {}
+            RuleOutcome::NeedDomain => {
+                let Decision::Final(if_match, _) = finalize(&g.action, f, info()) else {
+                    return Decision::NeedDomain;
+                };
+                return match eval_from(rs, &cands[i + 1..], f) {
+                    Decision::Final(route, rest) if route == if_match => {
+                        Decision::Final(route, rest)
+                    }
+                    _ => Decision::NeedDomain,
+                };
+            }
+        }
+    }
     // 6. Catch-all.
     match rs.groups.iter().find(|g| g.catch_all) {
         Some(g) => finalize(
