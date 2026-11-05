@@ -88,6 +88,7 @@ impl Engine {
             own_ports: Arc::new(DashSet::new()),
             events,
             idle_timeout: RELAY_IDLE_TIMEOUT,
+            proxy_down: DashSet::new(),
         });
         let shared = Arc::new(Shared {
             relay,
@@ -367,6 +368,13 @@ impl Inner {
                 } else {
                     Event::ProxyDown { id: id.clone() }
                 };
+                // Keep the relay's view in step, so the relay's next success
+                // after a failed test clears the banner (ProxyUp).
+                if res.tcp_ok {
+                    self.relay().proxy_down.remove(&id);
+                } else {
+                    self.relay().proxy_down.insert(id.clone());
+                }
                 mutex(&self.proxy_up).insert(id, res.tcp_ok);
                 let _ = self.relay().events.send(ev);
                 Response::ProxyTest(res)

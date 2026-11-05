@@ -4,7 +4,9 @@
 //!
 //! **Fail closed:** a flow routed to a proxy is only ever connected through
 //! that proxy. If the profile is unknown or the proxy fails, the client is
-//! closed and `Event::ProxyDown` is emitted; there is no direct fallback.
+//! closed; there is no direct fallback. `Event::ProxyDown` is emitted only
+//! when the proxy itself is unreachable or silent, and `Event::ProxyUp` on
+//! the first successful connect after that.
 
 use std::collections::HashSet;
 use std::io;
@@ -15,7 +17,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
-use q2route_core::config::{Config, Protocol};
+use q2route_core::config::{Config, ProfileId, Protocol};
 use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, Route};
 use q2route_core::ipc::Event;
 use q2route_core::peek::{peek_host, PeekResult};
@@ -75,6 +77,9 @@ pub struct RelayCtx {
     /// A relayed connection with no bytes in either direction for this long
     /// is closed ([`RELAY_IDLE_TIMEOUT`] in production).
     pub idle_timeout: Duration,
+    /// Profiles the relay last saw down (unreachable / silent); the first
+    /// successful connect through one emits `Event::ProxyUp`.
+    pub proxy_down: DashSet<ProfileId>,
 }
 
 /// Production idle timeout of a relayed connection.
@@ -221,16 +226,27 @@ async fn handle(
             let upstream = match profile {
                 Some(p) => connect_via(&p, &target, PROXY_TIMEOUT)
                     .await
-                    .map_err(|e| e.to_string()),
-                None => Err("unknown proxy profile".to_string()),
+                    .map_err(|e| (e.is_proxy_down(), e.to_string())),
+                None => Err((false, "unknown proxy profile".to_string())),
             };
             match upstream {
-                Ok(up) => pump(client, up, &buf, ctx, group).await,
-                Err(e) => {
+                Ok(up) => {
+                    // First success since the relay saw it down: it is back.
+                    if ctx.proxy_down.remove(&id).is_some() {
+                        let _ = ctx.events.send(Event::ProxyUp { id: id.clone() });
+                    }
+                    pump(client, up, &buf, ctx, group).await
+                }
+                Err((down, e)) => {
                     // Fail closed: drop the client, never connect direct.
                     tracing::warn!("proxy '{id}' failed for {}: {e}", orig.dst);
                     drop(client);
-                    let _ = ctx.events.send(Event::ProxyDown { id });
+                    // Only an unreachable / silent proxy is "down"; a refused
+                    // target or auth/protocol error is not a banner alarm.
+                    if down {
+                        ctx.proxy_down.insert(id.clone());
+                        let _ = ctx.events.send(Event::ProxyDown { id });
+                    }
                 }
             }
         }

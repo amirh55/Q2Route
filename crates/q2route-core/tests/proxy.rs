@@ -374,6 +374,39 @@ async fn handshake_stall_times_out() {
 }
 
 #[tokio::test]
+async fn stall_after_greeting_is_target_timeout_not_down() {
+    // The proxy answers the greeting, then never answers CONNECT (e.g. it is
+    // slow reaching the target): the proxy itself is up.
+    let (l, port) = listen().await;
+    let _srv = tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut g = [0u8; 3];
+        s.read_exact(&mut g).await.unwrap();
+        s.write_all(&[5, 0]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let r = connect_via(
+        &profile(ProxyKind::Socks5, port, None),
+        &Target::Domain("a.com".into(), 1),
+        Duration::from_millis(300),
+    )
+    .await;
+    let e = r.err().unwrap();
+    assert!(matches!(e, ProxyError::TargetTimeout), "{e:?}");
+    assert!(!e.is_proxy_down());
+}
+
+#[test]
+fn proxy_down_classification() {
+    assert!(ProxyError::Unreachable.is_proxy_down());
+    assert!(ProxyError::Timeout.is_proxy_down());
+    assert!(!ProxyError::Refused.is_proxy_down());
+    assert!(!ProxyError::Auth.is_proxy_down());
+    assert!(!ProxyError::Protocol("x".into()).is_proxy_down());
+    assert!(!ProxyError::TargetTimeout.is_proxy_down());
+}
+
+#[tokio::test]
 async fn test_proxy_closed_port() {
     let (l, port) = listen().await;
     drop(l);

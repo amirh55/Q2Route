@@ -122,6 +122,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         own_ports: Arc::new(DashSet::new()),
         events,
         idle_timeout: Duration::from_secs(7200),
+        proxy_down: DashSet::new(),
     })
 }
 
@@ -455,6 +456,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         stats: c.stats.clone(),
         own_ports: c.own_ports.clone(),
         events: c.events.clone(),
+        proxy_down: DashSet::new(),
     });
     let r = start(v4(origin), c).await;
     let mut client = TcpStream::connect(r.addr).await.unwrap();
@@ -474,5 +476,94 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         t0.elapsed() >= Duration::from_millis(300),
         "closed too early"
     );
+    r.cancel.cancel();
+}
+
+/// Multi-connection mock SOCKS5 (no auth) answering every CONNECT with
+/// reply code `rep`; on success it holds the tunnel open until EOF.
+async fn mock_socks_reply(rep: u8) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut g = [0u8; 3];
+                s.read_exact(&mut g).await.unwrap();
+                s.write_all(&[5, 0]).await.unwrap();
+                let mut h = [0u8; 10];
+                s.read_exact(&mut h).await.unwrap(); // IPv4 CONNECT
+                s.write_all(&[5, rep, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let mut sink = [0u8; 64];
+                while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    port
+}
+
+fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
+    let mut out = vec![];
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+/// Opens one client connection through the relay and gives the relay time
+/// to tunnel it (the connection is left open).
+async fn one_flow(r: &Relay) {
+    let mut c = TcpStream::connect(r.addr).await.unwrap();
+    let _ = c.write_all(b"hello").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn proxy_up_emitted_once_after_recovery() {
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let groups = vec![group("rest", Action::Proxy("mock".into()), &[], true)];
+    let c = ctx(config(vec![socks_profile(dead_port)], groups.clone()));
+    let mut events = c.events.subscribe();
+    let r = start("5.5.5.5:8000".parse().unwrap(), c.clone()).await;
+
+    let mut dead_client = TcpStream::connect(r.addr).await.unwrap();
+    let _ = dead_client.write_all(b"hello").await;
+    // A refused loopback connect takes ~2 s on Windows.
+    assert_closed(&mut dead_client, Duration::from_secs(6)).await;
+    assert_eq!(drain(&mut events), [Event::ProxyDown { id: "mock".into() }]);
+
+    // v2ray comes back (same profile id, now reachable).
+    let live = mock_socks_reply(0).await;
+    c.cfg
+        .store(Arc::new(config(vec![socks_profile(live)], groups)));
+    one_flow(&r).await;
+    one_flow(&r).await;
+    assert_eq!(
+        drain(&mut events),
+        [Event::ProxyUp { id: "mock".into() }],
+        "exactly one ProxyUp for the down -> up transition"
+    );
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn refused_target_is_not_proxy_down() {
+    // The proxy is up but refuses this destination (SOCKS5 REP 5).
+    let port = mock_socks_reply(5).await;
+    let c = ctx(config(
+        vec![socks_profile(port)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    ));
+    let mut events = c.events.subscribe();
+    let r = start("5.5.5.5:8000".parse().unwrap(), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let _ = client.write_all(b"x").await;
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(drain(&mut events), [], "no false ProxyDown alarm");
     r.cancel.cancel();
 }

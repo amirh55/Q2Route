@@ -6,8 +6,11 @@
 use crate::config::{ProxyKind, ProxyProfile};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 /// Result of a proxy connectivity test.
@@ -33,16 +36,67 @@ pub enum ProxyError {
     Auth,
     #[error("proxy refused the connection")]
     Refused,
+    /// Timed out before the proxy sent a single handshake byte.
     #[error("proxy handshake timed out")]
     Timeout,
+    /// Timed out after the proxy had answered (e.g. it is slow reaching the
+    /// target): the proxy itself is up.
+    #[error("proxy did not finish connecting to the target in time")]
+    TargetTimeout,
     #[error("proxy protocol error: {0}")]
     Protocol(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
+impl ProxyError {
+    /// Whether this failure means the proxy itself is down (unreachable, or
+    /// silent from the start), as opposed to it refusing this one target.
+    pub fn is_proxy_down(&self) -> bool {
+        matches!(self, ProxyError::Unreachable | ProxyError::Timeout)
+    }
+}
+
+/// Records whether any byte was read through it.
+struct Seen<'a> {
+    s: &'a mut TcpStream,
+    got: &'a AtomicBool,
+}
+
+impl AsyncRead for Seen<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut *self.s).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.got.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl AsyncWrite for Seen<'_> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.s).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.s).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.s).poll_shutdown(cx)
+    }
+}
+
 /// Connect to the proxy and tunnel to `t`. The whole operation is bounded by
-/// `timeout`. A TCP connect failure to the proxy itself is `Unreachable`.
+/// `timeout`. A TCP connect failure to the proxy itself is `Unreachable`; a
+/// timeout is `Timeout` if the proxy never sent a byte, else `TargetTimeout`.
 pub async fn connect_via(
     p: &ProxyProfile,
     t: &Target,
@@ -51,22 +105,33 @@ pub async fn connect_via(
     if p.kind == ProxyKind::Socks4 && matches!(t, Target::Ip(SocketAddr::V6(_))) {
         return Err(ProxyError::Protocol("SOCKS4 cannot reach IPv6".into()));
     }
+    let got = AtomicBool::new(false);
     tokio::time::timeout(timeout, async {
         let mut s = TcpStream::connect((p.host.as_str(), p.port))
             .await
             .map_err(|_| ProxyError::Unreachable)?;
+        let mut w = Seen {
+            s: &mut s,
+            got: &got,
+        };
         match p.kind {
-            ProxyKind::Socks5 => socks5(&mut s, p, t).await?,
-            ProxyKind::Socks4 => socks4(&mut s, t).await?,
-            ProxyKind::Http => http(&mut s, p, t).await?,
+            ProxyKind::Socks5 => socks5(&mut w, p, t).await?,
+            ProxyKind::Socks4 => socks4(&mut w, t).await?,
+            ProxyKind::Http => http(&mut w, p, t).await?,
         }
         Ok(s)
     })
     .await
-    .map_err(|_| ProxyError::Timeout)?
+    .map_err(|_| {
+        if got.load(Ordering::Relaxed) {
+            ProxyError::TargetTimeout
+        } else {
+            ProxyError::Timeout
+        }
+    })?
 }
 
-async fn socks5(s: &mut TcpStream, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
+async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
     let creds = p
         .username
         .as_ref()
@@ -148,7 +213,7 @@ async fn socks5(s: &mut TcpStream, p: &ProxyProfile, t: &Target) -> Result<(), P
     Ok(())
 }
 
-async fn socks4(s: &mut TcpStream, t: &Target) -> Result<(), ProxyError> {
+async fn socks4(s: &mut Seen<'_>, t: &Target) -> Result<(), ProxyError> {
     let mut req = vec![4, 1];
     let mut name: Option<&str> = None;
     match t {
@@ -184,7 +249,7 @@ async fn socks4(s: &mut TcpStream, t: &Target) -> Result<(), ProxyError> {
     }
 }
 
-async fn http(s: &mut TcpStream, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
+async fn http(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
     let hp = match t {
         Target::Ip(a) => a.to_string(), // IPv6 is bracketed already
         Target::Domain(d, port) => {
