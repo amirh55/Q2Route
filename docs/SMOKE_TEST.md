@@ -88,6 +88,18 @@ Install this update with `dist\Q2Route-update\Update.cmd` (see "Updating a runni
 | C3 | Leave a Steam download running for 10 min. | The page stays responsive; the list length stays bounded. | |
 | C4 | Right-click an `explorer.exe` (or `svchost.exe`) row. | The menu names the exe without "(and apps it starts)". After adding it to a Direct group, a browser started afterwards from the Start menu still shows `route=Proxy(v2ray)` in the Connections page. Remove the rule afterwards. | |
 
+## M3: UDP through the proxy
+
+Install this update with `dist\Q2Route-update\Update.cmd`.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| U1 | Proxies → Test on v2ray. | Shows "UDP OK" (v2rayN's SOCKS inbound has UDP on by default). | |
+| U2 | Put a filtered game's exe in a Proxy (v2ray) group; play online. | The game connects; Connections shows its UDP rows with route Proxy (v2ray) and growing ↑/↓; log has `udp ... via 'v2ray': associated`. | |
+| U3 | Same game with v2ray stopped. | The game can't connect; log shows `association failed ... (dropped, no direct fallback)`; browserleaks/game never sees the real IP. | |
+| U4 | Open `https://cloudflare-quic.com`. | Still reports `h2` (proxied UDP/443 stays blocked). | |
+| U5 | Use a Direct game (e.g. in "Games"). | Unaffected: still direct, ping unchanged. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
