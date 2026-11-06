@@ -3,3 +3,4 @@
 *.dll binary
 *.sys binary
 *.lib binary
+*.cmd text eol=crlf
