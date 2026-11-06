@@ -498,7 +498,7 @@ impl Config {
                     "the catch-all group cannot be moved".into(),
                 ));
             }
-            if to + 1 >= c.groups.len() {
+            if to >= c.groups.len().saturating_sub(1) {
                 return Err(ConfigError::Invalid(format!(
                     "cannot move group to index {to}"
                 )));

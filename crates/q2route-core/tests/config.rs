@@ -402,3 +402,11 @@ fn slug_cases() {
     assert_eq!(slug("Online  Games (UDP)"), "online-games-udp");
     assert_eq!(slug("بازی"), "group");
 }
+
+#[test]
+fn move_group_huge_index_is_rejected() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    assert!(c.move_group("games", usize::MAX).is_err());
+    assert_eq!(c, before);
+}
