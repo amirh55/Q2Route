@@ -10,7 +10,8 @@ use crate::client::Client;
 use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
 use crate::views::{
-    dashboard, groups::GroupsView, placeholder, proxies::ProxiesView, settings as settings_view,
+    connections::ConnectionsView, dashboard, groups::GroupsView, placeholder, proxies::ProxiesView,
+    settings as settings_view,
 };
 
 /// How often the UI and the tray refresh from `Client::latest()`.
@@ -86,6 +87,7 @@ pub struct App {
     pub requests: Requests,
     proxies: ProxiesView,
     groups: GroupsView,
+    connections: ConnectionsView,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
@@ -117,6 +119,7 @@ impl App {
             requests,
             proxies: ProxiesView::default(),
             groups: GroupsView::default(),
+            connections: ConnectionsView::default(),
             hide_on_start: hidden && tray.is_some(),
             tray,
             exiting: false,
@@ -211,6 +214,12 @@ impl eframe::App for App {
         egui::CentralPanel::default_margins().show(ui, |ui| {
             if !connected {
                 dashboard::service_banner(ui);
+            }
+            if self.page == Page::Connections {
+                // Has its own virtualised scroll area.
+                self.connections
+                    .show(ui, snap.as_ref(), &self.client, &mut self.requests);
+                return;
             }
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
