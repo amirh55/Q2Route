@@ -1,0 +1,18 @@
+[package]
+name = "q2route-core"
+version.workspace = true
+edition.workspace = true
+
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror = "1"
+ipnet = "2"
+globset = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "net", "time", "macros", "rt"] }
