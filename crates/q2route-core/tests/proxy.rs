@@ -1,8 +1,10 @@
-use q2route_core::proxy::{connect_via, test_proxy, ProxyError, Target};
+use q2route_core::proxy::{
+    connect_via, decode_udp, encode_udp, test_proxy, udp_associate, ProxyError, Target,
+};
 use q2route_core::{ProxyKind, ProxyProfile};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const T: Duration = Duration::from_secs(3);
 
@@ -414,4 +416,181 @@ async fn test_proxy_closed_port() {
     assert!(!r.tcp_ok);
     assert!(r.error.is_some());
     assert!(r.latency_ms.is_none());
+}
+
+#[test]
+fn encode_decode_roundtrip() {
+    let v4: std::net::SocketAddr = "1.2.3.4:27015".parse().unwrap();
+    let e = encode_udp(v4, b"abc");
+    assert_eq!(&e[..10], &[0, 0, 0, 1, 1, 2, 3, 4, 0x69, 0x87]);
+    assert_eq!(decode_udp(&e), Some((v4, &b"abc"[..])));
+    let v6: std::net::SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+    let e = encode_udp(v6, b"abc");
+    assert_eq!(decode_udp(&e), Some((v6, &b"abc"[..])));
+}
+
+#[test]
+fn decode_rejects_frag_domain_short() {
+    let mut e = encode_udp("1.2.3.4:5".parse().unwrap(), b"x");
+    assert!(decode_udp(&e).is_some());
+    e[2] = 1;
+    assert!(decode_udp(&e).is_none());
+    e[2] = 0;
+    e[3] = 3;
+    assert!(decode_udp(&e).is_none());
+    assert!(decode_udp(&[0, 0, 0, 1, 1]).is_none());
+}
+
+/// Mock SOCKS5 UDP ASSOCIATE on an accepted control connection: method 0,
+/// then a reply with BND `bnd_ip:<udp port>`, then `serve` handles datagrams
+/// while the control connection stays open.
+async fn udp_mock_conn<F, Fut>(mut s: TcpStream, rep: u8, bnd_ip: [u8; 4], serve: F)
+where
+    F: FnOnce(UdpSocket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let mut h = [0u8; 3];
+    s.read_exact(&mut h).await.unwrap();
+    assert_eq!(h, [5, 1, 0]);
+    s.write_all(&[5, 0]).await.unwrap();
+    let mut r = [0u8; 10];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+    let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = u.local_addr().unwrap().port();
+    let mut reply = vec![5, rep, 0, 1];
+    reply.extend_from_slice(&bnd_ip);
+    reply.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&reply).await.unwrap();
+    if rep == 0 {
+        serve(u).await;
+        // Keep the control connection open until the client closes it.
+        let mut b = [0u8; 1];
+        let _ = s.read(&mut b).await;
+    }
+}
+
+async fn udp_mock<F, Fut>(l: TcpListener, rep: u8, bnd_ip: [u8; 4], serve: F)
+where
+    F: FnOnce(UdpSocket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let (s, _) = l.accept().await.unwrap();
+    udp_mock_conn(s, rep, bnd_ip, serve).await;
+}
+
+/// Mock for `test_proxy`: first connection is the TCP CONNECT probe, the
+/// second the UDP ASSOCIATE.
+async fn test_proxy_mock<F, Fut>(l: TcpListener, rep: u8, serve: F)
+where
+    F: FnOnce(UdpSocket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let (mut s, _) = l.accept().await.unwrap();
+    let mut b = [0u8; 3];
+    s.read_exact(&mut b).await.unwrap();
+    s.write_all(&[5, 0]).await.unwrap();
+    let mut r = [0u8; 10];
+    s.read_exact(&mut r).await.unwrap();
+    s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    udp_mock(l, rep, [127, 0, 0, 1], serve).await;
+}
+
+async fn echo_udp(u: UdpSocket) {
+    let mut b = [0u8; 2048];
+    let (n, from) = u.recv_from(&mut b).await.unwrap();
+    u.send_to(&b[..n], from).await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_associate_against_mock() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(udp_mock(l, 0, [127, 0, 0, 1], echo_udp));
+    let a = udp_associate(&profile(ProxyKind::Socks5, port, None), T)
+        .await
+        .unwrap();
+    assert_eq!(a.relay.ip().to_string(), "127.0.0.1");
+    let dst: std::net::SocketAddr = "1.1.1.1:53".parse().unwrap();
+    let c = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    c.send_to(&encode_udp(dst, b"hi"), a.relay).await.unwrap();
+    let mut b = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(T, c.recv_from(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decode_udp(&b[..n]), Some((dst, &b"hi"[..])));
+    drop(a);
+    srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_associate_bnd_unspecified_uses_proxy_host() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(udp_mock(l, 0, [0, 0, 0, 0], |_u| async {}));
+    let a = udp_associate(&profile(ProxyKind::Socks5, port, None), T)
+        .await
+        .unwrap();
+    assert_eq!(a.relay.ip().to_string(), "127.0.0.1");
+    drop(a);
+    srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_associate_refused() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(udp_mock(l, 7, [0, 0, 0, 0], |_u| async {}));
+    let r = udp_associate(&profile(ProxyKind::Socks5, port, None), T).await;
+    assert!(matches!(r, Err(ProxyError::Refused)));
+    srv.await.unwrap();
+    // Non-SOCKS5: error without connecting (port 1 is never dialled).
+    let r = udp_associate(&profile(ProxyKind::Http, 1, None), T).await;
+    assert!(matches!(r, Err(ProxyError::Protocol(_))));
+}
+
+#[tokio::test]
+async fn test_proxy_udp_ok_through_mock() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(test_proxy_mock(l, 0, |u| async move {
+        let mut b = [0u8; 2048];
+        let (n, from) = u.recv_from(&mut b).await.unwrap();
+        let (dst, q) = decode_udp(&b[..n]).unwrap();
+        assert_eq!(dst.to_string(), "1.1.1.1:53");
+        let mut reply = q.to_vec();
+        reply[2] |= 0x80; // QR
+        u.send_to(&encode_udp(dst, &reply), from).await.unwrap();
+    }));
+    let r = test_proxy(&profile(ProxyKind::Socks5, port, None)).await;
+    assert!(r.tcp_ok);
+    assert_eq!(r.udp_ok, Some(true));
+    srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_udp_refused_is_false() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(test_proxy_mock(l, 7, |_u| async {}));
+    let r = test_proxy(&profile(ProxyKind::Socks5, port, None)).await;
+    assert!(r.tcp_ok);
+    assert_eq!(r.udp_ok, Some(false));
+    srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_http_has_no_udp_verdict() {
+    // HTTP CONNECT proxy: tcp ok, UDP not applicable.
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).await.unwrap();
+            head.push(b[0]);
+        }
+        s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+    });
+    let r = test_proxy(&profile(ProxyKind::Http, port, None)).await;
+    assert!(r.tcp_ok);
+    assert_eq!(r.udp_ok, None);
+    srv.await.unwrap();
 }

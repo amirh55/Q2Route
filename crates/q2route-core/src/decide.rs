@@ -95,8 +95,13 @@ fn finalize(action: &Action, f: &FlowInfo, info: MatchInfo) -> Decision {
     let route = match action {
         Action::Direct => Route::Direct,
         Action::Block => Route::Block,
-        // M1: no UDP / IPv6 relay, so proxied UDP and IPv6 are blocked, never leaked.
-        Action::Proxy(_) if f.proto == Protocol::Udp || f.dst.is_ipv6() => Route::Block,
+        // IPv6 has no relay; proxied UDP/443 (QUIC) is blocked so apps fall back
+        // to TCP through the proxy. Blocked, never leaked direct.
+        Action::Proxy(_)
+            if f.dst.is_ipv6() || (f.proto == Protocol::Udp && f.dst.port() == 443) =>
+        {
+            Route::Block
+        }
         Action::Proxy(id) => Route::Proxy(id.clone()),
     };
     Decision::Final(route, info)

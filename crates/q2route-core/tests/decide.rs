@@ -269,9 +269,22 @@ fn dns_ntp_direct_m1() {
 }
 
 #[test]
-fn udp_proxy_blocked_m1() {
+fn udp_proxy_ipv4_routes_to_proxy() {
+    assert_eq!(
+        d(Protocol::Udp, 40, "5.6.7.8:27015", None),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn udp_443_and_ipv6_stay_blocked() {
+    // QUIC (UDP/443) stays blocked so apps fall back to TCP through the proxy.
     assert_eq!(
         d(Protocol::Udp, 40, "1.2.3.4:443", None),
+        fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        d(Protocol::Udp, 40, "[2606:4700::1]:5000", None),
         fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
     );
 }
