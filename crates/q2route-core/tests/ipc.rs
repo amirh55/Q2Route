@@ -108,3 +108,70 @@ fn pipe_name() {
     assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
     let _ = ProxyKind::Socks5;
 }
+
+#[test]
+fn new_variants_round_trip() {
+    use q2route_core::decide::Route;
+    use q2route_core::{Protocol, Rule};
+    let rule = Rule {
+        apps: vec!["a.exe".into()],
+        ..Rule::default()
+    };
+    for r in [
+        Request::AddGroup {
+            name: "n".into(),
+            action: Action::Block,
+        },
+        Request::RenameGroup {
+            group_id: "g".into(),
+            name: "n".into(),
+        },
+        Request::DeleteGroup {
+            group_id: "g".into(),
+        },
+        Request::MoveGroup {
+            group_id: "g".into(),
+            to: 2,
+        },
+        Request::SetGroupRules {
+            group_id: "g".into(),
+            rules: vec![rule.clone()],
+        },
+        Request::AddRule {
+            group_id: "g".into(),
+            rule,
+        },
+        Request::GetConnections,
+        Request::ListProcesses,
+    ] {
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
+    }
+    let conn = ConnInfo {
+        id: 1,
+        proto: Protocol::Tcp,
+        pid: 4,
+        exe: "a.exe".into(),
+        local: "127.0.0.1:5000".parse().unwrap(),
+        dst: "1.2.3.4:443".parse().unwrap(),
+        domain: Some("x.com".into()),
+        route: Route::Proxy("v2ray".into()),
+        group_id: Some("g".into()),
+        reason: "own".into(),
+        started_ms: 10,
+        ended_ms: None,
+        up: Some(1),
+        down: None,
+    };
+    for r in [
+        Response::Connections(vec![conn]),
+        Response::Processes(vec![ProcEntry {
+            pid: 4,
+            name: "a.exe".into(),
+            path: r"C:\a.exe".into(),
+        }]),
+    ] {
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
+    }
+}

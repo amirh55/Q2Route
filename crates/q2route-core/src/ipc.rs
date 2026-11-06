@@ -1,11 +1,13 @@
 //! UI <-> service IPC: u32-LE length-prefixed JSON frames over a named pipe.
 
-use crate::config::{Action, Config, GroupId, ProfileId, ProxyProfile};
+use crate::config::{Action, Config, GroupId, ProfileId, Protocol, ProxyProfile, Rule};
+use crate::decide::Route;
 use crate::proxy::ProxyTestResult;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\q2route";
@@ -23,6 +25,14 @@ pub enum Request {
     DeleteProxy { id: ProfileId },
     TestProxy { id: ProfileId },
     Subscribe,
+    AddGroup { name: String, action: Action },
+    RenameGroup { group_id: GroupId, name: String },
+    DeleteGroup { group_id: GroupId },
+    MoveGroup { group_id: GroupId, to: usize },
+    SetGroupRules { group_id: GroupId, rules: Vec<Rule> },
+    AddRule { group_id: GroupId, rule: Rule },
+    GetConnections,
+    ListProcesses,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -48,6 +58,38 @@ pub enum Response {
     State(StateSnapshot),
     ProxyTest(ProxyTestResult),
     Error(String),
+    Connections(Vec<ConnInfo>),
+    Processes(Vec<ProcEntry>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ConnInfo {
+    pub id: u64,
+    pub proto: Protocol,
+    pub pid: u32,
+    /// File name; "System" / "?" when unknown.
+    pub exe: String,
+    pub local: SocketAddr,
+    pub dst: SocketAddr,
+    pub domain: Option<String>,
+    pub route: Route,
+    pub group_id: Option<GroupId>,
+    /// "own", "inherited from steam.exe", "catch-all", "always-direct app", "excluded", "no match".
+    pub reason: String,
+    /// Unix ms.
+    pub started_ms: u64,
+    /// `None` while active.
+    pub ended_ms: Option<u64>,
+    /// Bytes; `None` when not relayed.
+    pub up: Option<u64>,
+    pub down: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

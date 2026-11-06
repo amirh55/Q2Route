@@ -356,6 +356,14 @@ impl Inner {
                 self.apply(|c| c.set_group_enabled(&group_id, enabled))
                     .await
             }
+            Request::AddGroup { .. }
+            | Request::RenameGroup { .. }
+            | Request::DeleteGroup { .. }
+            | Request::MoveGroup { .. }
+            | Request::SetGroupRules { .. }
+            | Request::AddRule { .. }
+            | Request::GetConnections
+            | Request::ListProcesses => Response::Error("not implemented".into()),
             Request::UpsertProxy(p) => self.apply(|c| c.upsert_proxy(p)).await,
             Request::DeleteProxy { id } => self.apply(|c| c.delete_proxy(&id)).await,
             Request::TestProxy { id } => {

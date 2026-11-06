@@ -9,4 +9,5 @@ pub mod peek;
 pub mod process_tree;
 pub mod proxy;
 pub mod ruleset;
+pub mod suggest;
 pub use config::*;

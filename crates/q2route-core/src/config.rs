@@ -1,5 +1,6 @@
 //! Config model: proxies, rule groups, settings, TOML persistence.
 
+use crate::matchers::{AppMatcher, DomainPattern, IpMatcher, MatchError, PortRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -87,6 +88,52 @@ impl Default for Rule {
             include_children: true,
         }
     }
+}
+
+impl Rule {
+    /// A rule with no conditions matches nothing.
+    pub fn is_empty(&self) -> bool {
+        self.apps.is_empty()
+            && self.domains.is_empty()
+            && self.ips.is_empty()
+            && self.ports.is_empty()
+            && self.protocol.is_none()
+    }
+
+    /// Non-empty, and every entry parses with its matcher.
+    pub fn check(&self) -> Result<(), ConfigError> {
+        let bad = |e: MatchError| ConfigError::Invalid(e.to_string());
+        if self.is_empty() {
+            return Err(ConfigError::Invalid("rule has no conditions".into()));
+        }
+        for a in &self.apps {
+            AppMatcher::parse(a).map_err(bad)?;
+        }
+        for d in &self.domains {
+            DomainPattern::parse(d).map_err(bad)?;
+        }
+        for i in &self.ips {
+            IpMatcher::parse(i).map_err(bad)?;
+        }
+        for p in &self.ports {
+            PortRange::parse(p).map_err(bad)?;
+        }
+        Ok(())
+    }
+}
+
+/// Lowercase ASCII alphanumerics; other runs become a single `-`.
+pub fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() { "group" } else { out }.to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -384,6 +431,111 @@ impl Config {
             }
             Ok(())
         })
+    }
+
+    /// New enabled, empty group just before the catch-all. Returns its id.
+    pub fn add_group(&mut self, name: &str, action: Action) -> Result<GroupId, ConfigError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ConfigError::Invalid("group name is empty".into()));
+        }
+        let base = slug(name);
+        let mut id = base.clone();
+        let mut n = 2;
+        while self.groups.iter().any(|g| g.id == id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        let group = Group {
+            id: id.clone(),
+            name: name.into(),
+            enabled: true,
+            action,
+            rules: vec![],
+            catch_all: false,
+        };
+        self.mutate(|c| {
+            let at = c.groups.len().saturating_sub(1);
+            c.groups.insert(at, group);
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    pub fn rename_group(&mut self, id: &str, name: &str) -> Result<(), ConfigError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ConfigError::Invalid("group name is empty".into()));
+        }
+        self.mutate(|c| {
+            c.group_mut(id)?.name = name.into();
+            Ok(())
+        })
+    }
+
+    pub fn delete_group(&mut self, id: &str) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            if c.group_mut(id)?.catch_all {
+                return Err(ConfigError::Invalid(format!(
+                    "the catch-all group '{id}' cannot be deleted"
+                )));
+            }
+            c.groups.retain(|g| g.id != id);
+            Ok(())
+        })
+    }
+
+    /// Moves a group so it ends up at index `to`; nothing may land at or after the catch-all.
+    pub fn move_group(&mut self, id: &str, to: usize) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            let from = c
+                .groups
+                .iter()
+                .position(|g| g.id == id)
+                .ok_or_else(|| ConfigError::Invalid(format!("unknown group '{id}'")))?;
+            if c.groups[from].catch_all {
+                return Err(ConfigError::Invalid(
+                    "the catch-all group cannot be moved".into(),
+                ));
+            }
+            if to + 1 >= c.groups.len() {
+                return Err(ConfigError::Invalid(format!(
+                    "cannot move group to index {to}"
+                )));
+            }
+            let g = c.groups.remove(from);
+            c.groups.insert(to, g);
+            Ok(())
+        })
+    }
+
+    /// Replaces a group's rules (action and enabled state are untouched).
+    pub fn set_group_rules(&mut self, id: &str, rules: Vec<Rule>) -> Result<(), ConfigError> {
+        rules.iter().try_for_each(Rule::check)?;
+        self.mutate(|c| {
+            c.group_mut(id)?.rules = rules;
+            Ok(())
+        })
+    }
+
+    /// Appends a rule; `Ok(false)` if an equal rule already exists.
+    pub fn add_rule(&mut self, id: &str, rule: Rule) -> Result<bool, ConfigError> {
+        rule.check()?;
+        let mut added = false;
+        self.mutate(|c| {
+            let g = c.group_mut(id)?;
+            if g.catch_all {
+                return Err(ConfigError::Invalid(format!(
+                    "the catch-all group '{id}' takes no rules"
+                )));
+            }
+            if !g.rules.contains(&rule) {
+                g.rules.push(rule);
+                added = true;
+            }
+            Ok(())
+        })?;
+        Ok(added)
     }
 
     /// Delete a proxy; fails if unknown or still referenced (validation catches references).
