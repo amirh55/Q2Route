@@ -36,6 +36,9 @@ use crate::windivert::Address;
 pub const SESSION_IDLE: Duration = Duration::from_secs(300);
 /// Datagrams queued per session while it associates (more are dropped).
 pub const PENDING_MAX: usize = 64;
+/// ConnLog rows (one per remote) a session opens at most; further remotes
+/// are still relayed and counted in the stats, but get no row.
+pub const MAX_REMOTE_ROWS: usize = 32;
 /// After a failed association (or an unusable profile) the session drops
 /// its datagrams for this long; the next datagram after that retries.
 pub const FAIL_BACKOFF: Duration = Duration::from_secs(10);
@@ -278,29 +281,34 @@ impl Session {
     }
 
     /// ConnLog entry (with live bytes) for `remote`, opened on its first
-    /// datagram.
-    fn entry<'e>(&self, e: &'e mut Entries<'_>, remote: SocketAddrV4) -> &'e ConnBytes {
-        &e.by_remote
-            .entry(remote)
-            .or_insert_with(|| {
-                let bytes = Arc::new(ConnBytes::default());
-                let id = self.ctx.conns.open(
-                    NewConn {
-                        proto: Protocol::Udp,
-                        pid: self.pid,
-                        exe: self.exe(),
-                        local: SocketAddr::V4(self.local),
-                        dst: SocketAddr::V4(remote),
-                        domain: None,
-                        route: Route::Proxy(self.profile.clone()),
-                        group_id: self.group.clone(),
-                        reason: "udp relay".into(),
-                    },
-                    Some(bytes.clone()),
-                );
-                (id, bytes)
-            })
-            .1
+    /// datagram; `None` once the session has [`MAX_REMOTE_ROWS`] rows.
+    fn entry<'e>(&self, e: &'e mut Entries<'_>, remote: SocketAddrV4) -> Option<&'e ConnBytes> {
+        if !e.by_remote.contains_key(&remote) && e.by_remote.len() >= MAX_REMOTE_ROWS {
+            return None;
+        }
+        Some(
+            &e.by_remote
+                .entry(remote)
+                .or_insert_with(|| {
+                    let bytes = Arc::new(ConnBytes::default());
+                    let id = self.ctx.conns.open(
+                        NewConn {
+                            proto: Protocol::Udp,
+                            pid: self.pid,
+                            exe: self.exe(),
+                            local: SocketAddr::V4(self.local),
+                            dst: SocketAddr::V4(remote),
+                            domain: None,
+                            route: Route::Proxy(self.profile.clone()),
+                            group_id: self.group.clone(),
+                            reason: "udp relay".into(),
+                        },
+                        Some(bytes.clone()),
+                    );
+                    (id, bytes)
+                })
+                .1,
+        )
     }
 
     /// Drops every datagram for the backoff, then ends (the next datagram
@@ -405,7 +413,9 @@ impl Session {
                     let bytes = self.entry(entries, d.remote);
                     match sock.send(&encode_udp(SocketAddr::V4(d.remote), &d.payload)).await {
                         Ok(_) => {
-                            bytes.up.fetch_add(n, Ordering::Relaxed);
+                            if let Some(b) = bytes {
+                                b.up.fetch_add(n, Ordering::Relaxed);
+                            }
                             self.ctx.stats.add(group, n, 0);
                             deadline = Instant::now() + self.cfg.idle;
                         }

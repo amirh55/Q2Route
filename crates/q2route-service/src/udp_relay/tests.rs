@@ -487,3 +487,45 @@ async fn proxy_unreachable_emits_proxy_down_then_up() {
     assert_eq!(recv(&mut seen).await, b"two");
     let _ = recv(&mut s.injected).await;
 }
+
+#[tokio::test]
+async fn remote_rows_are_capped() {
+    let m = mock(MockOpts::default()).await;
+    // One echo server per remote (distinct ports), all reporting to `seen`.
+    let total = MAX_REMOTE_ROWS + 10;
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    let mut remotes = Vec::new();
+    for _ in 0..total {
+        let (addr, mut rx) = echo().await;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = rx.recv().await {
+                let _ = tx.send((addr, p));
+            }
+        });
+        remotes.push(addr);
+    }
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    for (i, r) in remotes.iter().enumerate() {
+        s.relay.submit(dg(*r, &(i as u32).to_be_bytes()));
+    }
+    let mut got = HashSet::new();
+    for _ in 0..total {
+        got.insert(recv(&mut seen).await.0);
+        recv(&mut s.injected).await;
+    }
+    assert_eq!(got.len(), total, "every remote is relayed");
+    let rows: Vec<_> = s
+        .ctx
+        .conns
+        .list()
+        .into_iter()
+        .filter(|c| c.local == SocketAddr::V4(local()))
+        .collect();
+    assert_eq!(rows.len(), MAX_REMOTE_ROWS);
+    assert!(rows.iter().all(|c| c.ended_ms.is_none()));
+    assert_eq!(s.ctx.stats.bytes("g"), (4 * total as u64, 4 * total as u64));
+}
