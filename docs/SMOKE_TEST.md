@@ -74,6 +74,19 @@ sc.exe stop Q2Route
 sc.exe start Q2Route
 ```
 
+## M2: rules editor and connections
+
+Install this update with `dist\Q2Route-update\Update.cmd` (see "Updating a running install" above).
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| E1 | Add group "Filtered games" with action Proxy (v2ray). Add the game's exe via "Pick running app…". | The dashboard shows the new card above "Everything else". | |
+| E2 | Enter the bad entry `10.0.0.0/33`. | An error shows and nothing changes; `config.toml` is unchanged. | |
+| E3 | Reorder and delete a group, then restart the service (`sc.exe stop Q2Route`, `sc.exe start Q2Route`). | The order persists after the restart. | |
+| C1 | Open the Connections page. | Lists browser connections with route, group and why; LAN and DNS are not listed. | |
+| C2 | Right-click a site → "Add domain to group ▸ Iranian sites" with `*.parent`. Open a new connection to it. | The connection goes Direct; log shows `group=iranian-sites`. | |
+| C3 | Leave a Steam download running for 10 min. | The page stays responsive; the list length stays bounded. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
