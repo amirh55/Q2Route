@@ -239,6 +239,8 @@ fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunSt
             run.nat.insert(f.local.port(), OriginalDst { dst, pid });
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
+        // Relay wired up in a later task: fail closed meanwhile.
+        Action::UdpProxy { .. } => Out::Drop,
         Action::Redirect => {
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
