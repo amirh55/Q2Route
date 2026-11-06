@@ -121,25 +121,34 @@ pub struct ConnectionsView {
     filter: Filter,
     conns: Vec<ConnInfo>,
     pending: Option<oneshot::Receiver<Response>>,
+    /// A received list held back while a context menu is open, so the row
+    /// under the pointer cannot change between aiming and clicking.
+    incoming: Option<Vec<ConnInfo>>,
     last_sent: Option<Instant>,
 }
 
 impl ConnectionsView {
     /// Collects a finished poll and sends the next one when due.
-    fn poll(&mut self, client: &Client, req: &mut Requests) {
+    fn poll(&mut self, ctx: &egui::Context, client: &Client, req: &mut Requests) {
         if let Some(rx) = self.pending.as_mut() {
             match rx.try_recv() {
                 Ok(Response::Connections(v)) => {
-                    self.conns = v;
+                    self.incoming = Some(v);
                     self.pending = None;
                 }
                 Ok(Response::Error(e)) => {
-                    req.last_error = Some(e);
+                    // The app already shows a banner while disconnected.
+                    if e != "disconnected" && req.last_error.as_ref() != Some(&e) {
+                        req.last_error = Some(e);
+                    }
                     self.pending = None;
                 }
                 Ok(_) | Err(oneshot::error::TryRecvError::Closed) => self.pending = None,
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
+        }
+        if self.incoming.is_some() && !egui::Popup::is_any_open(ctx) {
+            self.conns = self.incoming.take().unwrap_or_default();
         }
         if due(self.pending.is_some(), self.last_sent.map(|t| t.elapsed())) {
             self.pending = Some(client.send(Request::GetConnections));
@@ -154,7 +163,7 @@ impl ConnectionsView {
         client: &Client,
         req: &mut Requests,
     ) {
-        self.poll(client, req);
+        self.poll(ui.ctx(), client, req);
         ui.horizontal(|ui| {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.filter.text);
@@ -164,26 +173,32 @@ impl ConnectionsView {
         ui.label(format!("{} shown", rows.len()));
         ui.separator();
         ui.spacing_mut().item_spacing.x = 6.0;
-        ui.horizontal(|ui| {
-            for (h, w) in HEADERS.iter().zip(COLS) {
-                ui.add_sized(
-                    [w, ROW_HEIGHT],
-                    egui::Label::new(RichText::new(*h).strong()),
-                );
-            }
-        });
         let now = now_ms();
         let scroll_h = (ui.available_height() - 24.0).max(ROW_HEIGHT);
-        egui::ScrollArea::vertical()
-            .id_salt("connections_rows")
-            .auto_shrink(false)
-            .max_height(scroll_h)
-            .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-                for c in &rows[range] {
-                    if let Some((group_id, rule)) = row(ui, c, snap, now) {
-                        req.send(client, Request::AddRule { group_id, rule });
+        // The table is wider than the default window: scroll it sideways as
+        // a whole so header and rows stay aligned.
+        egui::ScrollArea::horizontal()
+            .id_salt("connections_table")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (h, w) in HEADERS.iter().zip(COLS) {
+                        ui.add_sized(
+                            [w, ROW_HEIGHT],
+                            egui::Label::new(RichText::new(*h).strong()),
+                        );
                     }
-                }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("connections_rows")
+                    .auto_shrink([true, false])
+                    .max_height((scroll_h - ROW_HEIGHT - 12.0).max(ROW_HEIGHT))
+                    .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+                        for c in &rows[range] {
+                            if let Some((group_id, rule)) = row(ui, c, snap, now) {
+                                req.send(client, Request::AddRule { group_id, rule });
+                            }
+                        }
+                    });
             });
         ui.weak("Changing a rule applies to new connections; open ones keep their route.");
     }
@@ -265,13 +280,16 @@ fn group_items(
 fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option<(GroupId, Rule)> {
     let mut pick = None;
     if let Some(rule) = app_rule(&c.exe) {
-        ui.menu_button("Add app to group \u{25b8}", |ui| {
-            group_items(ui, snap, &rule, &mut pick)
-        });
+        let label = if rule.include_children {
+            format!("Add {} (and apps it starts) to group", c.exe)
+        } else {
+            format!("Add {} to group", c.exe)
+        };
+        ui.menu_button(label, |ui| group_items(ui, snap, &rule, &mut pick));
     }
     let domains = c.domain.as_deref().map(domain_patterns).unwrap_or_default();
     if !domains.is_empty() {
-        ui.menu_button("Add domain to group \u{25b8}", |ui| {
+        ui.menu_button("Add domain to group", |ui| {
             for p in domains {
                 ui.menu_button(p.clone(), |ui| {
                     let rule = Rule {
@@ -285,7 +303,7 @@ fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option
     }
     let ips = ip_patterns(c.dst.ip());
     if !ips.is_empty() {
-        ui.menu_button("Add IP to group \u{25b8}", |ui| {
+        ui.menu_button("Add IP to group", |ui| {
             for p in ips {
                 ui.menu_button(p.clone(), |ui| {
                     let rule = Rule {

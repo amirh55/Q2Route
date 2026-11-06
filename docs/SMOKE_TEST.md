@@ -84,8 +84,9 @@ Install this update with `dist\Q2Route-update\Update.cmd` (see "Updating a runni
 | E2 | Enter the bad entry `10.0.0.0/33`. | An error shows and nothing changes; `config.toml` is unchanged. | |
 | E3 | Reorder and delete a group, then restart the service (`sc.exe stop Q2Route`, `sc.exe start Q2Route`). | The order persists after the restart. | |
 | C1 | Open the Connections page. | Lists browser connections with route, group and why; LAN and DNS are not listed. | |
-| C2 | Right-click a site → "Add domain to group ▸ Iranian sites" with `*.parent`. Open a new connection to it. | The connection goes Direct; log shows `group=iranian-sites`. | |
+| C2 | Right-click a site → "Add domain to group → Iranian sites" with `*.parent`. Open a new connection to it. | The connection goes Direct; log shows `group=iranian-sites`. | |
 | C3 | Leave a Steam download running for 10 min. | The page stays responsive; the list length stays bounded. | |
+| C4 | Right-click an `explorer.exe` (or `svchost.exe`) row. | The menu names the exe without "(and apps it starts)". After adding it to a Direct group, a browser started afterwards from the Start menu still shows `route=Proxy(v2ray)` in the Connections page. Remove the rule afterwards. | |
 
 ## Leak checks
 

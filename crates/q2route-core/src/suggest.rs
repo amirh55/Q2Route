@@ -6,7 +6,25 @@ use crate::process_tree::ProcessTree;
 use ipnet::IpNet;
 use std::net::IpAddr;
 
+const SHELL_HOSTS: [&str; 14] = [
+    "explorer.exe",
+    "svchost.exe",
+    "services.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "conhost.exe",
+    "rundll32.exe",
+    "dllhost.exe",
+    "runtimebroker.exe",
+    "sihost.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "taskhostw.exe",
+];
+
 /// App rule for an exe name; `None` for unknown / system pseudo-processes.
+/// Shell/host processes get `include_children = false`.
 pub fn app_rule(exe: &str) -> Option<Rule> {
     if ["", "?", "system", "idle"]
         .iter()
@@ -14,9 +32,12 @@ pub fn app_rule(exe: &str) -> Option<Rule> {
     {
         return None;
     }
+    // Shells and host processes start unrelated apps; inheriting from them
+    // would send everything they launch down the same route.
+    let host = SHELL_HOSTS.iter().any(|s| exe.eq_ignore_ascii_case(s));
     Some(Rule {
         apps: vec![exe.into()],
-        include_children: true,
+        include_children: !host,
         ..Rule::default()
     })
 }

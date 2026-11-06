@@ -13,6 +13,16 @@ fn app_rule_skips_system_and_unknown() {
 }
 
 #[test]
+fn app_rule_shell_hosts_do_not_include_children() {
+    for x in ["explorer.exe", "SVCHOST.EXE", "PowerShell.exe", "cmd.exe"] {
+        let r = app_rule(x).unwrap();
+        assert_eq!(r.apps, [x]);
+        assert!(!r.include_children, "{x}");
+    }
+    assert!(app_rule("steam.exe").unwrap().include_children);
+}
+
+#[test]
 fn domain_and_ip_patterns() {
     assert_eq!(
         domain_patterns("www.Digikala.com."),
