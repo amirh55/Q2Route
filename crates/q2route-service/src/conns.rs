@@ -4,7 +4,7 @@
 //! lock and never holds it across I/O or an await.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +60,22 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `::ffff:a.b.c.d` is `a.b.c.d`.
+fn unmap(a: SocketAddr) -> SocketAddr {
+    match a.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(a, |v4| SocketAddr::new(IpAddr::V4(v4), a.port())),
+        _ => a,
+    }
+}
+
+/// Same port, and the CLOSE address is unspecified or the same ip.
+fn same_local(entry: &SocketAddr, close: SocketAddr) -> bool {
+    let (e, c) = (unmap(*entry), unmap(close));
+    e.port() == c.port() && (c.ip().is_unspecified() || e.ip() == c.ip())
 }
 
 fn snapshot(a: &Active) -> ConnInfo {
@@ -148,7 +164,7 @@ impl ConnLog {
         let mut i = 0;
         while i < s.active.len() {
             let a = &s.active[i].info;
-            if a.proto == proto && a.local == local {
+            if a.proto == proto && same_local(&a.local, local) {
                 s.end(i, now);
             } else {
                 i += 1;
@@ -171,7 +187,7 @@ impl ConnLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     fn conn(i: usize) -> NewConn {
         NewConn {
@@ -222,6 +238,35 @@ mod tests {
         let ended = l.iter().find(|c| c.ended_ms.is_some()).unwrap();
         assert_eq!(ended.id, id1);
         assert_eq!(ended.proto, Protocol::Tcp);
+    }
+
+    #[test]
+    fn close_local_unspecified_and_mapped() {
+        let log = ConnLog::default();
+        let (mut u, mut t, mut o) = (conn(1), conn(2), conn(3));
+        local(&mut u, 5000);
+        u.proto = Protocol::Udp;
+        local(&mut t, 5000);
+        local(&mut o, 5001);
+        o.proto = Protocol::Udp;
+        let uid = log.open(u, None);
+        log.open(t, None);
+        log.open(o, None);
+        log.close_local(Protocol::Udp, "0.0.0.0:5000".parse().unwrap());
+        let ended: Vec<_> = log
+            .list()
+            .into_iter()
+            .filter(|c| c.ended_ms.is_some())
+            .collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, uid);
+
+        let log = ConnLog::default();
+        let mut t = conn(1);
+        local(&mut t, 5000);
+        log.open(t, None);
+        log.close_local(Protocol::Tcp, "[::ffff:10.0.0.1]:5000".parse().unwrap());
+        assert!(log.list()[0].ended_ms.is_some());
     }
 
     #[test]
