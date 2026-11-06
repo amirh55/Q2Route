@@ -97,8 +97,10 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | U1 | Proxies → Test on v2ray. | Shows "UDP OK" (v2rayN's SOCKS inbound has UDP on by default). | |
 | U2 | Put a filtered game's exe in a Proxy (v2ray) group; play online. | The game connects; Connections shows its UDP rows with route Proxy (v2ray) and growing ↑/↓; log has `udp ... via 'v2ray': associated`. | |
 | U3 | Same game with v2ray stopped. | The game can't connect; log shows `association failed ... (dropped, no direct fallback)`; browserleaks/game never sees the real IP. | |
+| U3b | With Windows Firewall turned off for the test, play a proxied game, then quit it mid-session; capture outbound ICMP (`pktmon start --capture --comp nics` / Wireshark filter `icmp`) for 60 s. Turn the firewall back on. | No ICMP port-unreachable toward the game server. | |
 | U4 | Open `https://cloudflare-quic.com`. | Still reports `h2` (proxied UDP/443 stays blocked). | |
 | U5 | Use a Direct game (e.g. in "Games"). | Unaffected: still direct, ping unchanged. | |
+| U6 | Re-run L4 (browserleaks WebRTC). | The srflx candidate shows the v2ray exit IP, never the real IP. | |
 
 ## Leak checks
 

@@ -6,6 +6,9 @@
 //! * Network layer: every outbound, non-loopback TCP/UDP packet. Relay
 //!   replies (`A:relay_port -> D:pa`) are restored to the app; everything else
 //!   goes through [`classify`], which only ever passes Direct flows.
+//!   Outbound ICMPv4 destination-unreachable is captured too: one quoting a
+//!   UDP packet to a port the UDP relay serves (the stack answering an
+//!   injected reply from the real IP) is dropped; any other passes as before.
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -35,7 +38,8 @@ use crate::windivert::{
 
 pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event == CLOSE)) \
      or (udp and event == BIND) or (tcp and event == ACCEPT)";
-pub const NETWORK_FILTER: &str = "outbound and !loopback and (tcp or udp)";
+pub const NETWORK_FILTER: &str =
+    "outbound and !loopback and ((tcp or udp) or (icmp and icmp.Type == 3))";
 /// Threads receiving from the Network-layer handle.
 pub const NETWORK_THREADS: usize = 4;
 /// Ancestors refreshed on demand for an unknown pid (Ruling R5).
@@ -246,6 +250,14 @@ fn route_packet(
     if !addr.outbound() {
         return Out::Send;
     }
+    // ICMPv4 (the filter captures only type 3): never a proxied flow; only
+    // the stack's answer to an injected relay reply is held back.
+    if pkt.first().is_some_and(|b| b >> 4 == 4) && pkt.get(9) == Some(&PROTO_ICMP) {
+        return match icmp_quoted_udp_dst_port(pkt) {
+            Some(port) if udp.serves_port(port) => Out::Drop,
+            _ => Out::Send,
+        };
+    }
     // Captured but not understood (e.g. odd IPv6 extension headers): drop
     // rather than risk passing a non-Direct flow.
     let Some(m) = parse(pkt) else {
@@ -310,6 +322,40 @@ fn route_packet(
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
     }
+}
+
+const PROTO_ICMP: u8 = 1;
+
+/// For an IPv4 ICMP destination unreachable (type 3) quoting an IPv4/UDP
+/// packet: the quoted UDP destination port (the local port the triggering
+/// inbound packet was addressed to). `None` for anything else or anything
+/// malformed / truncated.
+fn icmp_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
+    let be16 = |b: &[u8], at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]))
+    };
+    if p.len() < 20 || p[0] >> 4 != 4 || p[9] != PROTO_ICMP || be16(p, 6)? & 0x1fff != 0 {
+        return None;
+    }
+    let ihl = usize::from(p[0] & 0x0f) * 4;
+    let total = usize::from(be16(p, 2)?).min(p.len());
+    if ihl < 20 {
+        return None;
+    }
+    let icmp = p.get(ihl..total)?;
+    if *icmp.first()? != 3 {
+        return None;
+    }
+    // ICMP header (8 bytes), then the quoted IP header + 8 bytes.
+    let q = icmp.get(8..)?;
+    if q.len() < 20 || q[0] >> 4 != 4 || q[9] != PROTO_UDP || be16(q, 6)? & 0x1fff != 0 {
+        return None;
+    }
+    let qihl = usize::from(q[0] & 0x0f) * 4;
+    if qihl < 20 {
+        return None;
+    }
+    be16(q, qihl + 2)
 }
 
 /// UDP payload of an IPv4/UDP packet (bounded by the UDP and IP lengths);
@@ -466,10 +512,54 @@ mod tests {
         assert_eq!(relay_local(p("[2001:db8::1]:5000")), None);
     }
 
+    /// IPv4 ICMP `ty`/code 3 quoting the first 28 bytes of `quoted`.
+    fn icmp4(ty: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 128, PROTO_ICMP, 0, 0];
+        p.extend_from_slice(&[10, 0, 0, 2, 8, 8, 4, 4]);
+        p.extend_from_slice(&[ty, 3, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&quoted[..28.min(quoted.len())]);
+        let len = p.len() as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn icmp_quoted_udp_dst_port_parses_port_unreachable() {
+        // The triggering inbound packet: remote -> app's local port 5000.
+        let src = "8.8.4.4:3478".parse().unwrap();
+        let dst = "10.0.0.2:5000".parse().unwrap();
+        let udp = crate::udp_packet::build_inbound_udp(src, dst, b"reply").unwrap();
+        assert_eq!(icmp_quoted_udp_dst_port(&icmp4(3, &udp)), Some(5000));
+        let mut tcp = udp.clone();
+        tcp[9] = PROTO_TCP;
+        assert_eq!(
+            icmp_quoted_udp_dst_port(&icmp4(3, &tcp)),
+            None,
+            "quotes TCP"
+        );
+        assert_eq!(icmp_quoted_udp_dst_port(&icmp4(8, &udp)), None, "echo");
+        let full = icmp4(3, &udp);
+        for n in [0, 10, 20, 27, 36, 48, 51] {
+            assert_eq!(
+                icmp_quoted_udp_dst_port(&full[..n]),
+                None,
+                "truncated to {n}"
+            );
+        }
+        // The outer packet itself is UDP, not ICMP.
+        assert_eq!(icmp_quoted_udp_dst_port(&udp), None);
+    }
+
     #[test]
     fn filters_compile() {
         check_filter(SOCKET_FILTER, Layer::Socket).unwrap();
         check_filter(NETWORK_FILTER, Layer::Network).unwrap();
+        check_filter(
+            "outbound and !loopback and icmp and icmp.Type == 3",
+            Layer::Network,
+        )
+        .unwrap();
+        assert!(NETWORK_FILTER.contains("icmp and icmp.Type == 3"));
         assert!(check_filter("tcp and event == NOPE", Layer::Socket).is_err());
     }
 }

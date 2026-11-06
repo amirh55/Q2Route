@@ -435,18 +435,19 @@ async fn udp_check(p: &ProxyProfile) -> bool {
     let Ok(sock) = UdpSocket::bind(bind).await else {
         return false;
     };
+    // Connected like the service's relay socket: only replies from the
+    // relay address count, so "UDP OK" means the relay path works.
+    if sock.connect(assoc.relay).await.is_err() {
+        return false;
+    }
     let dst = SocketAddr::new(IpAddr::from([1, 1, 1, 1]), 53);
-    if sock
-        .send_to(&encode_udp(dst, DNS_QUERY), assoc.relay)
-        .await
-        .is_err()
-    {
+    if sock.send(&encode_udp(dst, DNS_QUERY)).await.is_err() {
         return false;
     }
     let mut buf = [0u8; 2048];
     let ok = matches!(
-        tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await,
-        Ok(Ok((n, _))) if decode_udp(&buf[..n]).is_some()
+        tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await,
+        Ok(Ok(n)) if decode_udp(&buf[..n]).is_some()
     );
     drop(assoc.control); // the association must live until here
     ok

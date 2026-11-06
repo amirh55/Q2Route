@@ -125,6 +125,8 @@ struct MockOpts {
     rep: u8,
     /// After the first relayed datagram, also send one from this remote.
     unsolicited: Option<SocketAddrV4>,
+    /// Serve the UDP relay on [::1] (BND.ADDR IPv6).
+    v6: bool,
 }
 
 struct Mock {
@@ -137,9 +139,16 @@ struct Mock {
 /// SOCKS5 proxy (no auth) that answers UDP ASSOCIATE and relays datagrams
 /// through one shared UDP relay socket.
 async fn mock(opts: MockOpts) -> Mock {
+    try_mock(opts).await.expect("mock relay socket")
+}
+
+/// Like [`mock`]; `None` if the relay socket cannot be bound (no IPv6
+/// loopback).
+async fn try_mock(opts: MockOpts) -> Option<Mock> {
+    let relay_bind = if opts.v6 { "[::1]:0" } else { "127.0.0.1:0" };
+    let relay = Arc::new(UdpSocket::bind(relay_bind).await.ok()?);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
-    let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let outer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_port = relay.local_addr().unwrap().port();
     let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
@@ -180,7 +189,7 @@ async fn mock(opts: MockOpts) -> Mock {
     });
     // Control connections.
     let (a, cc) = (attempts.clone(), close_control.clone());
-    let (delay, rep) = (opts.delay, opts.rep);
+    let (delay, rep, v6) = (opts.delay, opts.rep, opts.v6);
     tokio::spawn(async move {
         while let Ok((mut s, _)) = l.accept().await {
             let (a, cc) = (a.clone(), cc.clone());
@@ -193,7 +202,13 @@ async fn mock(opts: MockOpts) -> Mock {
                 assert_eq!(req[1], 3, "UDP ASSOCIATE");
                 a.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
-                let mut reply = vec![5, rep, 0, 1, 127, 0, 0, 1];
+                let mut reply = if v6 {
+                    let mut r = vec![5, rep, 0, 4];
+                    r.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                    r
+                } else {
+                    vec![5, rep, 0, 1, 127, 0, 0, 1]
+                };
                 reply.extend_from_slice(&relay_port.to_be_bytes());
                 s.write_all(&reply).await.unwrap();
                 if rep != 0 {
@@ -207,11 +222,11 @@ async fn mock(opts: MockOpts) -> Mock {
             });
         }
     });
-    Mock {
+    Some(Mock {
         port,
         attempts,
         close_control,
-    }
+    })
 }
 
 fn dg(remote: SocketAddrV4, payload: &[u8]) -> Datagram {
@@ -358,10 +373,159 @@ async fn udp_association_refused_drops_and_logs() {
     .await
     .unwrap();
     s.relay.submit(dg(echo_addr, b"two"));
+    // Another remote inside the backoff: no new row either.
+    let other = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 999);
+    s.relay.submit(dg(other, b"three"));
     quiet(&mut seen).await;
     quiet(&mut s.injected).await;
     assert_eq!(m.attempts.load(Ordering::SeqCst), 1);
     assert!(s.ctx.proxy_down.is_empty(), "a refusal is not proxy down");
+    assert_eq!(rows(&s.ctx).len(), 1, "one ConnLog row within the backoff");
+}
+
+/// ConnLog rows of the test's app socket.
+fn rows(ctx: &RelayCtx) -> Vec<ConnInfo> {
+    ctx.conns
+        .list()
+        .into_iter()
+        .filter(|c| c.local == SocketAddr::V4(local()))
+        .collect()
+}
+
+#[tokio::test]
+async fn dead_proxy_retries_once_per_backoff() {
+    let m = mock(MockOpts {
+        rep: 7,
+        ..Default::default()
+    })
+    .await;
+    let (echo_addr, mut seen) = echo().await;
+    let backoff = Duration::from_millis(400);
+    let s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig {
+            backoff,
+            ..Default::default()
+        },
+    );
+    let attempts = |n: usize| {
+        let a = m.attempts.clone();
+        async move {
+            timeout(WAIT, async {
+                while a.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    };
+    s.relay.submit(dg(echo_addr, b"one"));
+    attempts(1).await;
+    // Inside the backoff: dropped by the manager, no session.
+    for _ in 0..10 {
+        s.relay.submit(dg(echo_addr, b"x"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(m.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(rows(&s.ctx).len(), 1);
+    // After it: exactly one new attempt and one new row.
+    tokio::time::sleep(backoff).await;
+    s.relay.submit(dg(echo_addr, b"two"));
+    s.relay.submit(dg(echo_addr, b"three"));
+    attempts(2).await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(m.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(rows(&s.ctx).len(), 2);
+    quiet(&mut seen).await;
+}
+
+#[tokio::test]
+async fn close_is_not_dropped_when_queue_is_full() {
+    let m = mock(MockOpts::default()).await;
+    let (echo_addr, mut seen) = echo().await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    s.relay.submit(dg(echo_addr, b"one"));
+    assert_eq!(recv(&mut seen).await, b"one");
+    recv(&mut s.injected).await;
+    // Current-thread runtime: the manager cannot run while this loop fills
+    // (and overflows) the datagram queue.
+    for _ in 0..SUBMIT_QUEUE + 100 {
+        s.relay.submit(dg(echo_addr, b"flood"));
+    }
+    s.relay.close(local());
+    let c = conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
+    assert_eq!(c.local, SocketAddr::V4(local()));
+    // The queued datagrams predate the close: none restarts a session.
+    quiet(&mut seen).await;
+    assert_eq!(m.attempts.load(Ordering::SeqCst), 1);
+    assert!(rows(&s.ctx).iter().all(|c| c.ended_ms.is_some()));
+    // A datagram after the close (new socket on the port) is relayed.
+    s.relay.submit(dg(echo_addr, b"two"));
+    assert_eq!(recv(&mut seen).await, b"two");
+}
+
+#[tokio::test]
+async fn serves_port_during_session_and_guard() {
+    let m = mock(MockOpts::default()).await;
+    let (echo_addr, mut seen) = echo().await;
+    let guard = Duration::from_millis(500);
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig {
+            icmp_guard: guard,
+            ..Default::default()
+        },
+    );
+    let port = local().port();
+    assert!(!s.relay.serves_port(port));
+    s.relay.submit(dg(echo_addr, b"one"));
+    assert_eq!(recv(&mut seen).await, b"one");
+    recv(&mut s.injected).await;
+    assert!(s.relay.serves_port(port));
+    assert!(!s.relay.serves_port(port + 1));
+    s.relay.close(local());
+    conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
+    timeout(WAIT, async {
+        while s.ctx.stats.snapshot().0.values().any(|g| g.active > 0) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Ended, still guarded.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(s.relay.serves_port(port), "guarded after the session ends");
+    tokio::time::sleep(guard + Duration::from_millis(100)).await;
+    assert!(!s.relay.serves_port(port), "guard expired");
+}
+
+#[tokio::test]
+async fn ipv6_relay_address_works() {
+    let Some(m) = try_mock(MockOpts {
+        v6: true,
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!("no IPv6 loopback; skipped");
+        return;
+    };
+    let (echo_addr, mut seen) = echo().await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    s.relay.submit(dg(echo_addr, b"ping6"));
+    assert_eq!(recv(&mut seen).await, b"ping6");
+    let (src, dst, payload) = parse_inbound(&recv(&mut s.injected).await);
+    assert_eq!(
+        (src, dst, payload.as_slice()),
+        (echo_addr, local(), &b"ping6"[..])
+    );
 }
 
 #[tokio::test]

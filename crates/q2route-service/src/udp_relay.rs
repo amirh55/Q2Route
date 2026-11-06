@@ -9,12 +9,19 @@
 //! **Fail closed:** nothing here ever sends an app datagram direct. A missing
 //! or non-SOCKS5 profile, or a failed association, drops the datagrams (for
 //! [`FAIL_BACKOFF`], then the next datagram retries).
+//!
+//! **ICMP guard:** replies are injected toward the app's socket; one arriving
+//! after that socket closed makes Windows answer with an ICMP port
+//! unreachable from the real IP. [`UdpRelay::serves_port`] (live sessions
+//! plus [`ICMP_GUARD`] after they end) lets the packet loop drop those.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::Ordering;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use dashmap::DashMap;
 
 use q2route_core::config::{GroupId, ProfileId, Protocol, ProxyKind};
 use q2route_core::decide::Route;
@@ -42,6 +49,9 @@ pub const MAX_REMOTE_ROWS: usize = 32;
 /// After a failed association (or an unusable profile) the session drops
 /// its datagrams for this long; the next datagram after that retries.
 pub const FAIL_BACKOFF: Duration = Duration::from_secs(10);
+/// A local port still counts as relay-served this long after its last
+/// session ended (late replies may still be in flight / injected).
+pub const ICMP_GUARD: Duration = Duration::from_secs(60);
 const ASSOCIATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound of the packet threads -> manager channel.
 const SUBMIT_QUEUE: usize = 4096;
@@ -70,6 +80,7 @@ pub struct Datagram {
 pub struct UdpRelayConfig {
     pub idle: Duration,
     pub backoff: Duration,
+    pub icmp_guard: Duration,
 }
 
 impl Default for UdpRelayConfig {
@@ -77,17 +88,69 @@ impl Default for UdpRelayConfig {
         UdpRelayConfig {
             idle: SESSION_IDLE,
             backoff: FAIL_BACKOFF,
+            icmp_guard: ICMP_GUARD,
         }
     }
 }
 
-enum Msg {
-    Data(Datagram),
-    Close(SocketAddrV4),
+/// Live sessions on a local port, and when the last one ended.
+struct PortState {
+    live: u32,
+    ended: std::time::Instant,
+}
+
+type Ports = Arc<DashMap<u16, PortState>>;
+
+/// Counts a session on its local port while alive (dropped when the
+/// session task ends, also on cancel).
+struct PortGuard {
+    ports: Ports,
+    port: u16,
+}
+
+impl PortGuard {
+    fn new(ports: &Ports, port: u16) -> PortGuard {
+        ports
+            .entry(port)
+            .and_modify(|e| e.live += 1)
+            .or_insert(PortState {
+                live: 1,
+                ended: std::time::Instant::now(),
+            });
+        PortGuard {
+            ports: ports.clone(),
+            port,
+        }
+    }
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        if let Some(mut e) = self.ports.get_mut(&self.port) {
+            e.live = e.live.saturating_sub(1);
+            e.ended = std::time::Instant::now();
+        }
+    }
+}
+
+/// Session -> manager.
+enum Report {
+    /// Association failed / unusable profile: back off this key.
+    Failed(SocketAddrV4, ProfileId),
+    /// Associated: the key works again.
+    Associated(SocketAddrV4, ProfileId),
 }
 
 pub struct UdpRelay {
-    tx: mpsc::Sender<Msg>,
+    /// Datagrams (bounded: full = drop), stamped with `seq`.
+    tx: mpsc::Sender<(u64, Datagram)>,
+    /// Socket closes: unbounded (OS-rate-limited Socket-layer events), so a
+    /// close is never dropped while the manager runs.
+    close_tx: mpsc::UnboundedSender<(u64, SocketAddrV4)>,
+    /// Orders datagrams against closes across the two channels.
+    seq: AtomicU64,
+    ports: Ports,
+    icmp_guard: Duration,
     tracker: TaskTracker,
 }
 
@@ -109,7 +172,10 @@ impl UdpRelay {
         cfg: UdpRelayConfig,
     ) -> Arc<UdpRelay> {
         let (tx, rx) = mpsc::channel(SUBMIT_QUEUE);
+        let (close_tx, close_rx) = mpsc::unbounded_channel();
+        let (report_tx, report_rx) = mpsc::unbounded_channel();
         let tracker = TaskTracker::new();
+        let ports = Ports::default();
         let m = Manager {
             ctx,
             sink,
@@ -117,28 +183,51 @@ impl UdpRelay {
             cfg,
             tracker: tracker.clone(),
             sessions: HashMap::new(),
+            ports: ports.clone(),
+            report_tx,
+            failed: HashMap::new(),
+            closed: HashMap::new(),
         };
-        tracker.spawn(m.run(rx));
+        tracker.spawn(m.run(rx, close_rx, report_rx));
         // Closed now: `wait` returns once the manager and every session
         // (all spawned while the manager runs) have ended.
         tracker.close();
-        Arc::new(UdpRelay { tx, tracker })
+        Arc::new(UdpRelay {
+            tx,
+            close_tx,
+            seq: AtomicU64::new(0),
+            ports,
+            icmp_guard: cfg.icmp_guard,
+            tracker,
+        })
     }
 
     /// Called from packet threads; never blocks (bounded channel, try_send;
     /// full = drop).
     pub fn submit(&self, d: Datagram) {
-        if self.tx.try_send(Msg::Data(d)).is_err() {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        if self.tx.try_send((seq, d)).is_err() {
             tracing::debug!("udp relay queue full or stopped; datagram dropped");
         }
     }
 
     /// App socket closed: end its session now (an unspecified ip ends every
-    /// session on that port).
+    /// session on that port). Never blocks and is never dropped while the
+    /// manager runs; datagrams captured before it never start a session.
     pub fn close(&self, local: SocketAddrV4) {
-        if self.tx.try_send(Msg::Close(local)).is_err() {
-            tracing::debug!("udp relay queue full or stopped; close for {local} dropped");
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        if self.close_tx.send((seq, local)).is_err() {
+            tracing::debug!("udp relay stopped; close for {local} ignored");
         }
+    }
+
+    /// Whether a relay session serves local `port` now or did within the
+    /// ICMP guard. Lock-light (one DashMap shard read), no allocation: safe
+    /// per packet from packet threads.
+    pub fn serves_port(&self, port: u16) -> bool {
+        self.ports
+            .get(&port)
+            .is_some_and(|e| e.live > 0 || e.ended.elapsed() < self.icmp_guard)
     }
 
     /// Resolves once the relay was cancelled and every session has ended
@@ -162,6 +251,16 @@ struct Manager {
     cfg: UdpRelayConfig,
     tracker: TaskTracker,
     sessions: HashMap<SocketAddrV4, SessionHandle>,
+    ports: Ports,
+    report_tx: mpsc::UnboundedSender<Report>,
+    /// Keys whose last attempt failed -> end of their backoff. Kept after
+    /// the backoff (later failures log at debug) until the key associates
+    /// or its socket closes.
+    failed: HashMap<(SocketAddrV4, ProfileId), Instant>,
+    /// Local port -> seq of its latest close; datagrams with a lower seq
+    /// are from the closed socket. Cleared whenever the datagram queue is
+    /// empty (nothing older can still be queued).
+    closed: HashMap<u16, u64>,
 }
 
 /// Same port, and `close` is unspecified or the same ip.
@@ -170,25 +269,71 @@ fn same_local(entry: &SocketAddrV4, close: SocketAddrV4) -> bool {
 }
 
 impl Manager {
-    async fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
+    async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<(u64, Datagram)>,
+        mut close_rx: mpsc::UnboundedReceiver<(u64, SocketAddrV4)>,
+        mut report_rx: mpsc::UnboundedReceiver<Report>,
+    ) {
         loop {
-            let msg = tokio::select! {
+            // Biased: reports and closes before datagrams.
+            tokio::select! {
+                biased;
                 _ = self.cancel.cancelled() => break,
-                m = rx.recv() => match m {
-                    Some(m) => m,
+                r = report_rx.recv() => {
+                    // Never None: the manager holds a sender.
+                    if let Some(r) = r {
+                        self.report(r);
+                    }
+                }
+                c = close_rx.recv() => match c {
+                    Some((seq, local)) => self.close(seq, local),
                     None => break,
                 },
-            };
-            match msg {
-                Msg::Data(d) => self.data(d),
-                Msg::Close(local) => self.sessions.retain(|l, _| !same_local(l, local)),
+                m = rx.recv() => match m {
+                    Some((seq, d)) => {
+                        // A session that just ended reported before its
+                        // channel closed: see its report first.
+                        while let Ok(r) = report_rx.try_recv() {
+                            self.report(r);
+                        }
+                        self.data(seq, d);
+                    }
+                    None => break,
+                },
+            }
+            if !self.closed.is_empty() && rx.is_empty() {
+                self.closed.clear();
             }
         }
         // Dropping the handles cancels every session.
         self.sessions.clear();
     }
 
-    fn data(&mut self, d: Datagram) {
+    fn report(&mut self, r: Report) {
+        match r {
+            Report::Failed(local, profile) => {
+                self.failed
+                    .insert((local, profile), Instant::now() + self.cfg.backoff);
+            }
+            Report::Associated(local, profile) => {
+                self.failed.remove(&(local, profile));
+            }
+        }
+    }
+
+    fn close(&mut self, seq: u64, local: SocketAddrV4) {
+        let c = self.closed.entry(local.port()).or_insert(seq);
+        *c = (*c).max(seq);
+        self.sessions.retain(|l, _| !same_local(l, local));
+        self.failed.retain(|(l, _), _| !same_local(l, local));
+    }
+
+    fn data(&mut self, seq: u64, d: Datagram) {
+        // Captured before its socket's close: never (re)starts a session.
+        if self.closed.get(&d.local.port()).is_some_and(|&c| seq < c) {
+            return;
+        }
         let d = match self.sessions.get(&d.local) {
             // A rules change moved the flow to another profile: start over.
             Some(s) if s.profile == d.profile => match s.tx.try_send(d) {
@@ -198,13 +343,27 @@ impl Manager {
             },
             _ => d,
         };
+        // The handle (if any) has ended or is for another profile.
+        self.sessions.remove(&d.local);
+        let key = (d.local, d.profile.clone());
+        let quiet = match self.failed.get(&key) {
+            // Backing off: dropped here; no session, no row, no log.
+            Some(until) if Instant::now() < *until => return,
+            Some(_) => true,
+            None => false,
+        };
         // New sessions are rare next to datagrams: prune ended ones here.
         self.sessions.retain(|_, s| !s.tx.is_closed());
+        let guard = self.cfg.icmp_guard;
+        self.ports
+            .retain(|_, e| e.live > 0 || e.ended.elapsed() < guard);
         let (tx, rx) = mpsc::channel(PENDING_MAX);
         let stop = self.cancel.child_token();
         let session = Session {
             ctx: self.ctx.clone(),
             sink: self.sink.clone(),
+            report: self.report_tx.clone(),
+            quiet,
             cfg: self.cfg,
             pid: d.pid,
             profile: d.profile.clone(),
@@ -218,7 +377,9 @@ impl Manager {
         // Fresh channel with room: cannot fail.
         let _ = tx.try_send(d);
         let st = stop.clone();
+        let port_guard = PortGuard::new(&self.ports, local.port());
         self.tracker.spawn(async move {
+            let _port_guard = port_guard;
             tokio::select! {
                 _ = st.cancelled() => {}
                 _ = session.run(rx) => {}
@@ -252,6 +413,9 @@ impl Drop for Entries<'_> {
 struct Session {
     ctx: Arc<RelayCtx>,
     sink: Arc<dyn InboundSink>,
+    report: mpsc::UnboundedSender<Report>,
+    /// A failure of this key was already logged: log failures at debug.
+    quiet: bool,
     cfg: UdpRelayConfig,
     pid: u32,
     profile: ProfileId,
@@ -278,6 +442,25 @@ impl Session {
             self.local,
             self.first_remote
         );
+    }
+
+    /// Logs a failure (info the first time for this key, then debug) and
+    /// reports it; the session then ends (its row with it) and the manager
+    /// drops the key's datagrams for the backoff.
+    fn fail(&self, outcome: &str) {
+        if self.quiet {
+            tracing::debug!(
+                "udp pid={} local={} dst={} {outcome}",
+                self.pid,
+                self.local,
+                self.first_remote
+            );
+        } else {
+            self.log(outcome);
+        }
+        let _ = self
+            .report
+            .send(Report::Failed(self.local, self.profile.clone()));
     }
 
     /// ConnLog entry (with live bytes) for `remote`, opened on its first
@@ -311,23 +494,6 @@ impl Session {
         )
     }
 
-    /// Drops every datagram for the backoff, then ends (the next datagram
-    /// starts a new session).
-    async fn hold_dead(&self, rx: &mut mpsc::Receiver<Datagram>, entries: &mut Entries<'_>) {
-        let until = Instant::now() + self.cfg.backoff;
-        loop {
-            tokio::select! {
-                _ = sleep_until(until) => return,
-                d = rx.recv() => match d {
-                    Some(d) => {
-                        self.entry(entries, d.remote);
-                    }
-                    None => return,
-                },
-            }
-        }
-    }
-
     async fn run(self, mut rx: mpsc::Receiver<Datagram>) {
         let ctx = self.ctx.clone();
         let mut entries = Entries {
@@ -344,16 +510,15 @@ impl Session {
                     None => "unknown proxy profile",
                     Some(_) => "UDP needs a SOCKS5 proxy",
                 };
-                self.log(&format!(
+                return self.fail(&format!(
                     "profile={id}: dropped ({reason}, no direct fallback)"
                 ));
-                return self.hold_dead(&mut rx, &mut entries).await;
             }
         };
         let assoc = match udp_associate(&profile, ASSOCIATE_TIMEOUT).await {
             Ok(a) => a,
             Err(e) => {
-                self.log(&format!(
+                self.fail(&format!(
                     "via '{id}': association failed: {e} (dropped, no direct fallback)"
                 ));
                 // Same rule as the TCP relay: only an unreachable / silent
@@ -362,19 +527,21 @@ impl Session {
                     ctx.proxy_down.insert(id.clone());
                     let _ = ctx.events.send(Event::ProxyDown { id });
                 }
-                return self.hold_dead(&mut rx, &mut entries).await;
+                return;
             }
         };
         let sock = match bind_relay_socket(&assoc).await {
             Ok(s) => s,
             Err(e) => {
-                self.log(&format!(
+                return self.fail(&format!(
                     "via '{id}': association failed: {e} (dropped, no direct fallback)"
                 ));
-                return self.hold_dead(&mut rx, &mut entries).await;
             }
         };
         self.log(&format!("via '{id}': associated"));
+        let _ = self
+            .report
+            .send(Report::Associated(self.local, self.profile.clone()));
         if ctx.proxy_down.remove(&id).is_some() {
             let _ = ctx.events.send(Event::ProxyUp { id: id.clone() });
         }
@@ -443,10 +610,16 @@ impl Session {
     }
 }
 
-/// UDP socket bound to 0.0.0.0:0 and connected to the proxy's relay, so
-/// only datagrams from the relay are accepted.
+/// UDP socket bound to 0.0.0.0:0 (or [::]:0 for an IPv6 relay) and
+/// connected to the proxy's relay, so only datagrams from the relay are
+/// accepted.
 async fn bind_relay_socket(a: &UdpAssociation) -> std::io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+    let bind = if a.relay.is_ipv6() {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    };
+    let sock = UdpSocket::bind(bind).await?;
     sock.connect(a.relay).await?;
     Ok(sock)
 }
