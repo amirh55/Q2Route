@@ -41,7 +41,7 @@ const PEEK_MAX: usize = 4096;
 const PROXY_TIMEOUT: Duration = Duration::from_secs(5);
 const COPY_BUF: usize = 16 * 1024;
 /// Stats group for flows whose decision names no group.
-const NO_GROUP: &str = "(none)";
+pub(crate) const NO_GROUP: &str = "(none)";
 
 /// Maps an accepted peer address back to the flow's original destination.
 /// The relay owns the NAT entry while its connection lives: it attaches the

@@ -8,7 +8,7 @@
 //!   goes through [`classify`], which only ever passes Direct flows.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,7 @@ use crate::conns::{ConnLog, NewConn};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
+use crate::udp_relay::{Datagram, InboundSink, UdpRelay};
 use crate::winapi;
 use crate::windivert::{
     calc_checksums_addr, Address, Handle, EVENT_SOCKET_ACCEPT, EVENT_SOCKET_BIND,
@@ -102,7 +103,40 @@ fn keep_going(run: &RunState, layer: &str, e: &std::io::Error) -> bool {
     true
 }
 
-pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
+/// Injects the UDP relay's rebuilt reply packets toward apps through the
+/// Network-layer handle. A WinDivert send is a short non-blocking driver
+/// call (safe concurrently with the packet threads), so it runs directly on
+/// the calling tokio task.
+pub struct NetworkSink(pub Arc<Handle>);
+
+impl InboundSink for NetworkSink {
+    fn inject(&self, mut pkt: Vec<u8>, addr: &Address) {
+        let mut a = *addr;
+        a.set_outbound(false);
+        calc_checksums_addr(&mut pkt, &mut a);
+        if let Err(e) = self.0.send(&pkt, &a) {
+            tracing::debug!("udp reply inject failed: {e}");
+        }
+    }
+}
+
+/// A Socket-layer local address as the UDP relay keys it: IPv4 or
+/// v4-mapped as is, the IPv6 wildcard as `0.0.0.0` (same port); `None` for
+/// other IPv6 (never relayed).
+fn relay_local(a: SocketAddr) -> Option<SocketAddrV4> {
+    match a {
+        SocketAddr::V4(a) => Some(a),
+        SocketAddr::V6(a) if a.ip().is_unspecified() => {
+            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, a.port()))
+        }
+        SocketAddr::V6(a) => a
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddrV4::new(ip, a.port())),
+    }
+}
+
+pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp: Arc<UdpRelay>) {
     loop {
         let addr = match h.recv(&mut []) {
             Ok((_, addr)) => addr,
@@ -131,6 +165,11 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
                     Protocol::Udp
                 };
                 conns.close_local(proto, s.local);
+                if s.protocol == PROTO_UDP {
+                    if let Some(l) = relay_local(s.local) {
+                        udp.close(l);
+                    }
+                }
                 // A new socket reusing this local port must not inherit
                 // the old socket's decision.
                 run.cache.on_socket_closed(s.protocol, s.local);
@@ -140,7 +179,7 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
     }
 }
 
-pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>) {
+pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>, udp: Arc<UdpRelay>) {
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
         let (n, mut addr) = match h.recv(&mut buf) {
@@ -149,7 +188,7 @@ pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>) {
             Err(_) => return,
         };
         let pkt = &mut buf[..n];
-        match route_packet(pkt, &mut addr, &shared, &run) {
+        match route_packet(pkt, &mut addr, &shared, &run, &udp) {
             Out::Send => {
                 if let Err(e) = h.send(pkt, &addr) {
                     tracing::debug!("reinject failed: {e}");
@@ -197,7 +236,13 @@ impl From<bool> for Out {
 /// from: an inbound packet (never captured by the filter), a restored relay
 /// reply, a NAT-rewritten packet, or `classify` returning `Pass` (Direct
 /// flow / own socket). `ResetApp` never sends the packet itself.
-fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunState) -> Out {
+fn route_packet(
+    pkt: &mut [u8],
+    addr: &mut Address,
+    shared: &Shared,
+    run: &RunState,
+    udp: &UdpRelay,
+) -> Out {
     if !addr.outbound() {
         return Out::Send;
     }
@@ -239,12 +284,44 @@ fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunSt
             run.nat.insert(f.local.port(), OriginalDst { dst, pid });
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
-        // Relay wired up in a later task: fail closed meanwhile.
-        Action::UdpProxy { .. } => Out::Drop,
+        // Handed to the UDP relay; the packet itself never leaves.
+        Action::UdpProxy {
+            pid,
+            profile,
+            group_id,
+        } => {
+            let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (f.local, f.remote) else {
+                return Out::Drop;
+            };
+            if let Some(payload) = udp4_payload(pkt) {
+                udp.submit(Datagram {
+                    pid,
+                    profile,
+                    group_id,
+                    local,
+                    remote,
+                    payload: payload.to_vec(),
+                    addr: *addr,
+                });
+            }
+            Out::Drop
+        }
         Action::Redirect => {
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
     }
+}
+
+/// UDP payload of an IPv4/UDP packet (bounded by the UDP and IP lengths);
+/// `None` if the lengths are inconsistent (e.g. a truncated fragment).
+fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
+    let ihl = usize::from(*p.first()? & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([*p.get(2)?, *p.get(3)?]));
+    let udp_len = usize::from(u16::from_be_bytes([*p.get(ihl + 4)?, *p.get(ihl + 5)?]));
+    if udp_len < 8 || ihl + udp_len > total.min(p.len()) {
+        return None;
+    }
+    p.get(ihl + 8..ihl + udp_len)
 }
 
 /// Ruling R14: FlowTable by (local, remote) -> by local -> OS socket table
@@ -363,6 +440,31 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
 mod tests {
     use super::*;
     use crate::windivert::{check_filter, Layer};
+
+    #[test]
+    fn udp4_payload_slices_after_header() {
+        let src = "10.0.0.2:5000".parse().unwrap();
+        let dst = "8.8.4.4:3478".parse().unwrap();
+        let p = crate::udp_packet::build_inbound_udp(src, dst, b"hello").unwrap();
+        assert_eq!(udp4_payload(&p), Some(&b"hello"[..]));
+        let mut bad = p.clone();
+        bad[24..26].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(udp4_payload(&bad), None, "UDP length past the packet");
+        assert_eq!(udp4_payload(&p[..25]), None, "truncated");
+    }
+
+    #[test]
+    fn relay_local_maps_socket_addresses() {
+        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let v4 = |s: &str| Some(s.parse::<SocketAddrV4>().unwrap());
+        assert_eq!(relay_local(p("10.0.0.2:5000")), v4("10.0.0.2:5000"));
+        assert_eq!(
+            relay_local(p("[::ffff:10.0.0.2]:5000")),
+            v4("10.0.0.2:5000")
+        );
+        assert_eq!(relay_local(p("[::]:5000")), v4("0.0.0.0:5000"));
+        assert_eq!(relay_local(p("[2001:db8::1]:5000")), None);
+    }
 
     #[test]
     fn filters_compile() {

@@ -60,7 +60,7 @@ pub enum Action {
     /// Insert a NAT entry for this new flow owned by `pid`, then redirect.
     NewRedirect { pid: u32 },
     /// IPv4 UDP of a proxied flow: relay it through the SOCKS5 profile.
-    /// `pid` is the owning pid when freshly decided, 0 on a cache hit.
+    /// `pid` is the owning pid (from the decision, also on a cache hit).
     UdpProxy {
         pid: u32,
         profile: ProfileId,
@@ -74,8 +74,8 @@ pub enum Cached {
     Direct,
     /// Block, or a proxied TCP flow (handled by the TCP relay).
     Other,
-    /// Proxied UDP flow.
-    UdpProxy(ProfileId, Option<GroupId>),
+    /// Proxied UDP flow: profile, group, owning pid.
+    UdpProxy(ProfileId, Option<GroupId>, u32),
 }
 
 struct CacheEntry {
@@ -239,7 +239,7 @@ pub fn classify(
                 Decision::Final(Route::Proxy(p), info)
                     if id.proto == PROTO_UDP && id.remote.is_ipv4() =>
                 {
-                    Cached::UdpProxy(p, info.group_id)
+                    Cached::UdpProxy(p, info.group_id, pid)
                 }
                 _ => Cached::Other,
             }
@@ -289,17 +289,19 @@ pub fn classify(
             }
         }
         PROTO_UDP => {
-            let (pid, cached) = match cache.get(&id) {
-                Some(c) => (0, c),
-                None => decide_now(&mut call),
+            let cached = match cache.get(&id) {
+                Some(c) => c,
+                None => decide_now(&mut call).1,
             };
             match cached {
                 Cached::Direct => Action::Pass,
-                Cached::UdpProxy(profile, group_id) if id.remote.is_ipv4() => Action::UdpProxy {
-                    pid,
-                    profile,
-                    group_id,
-                },
+                Cached::UdpProxy(profile, group_id, pid) if id.remote.is_ipv4() => {
+                    Action::UdpProxy {
+                        pid,
+                        profile,
+                        group_id,
+                    }
+                }
                 _ => Action::Drop,
             }
         }
@@ -709,12 +711,8 @@ mod tests {
             group_id: Some("g".into()),
         };
         assert_eq!(run(&udp_stun(), &c, false, APP_PID, proxy(), &n), want);
-        let hit = run(&udp_stun(), &c, false, APP_PID, proxy(), &n);
-        assert!(matches!(
-            hit,
-            Action::UdpProxy { ref profile, ref group_id, .. }
-                if profile == "v2ray" && group_id.as_deref() == Some("g")
-        ));
+        // A cache hit returns the same action, pid included.
+        assert_eq!(run(&udp_stun(), &c, false, APP_PID, proxy(), &n), want);
         assert_eq!(n.get(), 1, "second packet from cache");
     }
 
