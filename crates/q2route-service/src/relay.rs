@@ -24,6 +24,7 @@ use q2route_core::peek::{peek_host, PeekResult};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::{connect_via, Target};
 use q2route_core::ruleset::RuleSet;
+use q2route_core::suggest::reason_text;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::broadcast;
@@ -31,6 +32,7 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::conns::{ConnBytes, ConnLog, NewConn};
 use crate::nat::OriginalDst;
 use crate::stats::Stats;
 
@@ -65,12 +67,25 @@ impl Drop for Hold<'_> {
     }
 }
 
+/// Marks the connection ended when the relay connection ends (also on cancel).
+struct ConnGuard<'a> {
+    log: &'a ConnLog,
+    id: u64,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.log.close(self.id);
+    }
+}
+
 pub struct RelayCtx {
     pub rules: ArcSwap<RuleSet>,
     pub cfg: ArcSwap<Config>,
     pub tree: Arc<RwLock<ProcessTree>>,
     pub excluded: ArcSwap<HashSet<u32>>,
     pub stats: Arc<Stats>,
+    pub conns: Arc<ConnLog>,
     /// Local ports of the relay's direct upstream sockets; capture skips them.
     pub own_ports: Arc<DashSet<u16>>,
     pub events: broadcast::Sender<Event>,
@@ -220,6 +235,27 @@ async fn handle(
         &ctx.tree.read().unwrap_or_else(|e| e.into_inner()),
         orig.pid,
     );
+    let bytes = Arc::new(ConnBytes::default());
+    let _conn = ConnGuard {
+        log: &ctx.conns,
+        id: ctx.conns.open(
+            NewConn {
+                proto: Protocol::Tcp,
+                pid: orig.pid,
+                exe: exe.clone(),
+                local: peer,
+                dst: SocketAddr::V4(orig.dst),
+                domain: (!domain.is_empty()).then(|| domain.clone()),
+                route: route.clone(),
+                group_id: info.group_id.clone(),
+                reason: reason_text(
+                    &info.reason,
+                    &ctx.tree.read().unwrap_or_else(|e| e.into_inner()),
+                ),
+            },
+            Some(bytes.clone()),
+        ),
+    };
     let shown_domain = if domain.is_empty() {
         "-".to_string()
     } else {
@@ -254,7 +290,7 @@ async fn handle(
                     if ctx.proxy_down.remove(&id).is_some() {
                         let _ = ctx.events.send(Event::ProxyUp { id: id.clone() });
                     }
-                    pump(client, up, &buf, ctx, group).await
+                    pump(client, up, &buf, ctx, group, &bytes).await
                 }
                 Err((down, e)) => {
                     // Fail closed: drop the client, never connect direct.
@@ -292,7 +328,7 @@ async fn handle(
             match sock.connect(SocketAddr::V4(orig.dst)).await {
                 Ok(up) => {
                     log("direct");
-                    pump(client, up, &buf, ctx, group).await
+                    pump(client, up, &buf, ctx, group, &bytes).await
                 }
                 Err(e) => log(&format!("direct connect failed: {e}")),
             }
@@ -366,7 +402,14 @@ impl Activity {
 /// Sends the peeked bytes upstream, then copies both ways until both
 /// directions are closed (or either fails), or until no byte has moved in
 /// either direction for `ctx.idle_timeout`.
-async fn pump(client: TcpStream, upstream: TcpStream, peeked: &[u8], ctx: &RelayCtx, group: &str) {
+async fn pump(
+    client: TcpStream,
+    upstream: TcpStream,
+    peeked: &[u8],
+    ctx: &RelayCtx,
+    group: &str,
+    bytes: &ConnBytes,
+) {
     set_keepalive(&upstream);
     let _active = ctx.stats.open(group);
     let (mut cr, mut cw) = client.into_split();
@@ -376,14 +419,17 @@ async fn pump(client: TcpStream, upstream: TcpStream, peeked: &[u8], ctx: &Relay
             return;
         }
         ctx.stats.add(group, peeked.len() as u64, 0);
+        bytes.up.fetch_add(peeked.len() as u64, Ordering::Relaxed);
     }
     let activity = Activity::new();
     let up = copy(&mut cr, &mut uw, |n| {
         activity.touch();
+        bytes.up.fetch_add(n, Ordering::Relaxed);
         ctx.stats.add(group, n, 0)
     });
     let down = copy(&mut ur, &mut cw, |n| {
         activity.touch();
+        bytes.down.fetch_add(n, Ordering::Relaxed);
         ctx.stats.add(group, 0, n)
     });
     tokio::pin!(up, down);

@@ -17,10 +17,12 @@ use arc_swap::ArcSwap;
 use q2route_core::config::Protocol;
 use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, MatchReason, Route};
 use q2route_core::process_tree::ProcessTree;
+use q2route_core::suggest::reason_text;
 
 use crate::classify::{
     build_rst_to_app, classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP,
 };
+use crate::conns::{ConnLog, NewConn};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
@@ -100,7 +102,7 @@ fn keep_going(run: &RunState, layer: &str, e: &std::io::Error) -> bool {
     true
 }
 
-pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>) {
+pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
     loop {
         let addr = match h.recv(&mut []) {
             Ok((_, addr)) => addr,
@@ -123,6 +125,12 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>) {
             }
             EVENT_SOCKET_CLOSE => {
                 table.on_close(&s);
+                let proto = if s.protocol == PROTO_TCP {
+                    Protocol::Tcp
+                } else {
+                    Protocol::Udp
+                };
+                conns.close_local(proto, s.local);
                 // A new socket reusing this local port must not inherit
                 // the old socket's decision.
                 run.cache.on_socket_closed(s.protocol, s.local);
@@ -312,13 +320,39 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
     let d = decide(&rules, &tree, &excluded, &info);
     // One line per decided flow (decide_flow runs only when the flow cache
     // cannot answer). LAN / DNS / NTP flows are frequent and uninteresting.
-    let proto = if proto == Protocol::Tcp { "tcp" } else { "udp" };
+    let proto_name = if proto == Protocol::Tcp { "tcp" } else { "udp" };
     let exe = exe_name(&tree, pid);
     let what = describe(&d);
     if matches!(&d, Decision::Final(_, i) if i.reason == MatchReason::AlwaysDirectDst) {
-        tracing::debug!("flow {proto} pid={pid} exe={exe} dst={} {what}", f.remote);
+        tracing::debug!(
+            "flow {proto_name} pid={pid} exe={exe} dst={} {what}",
+            f.remote
+        );
     } else {
-        tracing::info!("flow {proto} pid={pid} exe={exe} dst={} {what}", f.remote);
+        tracing::info!(
+            "flow {proto_name} pid={pid} exe={exe} dst={} {what}",
+            f.remote
+        );
+    }
+    // Direct / Block flows are never relayed, so record them here; Proxy and
+    // NeedDomain flows are redirected and recorded by the relay.
+    if let Decision::Final(route @ (Route::Direct | Route::Block), i) = &d {
+        if i.reason != MatchReason::AlwaysDirectDst {
+            shared.relay.conns.open(
+                NewConn {
+                    proto,
+                    pid,
+                    exe,
+                    local: f.local,
+                    dst: f.remote,
+                    domain: None,
+                    route: route.clone(),
+                    group_id: i.group_id.clone(),
+                    reason: reason_text(&i.reason, &tree),
+                },
+                None,
+            );
+        }
     }
     (pid, d)
 }

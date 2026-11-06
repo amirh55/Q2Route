@@ -2,6 +2,7 @@
 //! TCP NAT redirect, transparent relay and traffic stats.
 
 pub mod classify;
+pub mod conns;
 pub mod engine;
 pub mod flows;
 pub mod geo;
