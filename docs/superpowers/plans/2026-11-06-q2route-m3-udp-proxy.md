@@ -90,8 +90,8 @@
 **Interfaces:**
 - Consumes: Task 1 `Route::Proxy` for UDP.
 - Produces (classify.rs):
-  - The cache stores a route, not a bool: `pub enum Cached { Direct, Other, UdpProxy(ProfileId) }` (`Other` = Block or TCP-proxied). `FlowCache::get(&id) -> Option<Cached>`, `put_at(id, Cached, generation)`. All TCP rules stay exactly as they are (TCP uses Direct vs not-Direct only); keep the existing tests passing unchanged in meaning.
-  - New `Action::UdpProxy { pid: u32, profile: ProfileId }` returned for a UDP packet whose (cached or fresh) decision is `Route::Proxy(profile)` and whose remote is IPv4. Proxied IPv6 UDP is never `UdpProxy` (Task 1 already blocks it; keep a defensive `Drop`).
+  - The cache stores a route, not a bool: `pub enum Cached { Direct, Other, UdpProxy(ProfileId, Option<GroupId>) }` (`Other` = Block or TCP-proxied). `FlowCache::get(&id) -> Option<Cached>`, `put_at(id, Cached, generation)`. All TCP rules stay exactly as they are (TCP uses Direct vs not-Direct only); keep the existing tests passing unchanged in meaning.
+  - New `Action::UdpProxy { pid: u32, profile: ProfileId, group_id: Option<GroupId> }` returned for a UDP packet whose (cached or fresh) decision is `Route::Proxy(profile)` and whose remote is IPv4. Proxied IPv6 UDP is never `UdpProxy` (Task 1 already blocks it; keep a defensive `Drop`).
   - Invariant doc on `classify` updated: `Pass` still only for Direct / own sockets.
 - Produces (udp_packet.rs):
   ```rust
@@ -101,7 +101,7 @@
   ```
 
 - [ ] **Step 1: Failing tests**
-  - classify.rs: `udp_proxy_decision_returns_udp_proxy` (fresh decide → `Final(Route::Proxy("v2ray"))` → `Action::UdpProxy{pid, profile:"v2ray"}`; second packet uses the cache, decide not called); `udp_block_still_drops`; `udp_direct_still_passes`; `rules_change_redecides_udp_proxy` (generation bump → decide called again).
+  - classify.rs: `udp_proxy_decision_returns_udp_proxy` (fresh decide → `Final(Route::Proxy("v2ray"))` → `Action::UdpProxy{pid, profile:"v2ray", group_id}` (group_id from the decision's MatchInfo; on a cache hit the cache must return it too, so `Cached::UdpProxy` holds `(ProfileId, Option<GroupId>)`); second packet uses the cache, decide not called); `udp_block_still_drops`; `udp_direct_still_passes`; `rules_change_redecides_udp_proxy` (generation bump → decide called again).
   - udp_packet.rs: `inbound_packet_roundtrip_1400` — build from `8.8.4.4:3478` to `192.168.1.10:50000` with 1400 bytes of `i as u8`; parse with `etherparse::SlicedPacket::from_ip`; assert addresses, ports, payload, and that both checksums verify (recompute with etherparse and compare); `oversized_payload_errors` (65508 bytes → Err).
 - [ ] **Step 2: Run** `cargo test -p q2route-service classify udp_packet` — FAIL.
 - [ ] **Step 3: Implement.** The packet loop (`route_packet`) must compile: map `Action::UdpProxy` to `Out::Drop` for now (Task 3 wires the relay). That keeps behaviour fail-closed between tasks.
