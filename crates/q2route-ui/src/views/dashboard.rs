@@ -1,7 +1,7 @@
 //! Dashboard: run status header, banners and one card per group.
 
 use eframe::egui::{self, Color32, RichText};
-use q2route_core::config::{Action, Config, Group, ProxyProfile};
+use q2route_core::config::{Action, Config, Group, ProxyProfile, Rule};
 use q2route_core::ipc::{Request, StateSnapshot};
 
 use crate::app::Requests;
@@ -14,6 +14,31 @@ pub const BLOCK: Color32 = Color32::from_rgb(0xb7, 0x3a, 0x3a);
 const CARD: Color32 = Color32::from_rgb(0x26, 0x27, 0x2d);
 const CARD_WIDTH: f32 = 250.0;
 
+/// One rule as a line, e.g. `steam.exe + children + port 443`.
+pub fn rule_summary(r: &Rule) -> String {
+    let mut parts = vec![];
+    if !r.apps.is_empty() {
+        let apps = r.apps.join(", ");
+        parts.push(if r.include_children {
+            format!("{apps} + children")
+        } else {
+            apps
+        });
+    }
+    parts.extend(r.domains.iter().cloned());
+    parts.extend(r.ips.iter().map(|i| match i.trim().strip_prefix("geoip:") {
+        Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
+        None => i.clone(),
+    }));
+    if !r.ports.is_empty() {
+        parts.push(format!("port {}", r.ports.join(", ")));
+    }
+    if let Some(p) = r.protocol {
+        parts.push(format!("{p:?}").to_uppercase());
+    }
+    parts.join(" + ")
+}
+
 /// Short human summary of a group's rules, e.g. `*.ir` or `steam.exe + children`.
 pub fn summary(g: &Group) -> String {
     if g.catch_all {
@@ -22,29 +47,7 @@ pub fn summary(g: &Group) -> String {
     let rules: Vec<String> = g
         .rules
         .iter()
-        .map(|r| {
-            let mut parts = vec![];
-            if !r.apps.is_empty() {
-                let apps = r.apps.join(", ");
-                parts.push(if r.include_children {
-                    format!("{apps} + children")
-                } else {
-                    apps
-                });
-            }
-            parts.extend(r.domains.iter().cloned());
-            parts.extend(r.ips.iter().map(|i| match i.trim().strip_prefix("geoip:") {
-                Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
-                None => i.clone(),
-            }));
-            if !r.ports.is_empty() {
-                parts.push(format!("port {}", r.ports.join(", ")));
-            }
-            if let Some(p) = r.protocol {
-                parts.push(format!("{p:?}").to_uppercase());
-            }
-            parts.join(" + ")
-        })
+        .map(rule_summary)
         .filter(|s| !s.is_empty())
         .collect();
     if rules.is_empty() {
@@ -205,7 +208,7 @@ fn card(ui: &mut egui::Ui, s: &StateSnapshot, g: &Group, client: &Client, req: &
         });
 }
 
-fn action_switch(
+pub fn action_switch(
     ui: &mut egui::Ui,
     s: &StateSnapshot,
     g: &Group,
