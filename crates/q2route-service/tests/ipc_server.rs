@@ -158,3 +158,25 @@ async fn client_drop_harmless() {
     ));
     cancel.cancel();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_request_gets_error_and_connection_survives() {
+    let (name, cancel) = serve("unknown-request");
+    let mut c = connect(&name).await;
+    write_msg(&mut c, &serde_json::json!({"FromTheFuture": {"x": 1}}))
+        .await
+        .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(2), read_msg::<_, ServerMsg>(&mut c))
+        .await
+        .expect("reply in time")
+        .unwrap();
+    assert_eq!(
+        m,
+        ServerMsg::Response(Response::Error("unsupported request".into()))
+    );
+    assert!(matches!(
+        request(&mut c, Request::GetState).await,
+        ServerMsg::Response(Response::State(_))
+    ));
+    cancel.cancel();
+}

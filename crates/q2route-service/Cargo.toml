@@ -13,6 +13,7 @@ name = "q2route-service"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
 arc-swap = "1.9.3"
 dashmap = "6.2.1"
 q2route-core = { path = "../q2route-core" }

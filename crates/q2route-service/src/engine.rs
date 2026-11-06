@@ -17,7 +17,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ConfigError, ProfileId};
-use q2route_core::ipc::{Event, Request, Response, StateSnapshot};
+use q2route_core::ipc::{Event, ProcEntry, Request, Response, StateSnapshot};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::test_proxy;
 use tokio::net::TcpListener;
@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::conns::ConnLog;
 use crate::geo::GeoCache;
 use crate::ipc_server::{BoxFuture, Control};
 use crate::packet_loop::{
@@ -89,6 +90,7 @@ impl Engine {
             tree: Arc::new(RwLock::new(ProcessTree::default())),
             excluded: ArcSwap::from_pointee(HashSet::new()),
             stats: Arc::new(Stats::default()),
+            conns: Arc::new(ConnLog::default()),
             own_ports: Arc::new(DashSet::new()),
             events,
             idle_timeout: RELAY_IDLE_TIMEOUT,
@@ -192,9 +194,12 @@ impl Inner {
         let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
             std::thread::Builder::new().name(name).spawn(f)
         };
-        let (h, s) = (sock.clone(), state.clone());
-        let mut spawned = spawn("q2r-socket".into(), Box::new(move || socket_loop(h, s)))
-            .map(|t| threads.push(t));
+        let (h, s, conns) = (sock.clone(), state.clone(), self.relay().conns.clone());
+        let mut spawned = spawn(
+            "q2r-socket".into(),
+            Box::new(move || socket_loop(h, s, conns)),
+        )
+        .map(|t| threads.push(t));
         for i in 0..NETWORK_THREADS {
             let (h, sh, s) = (net.clone(), self.shared.clone(), state.clone());
             spawned = spawned.and_then(|()| {
@@ -356,6 +361,30 @@ impl Inner {
                 self.apply(|c| c.set_group_enabled(&group_id, enabled))
                     .await
             }
+            Request::AddGroup { name, action } => {
+                self.apply(|c| c.add_group(&name, action).map(|_| ())).await
+            }
+            Request::RenameGroup { group_id, name } => {
+                self.apply(|c| c.rename_group(&group_id, &name)).await
+            }
+            Request::DeleteGroup { group_id } => self.apply(|c| c.delete_group(&group_id)).await,
+            Request::MoveGroup { group_id, to } => {
+                self.apply(|c| c.move_group(&group_id, to)).await
+            }
+            Request::SetGroupRules { group_id, rules } => {
+                self.apply(|c| c.set_group_rules(&group_id, rules)).await
+            }
+            // Adding a rule that already exists is not an error.
+            Request::AddRule { group_id, rule } => {
+                self.apply(|c| c.add_rule(&group_id, rule).map(|_| ()))
+                    .await
+            }
+            Request::GetConnections => Response::Connections(self.relay().conns.list()),
+            Request::ListProcesses => Response::Processes(
+                tokio::task::spawn_blocking(process_entries)
+                    .await
+                    .unwrap_or_default(),
+            ),
             Request::UpsertProxy(p) => self.apply(|c| c.upsert_proxy(p)).await,
             Request::DeleteProxy { id } => self.apply(|c| c.delete_proxy(&id)).await,
             Request::TestProxy { id } => {
@@ -449,6 +478,26 @@ impl Control for Engine {
 }
 
 /// Replaces the process tree with a fresh snapshot.
+/// Running processes with a known absolute exe path, by name, one per path.
+fn process_entries() -> Vec<ProcEntry> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<ProcEntry> = winapi::list_processes()
+        .into_iter()
+        .filter(|p| p.exe.is_absolute())
+        .filter_map(|p| {
+            let name = p.exe.file_name()?.to_string_lossy().into_owned();
+            let path = p.exe.to_string_lossy().into_owned();
+            seen.insert(path.to_lowercase()).then_some(ProcEntry {
+                pid: p.pid,
+                name,
+                path,
+            })
+        })
+        .collect();
+    out.sort_by_cached_key(|e| e.name.to_lowercase());
+    out
+}
+
 async fn refresh_processes(relay: &RelayCtx) {
     let Ok(procs) = tokio::task::spawn_blocking(winapi::list_processes).await else {
         return;

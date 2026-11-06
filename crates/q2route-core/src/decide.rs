@@ -1,5 +1,6 @@
 //! Routing decision engine: Direct / Proxy / Block for each new connection.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -17,7 +18,7 @@ pub struct FlowInfo<'a> {
     pub domain: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Route {
     Direct,
     Block,

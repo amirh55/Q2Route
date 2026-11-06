@@ -122,9 +122,12 @@ pub async fn serve_pipe(
 async fn serve_client(pipe: NamedPipeServer, ctrl: Arc<dyn Control>, cancel: CancellationToken) {
     let (mut rd, mut wr) = tokio::io::split(pipe);
     // read_msg is not cancel-safe, so it runs in its own task.
-    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    // `None` marks a well-framed message that is not a known `Request`
+    // (e.g. a newer UI); it is answered with an error, not a disconnect.
+    let (tx, mut rx) = mpsc::channel::<Option<Request>>(8);
     let reader = tokio::spawn(async move {
-        while let Ok(r) = read_msg::<_, Request>(&mut rd).await {
+        while let Ok(v) = read_msg::<_, serde_json::Value>(&mut rd).await {
+            let r = serde_json::from_value::<Request>(v).ok();
             if tx.send(r).await.is_err() {
                 break;
             }
@@ -137,11 +140,12 @@ async fn serve_client(pipe: NamedPipeServer, ctrl: Arc<dyn Control>, cancel: Can
             _ = cancel.cancelled() => break,
             r = rx.recv(), if pending.is_none() => match r {
                 None => break,
-                Some(Request::Subscribe) => {
+                Some(None) => ServerMsg::Response(Response::Error("unsupported request".into())),
+                Some(Some(Request::Subscribe)) => {
                     events = Some(ctrl.subscribe());
                     ServerMsg::Response(Response::Ok)
                 }
-                Some(r) => {
+                Some(Some(r)) => {
                     pending = Some(ctrl.handle(r));
                     continue;
                 }

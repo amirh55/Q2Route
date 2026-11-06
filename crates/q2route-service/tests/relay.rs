@@ -120,6 +120,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         tree: Arc::new(RwLock::new(ProcessTree::default())),
         excluded: ArcSwap::from_pointee(HashSet::new()),
         stats: Arc::new(Stats::default()),
+        conns: Arc::new(Default::default()),
         own_ports: Arc::new(DashSet::new()),
         events,
         idle_timeout: Duration::from_secs(7200),
@@ -455,6 +456,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         tree: c.tree.clone(),
         excluded: ArcSwap::new(c.excluded.load_full()),
         stats: c.stats.clone(),
+        conns: c.conns.clone(),
         own_ports: c.own_ports.clone(),
         events: c.events.clone(),
         proxy_down: DashSet::new(),
@@ -566,5 +568,50 @@ async fn refused_target_is_not_proxy_down() {
     assert_closed(&mut client, Duration::from_secs(3)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(drain(&mut events), [], "no false ProxyDown alarm");
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn relayed_connection_is_listed_with_bytes() {
+    let hello = fixture();
+    let (sport, mut reqs) = mock_socks(hello.len()).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![
+            group("ir", Action::Proxy("mock".into()), &["*.ir"], false),
+            group("rest", Action::Block, &[], true),
+        ],
+    );
+    let c = ctx(cfg);
+    let r = start("5.5.5.5:443".parse().unwrap(), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(&hello).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let l = c.conns.list();
+    assert_eq!(l.len(), 1);
+    assert_eq!(
+        l[0].route,
+        q2route_core::decide::Route::Proxy("mock".into())
+    );
+    assert_eq!(l[0].domain.as_deref(), Some("www.digikala.ir"));
+    assert_eq!(l[0].group_id.as_deref(), Some("ir"));
+    assert_eq!(l[0].dst, "5.5.5.5:443".parse::<SocketAddr>().unwrap());
+    assert!(l[0].up.unwrap() >= hello.len() as u64);
+    assert!(l[0].ended_ms.is_none());
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let l = c.conns.list();
+        if l[0].ended_ms.is_some() {
+            assert_eq!(l.len(), 1);
+            assert!(l[0].up.unwrap() > 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "connection never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     r.cancel.cancel();
 }

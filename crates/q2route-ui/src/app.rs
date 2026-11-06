@@ -9,7 +9,10 @@ use tokio::sync::oneshot;
 use crate::client::Client;
 use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
-use crate::views::{dashboard, placeholder, proxies::ProxiesView, settings as settings_view};
+use crate::views::{
+    connections::ConnectionsView, dashboard, groups::GroupsView, placeholder, proxies::ProxiesView,
+    settings as settings_view,
+};
 
 /// How often the UI and the tray refresh from `Client::latest()`.
 pub const REFRESH: Duration = Duration::from_millis(250);
@@ -83,6 +86,8 @@ pub struct App {
     pub settings: UiSettings,
     pub requests: Requests,
     proxies: ProxiesView,
+    groups: GroupsView,
+    connections: ConnectionsView,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
@@ -113,6 +118,8 @@ impl App {
             settings,
             requests,
             proxies: ProxiesView::default(),
+            groups: GroupsView::default(),
+            connections: ConnectionsView::default(),
             hide_on_start: hidden && tray.is_some(),
             tray,
             exiting: false,
@@ -208,11 +215,21 @@ impl eframe::App for App {
             if !connected {
                 dashboard::service_banner(ui);
             }
+            if self.page == Page::Connections {
+                // Has its own virtualised scroll area.
+                self.connections
+                    .show(ui, snap.as_ref(), &self.client, &mut self.requests);
+                return;
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| match self.page {
                     Page::Dashboard => {
                         dashboard::show(ui, snap.as_ref(), &self.client, &mut self.requests)
+                    }
+                    Page::Groups => {
+                        self.groups
+                            .show(ui, snap.as_ref(), &self.client, &mut self.requests)
                     }
                     Page::Proxies => {
                         self.proxies

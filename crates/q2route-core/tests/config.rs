@@ -268,3 +268,145 @@ fn migrate_respects_user_changes() {
     // Up to date: no change.
     assert!(!Config::seed().migrate());
 }
+
+#[test]
+fn add_group_inserts_before_catch_all_with_unique_id() {
+    let mut c = Config::seed();
+    assert_eq!(
+        c.add_group("My Games!", Action::Direct).unwrap(),
+        "my-games"
+    );
+    assert_eq!(
+        c.add_group("my games", Action::Block).unwrap(),
+        "my-games-2"
+    );
+    let ids: Vec<_> = c.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "iranian-sites",
+            "steam",
+            "games",
+            "my-games",
+            "my-games-2",
+            "everything-else"
+        ]
+    );
+    assert!(c.add_group("   ", Action::Direct).is_err());
+}
+
+#[test]
+fn delete_rename_move_respect_catch_all() {
+    let mut c = Config::seed();
+    assert!(c.delete_group("everything-else").is_err());
+    assert!(c.move_group("everything-else", 0).is_err());
+    assert!(c.move_group("games", 3).is_err()); // catch-all's index
+    c.move_group("games", 0).unwrap();
+    assert_eq!(c.groups[0].id, "games");
+    c.rename_group("games", "Online games").unwrap();
+    assert_eq!(
+        (c.groups[0].id.as_str(), c.groups[0].name.as_str()),
+        ("games", "Online games")
+    );
+    assert!(c.rename_group("games", " ").is_err());
+    c.delete_group("games").unwrap();
+    assert!(c.groups.iter().all(|g| g.id != "games"));
+    assert!(c.delete_group("games").is_err());
+}
+
+#[test]
+fn set_group_rules_keeps_action_and_enabled() {
+    let mut c = Config::seed();
+    c.set_group_action("steam", Action::Proxy("v2ray".into()))
+        .unwrap();
+    let rules = vec![Rule {
+        apps: vec!["steam.exe".into(), "steamwebhelper.exe".into()],
+        ..Rule::default()
+    }];
+    c.set_group_rules("steam", rules.clone()).unwrap();
+    let g = c.groups.iter().find(|g| g.id == "steam").unwrap();
+    assert_eq!(g.rules, rules);
+    assert_eq!(g.action, Action::Proxy("v2ray".into()));
+    assert!(!g.enabled);
+}
+
+#[test]
+fn set_group_rules_rejects_bad_entries() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    for bad in [
+        Rule {
+            ips: vec!["10.0.0.0/33".into()],
+            ..Rule::default()
+        },
+        Rule {
+            domains: vec!["*".into()],
+            ..Rule::default()
+        },
+        Rule {
+            ports: vec!["80-70".into()],
+            ..Rule::default()
+        },
+        Rule {
+            ips: vec!["geoip:".into()],
+            ..Rule::default()
+        },
+        Rule::default(), // no conditions
+    ] {
+        assert!(c.set_group_rules("games", vec![bad]).is_err());
+    }
+    assert_eq!(c, before);
+    let e = c
+        .set_group_rules(
+            "games",
+            vec![Rule {
+                ips: vec!["10.0.0.0/33".into()],
+                ..Rule::default()
+            }],
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("10.0.0.0/33"), "{e}");
+}
+
+#[test]
+fn add_rule_dedupes() {
+    let mut c = Config::seed();
+    let r = Rule {
+        apps: vec!["game.exe".into()],
+        ..Rule::default()
+    };
+    assert!(c.add_rule("games", r.clone()).unwrap());
+    assert!(!c.add_rule("games", r).unwrap());
+    assert_eq!(
+        c.groups
+            .iter()
+            .find(|g| g.id == "games")
+            .unwrap()
+            .rules
+            .len(),
+        1
+    );
+    assert!(c
+        .add_rule(
+            "everything-else",
+            Rule {
+                apps: vec!["x.exe".into()],
+                ..Rule::default()
+            }
+        )
+        .is_err());
+}
+
+#[test]
+fn slug_cases() {
+    assert_eq!(slug("Online  Games (UDP)"), "online-games-udp");
+    assert_eq!(slug("بازی"), "group");
+}
+
+#[test]
+fn move_group_huge_index_is_rejected() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    assert!(c.move_group("games", usize::MAX).is_err());
+    assert_eq!(c, before);
+}
