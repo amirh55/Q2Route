@@ -34,9 +34,9 @@ line with domain, route, group, reason and outcome.
 
 | # | Check | Result |
 |---|---|---|
-| P1 | Proxifier is fully exited (tray icon gone, no `Proxifier.exe` in Task Manager). It redirects connections and breaks Q2Route (Ruling R10). | |
-| P2 | OpenNetRoute and any other WinDivert-based app (other routers, packet sniffers) are closed. | |
-| P3 | v2rayN: system proxy is cleared and TUN mode is off. v2ray/xray is running with its SOCKS inbound on `127.0.0.1:10808`. | |
+| P1 | Proxifier is fully exited (tray icon gone, no `Proxifier.exe` in Task Manager). It redirects connections and breaks Q2Route (Ruling R10). | pass |
+| P2 | OpenNetRoute and any other WinDivert-based app (other routers, packet sniffers) are closed. | pass |
+| P3 | v2rayN: system proxy is cleared and TUN mode is off. v2ray/xray is running with its SOCKS inbound on `127.0.0.1:10808`. | pass |
 | P4 | Windows Firewall is ON for all profiles. | |
 | P5 | After `Install.cmd`, the firewall rule exists. | |
 
@@ -51,10 +51,10 @@ Get-NetFirewallRule -DisplayName "Q2Route relay" | Select-Object DisplayName, En
 
 | # | Step | Expected | Result |
 |---|---|---|---|
-| 1 | Iranian sites. Dashboard shows Running, "Everything else" set to v2ray. Open `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me shows the **v2ray exit IP**; digikala.ir loads; log shows `group=iranian-sites` `route=Direct` for digikala.ir and `group=everything-else` `route=Proxy(v2ray)` for ifconfig.me. | |
+| 1 | Iranian sites. Dashboard shows Running, "Everything else" set to v2ray. Open `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me shows the **v2ray exit IP**; digikala.ir loads; log shows `group=iranian-sites` `route=Direct` for digikala.ir and `group=everything-else` `route=Proxy(v2ray)` for ifconfig.me. | pass (2026-11-06). ifconfig.me showed the German v2ray exit IP. `ipmyp.ir` (used instead of digikala.ir) showed the Iranian IP, log `group=iranian-sites route=Direct`. Note: `www.digikala.com` is not `.ir`, so it goes through the proxy until geoip:ir exists. |
 | 2 | Steam. Enable "Steam" with Direct, start Steam. | Log shows `exe=steamwebhelper.exe ... route=Direct group=steam reason=Inherited(from_pid=...)`. | |
 | 2b | Launch a game from Steam that has its own rule in a lower group (e.g. add its exe to "Games" with a different action). | Log shows the game exe with its own group and `reason=Own`. | |
-| 3 | Proxy down. Stop v2ray. Reload `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me **fails to load and never shows the real IP**; red banner appears; digikala.ir still loads; log shows `proxy failed: ... (closed, no direct fallback)`. | |
+| 3 | Proxy down. Stop v2ray. Reload `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me **fails to load and never shows the real IP**; red banner appears; digikala.ir still loads; log shows `proxy failed: ... (closed, no direct fallback)`. | pass for `.ir` (2026-11-06). With a dead config, foreign sites failed and `.ir` sites loaded; with v2ray closed, log shows `proxy unreachable (closed, no direct fallback)`. The "Iranian site" that failed with v2ray closed was `www.digikala.com` (proxied, not `.ir`): correct per the rules, fixed by geoip:ir. Banner not recorded. |
 | 3b | Restart v2ray and browse a proxied site. | The banner clears by itself (no Test click needed). | |
 | 4 | Deliberate Stop. Press Stop. | ifconfig.me shows the real IP; status reads "Stopped: all traffic direct". Press Start again afterwards. | |
 | 5 | UI loss. Kill `q2route.exe` in Task Manager while Running. | Browsing continues through v2ray; relaunched UI reconnects. | |
@@ -72,12 +72,12 @@ sc.exe start Q2Route
 
 | # | Check | Expected | Result |
 |---|---|---|---|
-| L1 | `curl -6 https://ifconfig.co` | Fails, or never shows the real IPv6 / IPv4 (proxied IPv6 is blocked in M1). | |
-| L2 | `curl -4 https://ifconfig.co` | Shows the v2ray exit IP. | |
-| L3 | Browser: `https://browserleaks.com/ip` | Only the v2ray exit IP; no real IPv4/IPv6. | |
-| L4 | Browser: `https://browserleaks.com/webrtc` | No real public IP in the WebRTC candidates (local/LAN addresses are fine). | |
-| L5 | Browser: `https://cloudflare-quic.com` | Page reports HTTP/2 (`h2`), not HTTP/3 (`h3`): proxied UDP/QUIC is blocked. | |
-| L6 | Browser: `https://www.dnsleaktest.com` (extended test) | Shows the ISP resolver: **known M1 gap** (Ruling R3, DNS is always direct until the M2 DNS relay). Record what it shows. | |
+| L1 | `curl -6 https://ifconfig.co` | Fails, or never shows the real IPv6 / IPv4 (proxied IPv6 is blocked in M1). | pass: `Could not resolve host`, no IPv6 exposure. |
+| L2 | `curl -4 https://ifconfig.co` | Shows the v2ray exit IP. | inconclusive: log shows curl proxied via v2ray, but TLS failed (`CRYPT_E_REVOCATION_OFFLINE`). Retry with `curl.exe --ssl-no-revoke -4 https://ifconfig.co`. No real IP shown. |
+| L3 | Browser: `https://browserleaks.com/ip` | Only the v2ray exit IP; no real IPv4/IPv6. | pass |
+| L4 | Browser: `https://browserleaks.com/webrtc` | No real public IP in the WebRTC candidates (local/LAN addresses are fine). | pass |
+| L5 | Browser: `https://cloudflare-quic.com` | Page reports HTTP/2 (`h2`), not HTTP/3 (`h3`): proxied UDP/QUIC is blocked. | pass (h2) |
+| L6 | Browser: `https://www.dnsleaktest.com` (extended test) | Shows the ISP resolver: **known M1 gap** (Ruling R3, DNS is always direct until the M2 DNS relay). Record what it shows. | German and Belgian resolvers, no Iranian ISP resolver (Chrome secure DNS goes through the proxy). Other apps still use the ISP resolver directly (R3). |
 
 ```powershell
 curl.exe -6 https://ifconfig.co
@@ -89,11 +89,11 @@ curl.exe -4 https://ifconfig.co
 | # | Check | Expected | Result |
 |---|---|---|---|
 | R1 | Unchecking "Everything else". | Impossible: the card has no Enabled checkbox and the tray never shows it "(off)". | |
-| R2 | Idle connection: open an SSH (or telnet) session to a proxied host, leave it idle 3+ minutes, then type. | Session still works (the NAT entry is held by the relay, not swept after 120 s). | |
+| R2 | Idle connection: open an SSH (or telnet) session to a proxied host, leave it idle 3+ minutes, then type. | Session still works (the NAT entry is held by the relay, not swept after 120 s). | pass: Termius SSH stable for 20 min. |
 | R3 | Service handles and memory over 1 hour of normal use. | Handle count and private bytes stay flat (no steady growth). Record start/end values. | |
 | R4 | Restart v2ray several times while Q2Route runs, then count connections to the SOCKS port. | Count stays bounded (no leaked relay upstream sockets). | |
 | R5 | Toggle Steam Direct/Proxy during a download. | Existing connections on the old route are reset and Steam reconnects on the new route; the download resumes. Record how long it stalls. | |
-| R6 | Speed test (e.g. speedtest.net) with the service stopped vs running; watch the service CPU in Task Manager. | Record both speeds and the CPU. | |
+| R6 | Speed test (e.g. speedtest.net) with the service stopped vs running; watch the service CPU in Task Manager. | Record both speeds and the CPU. | speed good while running; stopped-vs-running numbers and CPU not recorded. |
 | R7 | Router admin page (e.g. `http://192.168.1.1`). | Loads (LAN is always direct). | |
 | R8 | Windows Update: Settings > Windows Update > Check for updates. | Connects. | |
 | R9 | Inbound from the internet to a local server: run `python -m http.server 8000`, forward port 8000 on the router (or use a public-IP machine), and open `http://<your public IP>:8000` from a phone on **mobile data** (not Wi-Fi: LAN peers are always direct and prove nothing). | Loads (accepted inbound connections are direct). Remove the port forward afterwards. | |
