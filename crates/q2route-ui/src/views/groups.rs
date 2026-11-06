@@ -87,6 +87,27 @@ pub fn can_move(groups: &[Group], i: usize) -> (bool, bool) {
     (i > 0, !next_is_catch_all)
 }
 
+/// The rule list after saving `rule`: replaces `base[index]` or appends when
+/// `index` is None. None when `current` no longer equals `base` (the index
+/// would point at the wrong rule) or the index is out of range.
+pub fn apply_edit(
+    current: &[Rule],
+    base: &[Rule],
+    index: Option<usize>,
+    rule: Rule,
+) -> Option<Vec<Rule>> {
+    if current != base {
+        return None;
+    }
+    let mut rules = current.to_vec();
+    match index {
+        Some(i) if i < rules.len() => rules[i] = rule,
+        Some(_) => return None,
+        None => rules.push(rule),
+    }
+    Some(rules)
+}
+
 fn action_badge(s: &StateSnapshot, a: &Action) -> (String, Color32) {
     match a {
         Action::Direct => ("Direct".into(), dashboard::DIRECT),
@@ -107,6 +128,8 @@ fn protocol_name(p: Option<Protocol>) -> &'static str {
 }
 
 struct RuleEditor {
+    /// The group's rules when the editor opened; `index` refers to these.
+    base: Vec<Rule>,
     /// `Some(i)` while editing rule `i`; `None` for a new rule.
     index: Option<usize>,
     form: RuleForm,
@@ -287,7 +310,7 @@ impl GroupsView {
         ui.horizontal(|ui| {
             ui.heading("Rules");
             if ui.button("Add rule").clicked() {
-                self.open_editor(None, RuleForm::default());
+                self.open_editor(g, None, RuleForm::default());
             }
         });
         if g.rules.is_empty() {
@@ -307,7 +330,7 @@ impl GroupsView {
             });
         }
         if let Some(i) = edit {
-            self.open_editor(Some(i), RuleForm::from_rule(&g.rules[i]));
+            self.open_editor(g, Some(i), RuleForm::from_rule(&g.rules[i]));
         }
         if let Some(i) = remove {
             let mut rules = g.rules.clone();
@@ -318,8 +341,9 @@ impl GroupsView {
         self.rule_form(ui, g, client);
     }
 
-    fn open_editor(&mut self, index: Option<usize>, form: RuleForm) {
+    fn open_editor(&mut self, g: &Group, index: Option<usize>, form: RuleForm) {
         self.editor = Some(RuleEditor {
+            base: g.rules.clone(),
             index,
             form,
             error: None,
@@ -332,6 +356,11 @@ impl GroupsView {
         let Some(ed) = self.editor.as_mut() else {
             return;
         };
+        if ed.saving.is_none() && g.rules != ed.base {
+            // Rules changed under the editor; its index is stale.
+            self.editor = None;
+            return;
+        }
         if let Some(rx) = ed.saving.as_mut() {
             match rx.try_recv() {
                 Ok(Response::Error(e)) => {
@@ -453,14 +482,16 @@ impl GroupsView {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
         if save {
-            let mut rules = g.rules.clone();
-            match ed.index {
-                Some(i) if i < rules.len() => rules[i] = rule,
-                _ => rules.push(rule),
+            match apply_edit(&g.rules, &ed.base, ed.index, rule) {
+                Some(rules) => {
+                    ed.error = None;
+                    let group_id = g.id.clone();
+                    ed.saving = Some(client.send(Request::SetGroupRules { group_id, rules }));
+                }
+                None => {
+                    ed.error = Some("This group's rules changed; reopen the rule.".into());
+                }
             }
-            ed.error = None;
-            let group_id = g.id.clone();
-            ed.saving = Some(client.send(Request::SetGroupRules { group_id, rules }));
         }
         if cancel {
             self.editor = None;
@@ -499,6 +530,22 @@ mod tests {
         let r = rule_from_form(&RuleForm::default());
         assert!(r.is_empty());
         assert!(r.include_children);
+    }
+
+    #[test]
+    fn apply_edit_replaces_appends_and_rejects_stale() {
+        let rule = |d: &str| Rule {
+            domains: vec![d.into()],
+            ..Rule::default()
+        };
+        let base = vec![rule("a"), rule("b"), rule("c")];
+        let edited = apply_edit(&base, &base, Some(1), rule("x")).unwrap();
+        assert_eq!(edited, [rule("a"), rule("x"), rule("c")]);
+        let added = apply_edit(&base, &base, None, rule("x")).unwrap();
+        assert_eq!(added, [rule("a"), rule("b"), rule("c"), rule("x")]);
+        let current = vec![rule("b"), rule("c")];
+        assert_eq!(apply_edit(&current, &base, Some(1), rule("x")), None);
+        assert_eq!(apply_edit(&base, &base, Some(3), rule("x")), None);
     }
 
     #[test]
