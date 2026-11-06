@@ -32,7 +32,11 @@ pub fn summary(g: &Group) -> String {
                     apps
                 });
             }
-            parts.extend(r.domains.iter().chain(&r.ips).cloned());
+            parts.extend(r.domains.iter().cloned());
+            parts.extend(r.ips.iter().map(|i| match i.trim().strip_prefix("geoip:") {
+                Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
+                None => i.clone(),
+            }));
             if !r.ports.is_empty() {
                 parts.push(format!("port {}", r.ports.join(", ")));
             }
@@ -270,7 +274,12 @@ mod tests {
         let s: Vec<String> = cfg.groups.iter().map(summary).collect();
         assert_eq!(
             s,
-            ["*.ir", "steam.exe + children", "No rules yet", "catch-all"]
+            [
+                "*.ir; GeoIP IR",
+                "steam.exe + children",
+                "No rules yet",
+                "catch-all"
+            ]
         );
     }
 

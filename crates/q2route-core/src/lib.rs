@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod decide;
+pub mod geoip;
 pub mod ipc;
 pub mod matchers;
 pub mod peek;

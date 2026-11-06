@@ -62,6 +62,8 @@ pub enum Event {
     },
 }
 
+// Short-lived wire messages; boxing would only add an allocation per frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
     Response(Response),

@@ -20,6 +20,8 @@ fn seed_matches_spec() {
     let ids: Vec<_> = c.groups.iter().map(|g| g.id.as_str()).collect();
     assert_eq!(ids, ["iranian-sites", "steam", "games", "everything-else"]);
     assert_eq!(c.groups[0].rules[0].domains, ["*.ir"]);
+    assert_eq!(c.groups[0].rules[1].ips, ["geoip:ir"]);
+    assert_eq!(c.seed_version, SEED_VERSION);
     assert_eq!(c.groups[1].rules[0].apps, ["steam.exe"]);
     assert!(c.groups[1].rules[0].include_children);
     assert!(c.groups[2].rules.is_empty());
@@ -227,4 +229,42 @@ fn upsert_and_delete_proxy() {
     c.delete_proxy("alt").unwrap();
     assert_eq!(c.proxies.len(), 1);
     assert!(c.delete_proxy("alt").is_err());
+}
+
+#[test]
+fn migrate_adds_geoip_ir_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // An M1 config: no seed_version, "Iranian sites" has only *.ir.
+    let mut old = Config::seed();
+    old.seed_version = 0;
+    old.groups[0].rules.truncate(1);
+    old.save(&path).unwrap();
+
+    let c = Config::load(&path).unwrap();
+    assert_eq!(c.seed_version, SEED_VERSION);
+    assert_eq!(c.groups[0].rules.len(), 2);
+    assert_eq!(c.groups[0].rules[1].ips, ["geoip:ir"]);
+    // Saved, and not added again on the next load.
+    let again = Config::load(&path).unwrap();
+    assert_eq!(again, c);
+}
+
+#[test]
+fn migrate_respects_user_changes() {
+    // geoip:ir already present (any case): not duplicated.
+    let mut c = Config::seed();
+    c.seed_version = 0;
+    c.groups[0].rules[1].ips = vec!["GeoIP:IR".into()];
+    assert!(c.migrate());
+    assert_eq!(c.groups[0].rules.len(), 2);
+    // Group removed by the user: nothing re-created.
+    let mut c = Config::seed();
+    c.seed_version = 0;
+    c.groups.remove(0);
+    let before = c.groups.clone();
+    assert!(c.migrate());
+    assert_eq!(c.groups, before);
+    // Up to date: no change.
+    assert!(!Config::seed().migrate());
 }

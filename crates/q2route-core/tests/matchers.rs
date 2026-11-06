@@ -98,3 +98,27 @@ fn always_direct_dst() {
         assert!(!is_always_direct_dst(ip(s)), "{s}");
     }
 }
+
+#[test]
+fn geoip_matcher() {
+    use q2route_core::geoip::{GeoIp, IpSet};
+    let geo = GeoIp::from_sets([(
+        "IR".to_string(),
+        IpSet::from_cidrs(&[("185.188.104.0".parse().unwrap(), 22)]),
+    )]);
+    let m = IpMatcher::parse_with("geoip:ir", &geo).unwrap();
+    assert!(m.matches("185.188.107.12".parse().unwrap()));
+    assert!(!m.matches("8.8.8.8".parse().unwrap()));
+    // Without data: parses, matches nothing (falls through to the proxy).
+    let none = IpMatcher::parse("geoip:ir").unwrap();
+    assert!(!none.matches("185.188.107.12".parse().unwrap()));
+    assert!(IpMatcher::parse("geoip:").is_err());
+    assert_eq!(
+        q2route_core::matchers::geoip_codes(&[
+            "geoip:IR".to_string(),
+            "1.2.3.4".into(),
+            "geoip:ir".into()
+        ]),
+        ["ir"]
+    );
+}

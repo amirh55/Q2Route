@@ -133,8 +133,15 @@ impl Default for Settings {
     }
 }
 
+/// Bumped when the seed gains something existing configs should get too
+/// (see [`Config::migrate`]). 1: `geoip:ir` in "Iranian sites".
+pub const SEED_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
+    /// Seed additions already applied to this config.
+    #[serde(default)]
+    pub seed_version: u32,
     #[serde(default)]
     pub proxies: Vec<ProxyProfile>,
     #[serde(default)]
@@ -162,6 +169,7 @@ impl Config {
             catch_all,
         };
         Config {
+            seed_version: SEED_VERSION,
             proxies: vec![ProxyProfile {
                 id: "v2ray".into(),
                 name: "V2Ray".into(),
@@ -177,10 +185,16 @@ impl Config {
                     "Iranian sites",
                     true,
                     Action::Direct,
-                    vec![Rule {
-                        domains: vec!["*.ir".into()],
-                        ..Rule::default()
-                    }],
+                    vec![
+                        Rule {
+                            domains: vec!["*.ir".into()],
+                            ..Rule::default()
+                        },
+                        Rule {
+                            ips: vec!["geoip:ir".into()],
+                            ..Rule::default()
+                        },
+                    ],
                     false,
                 ),
                 group(
@@ -226,8 +240,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let c: Config = toml::from_str(&s)?;
+                let mut c: Config = toml::from_str(&s)?;
                 c.validate()?;
+                if c.migrate() {
+                    c.save(path)?;
+                }
                 Ok(c)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -237,6 +254,31 @@ impl Config {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Applies seed additions newer than `seed_version`. Returns whether
+    /// anything changed. Groups the user deleted or renamed are left alone.
+    pub fn migrate(&mut self) -> bool {
+        if self.seed_version >= SEED_VERSION {
+            return false;
+        }
+        if self.seed_version < 1 {
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == "iranian-sites") {
+                let has = g.rules.iter().any(|r| {
+                    r.ips
+                        .iter()
+                        .any(|i| i.trim().eq_ignore_ascii_case("geoip:ir"))
+                });
+                if !has {
+                    g.rules.push(Rule {
+                        ips: vec!["geoip:ir".into()],
+                        ..Rule::default()
+                    });
+                }
+            }
+        }
+        self.seed_version = SEED_VERSION;
+        true
     }
 
     /// Atomic save: write a temp file next to `path`, then rename over it.

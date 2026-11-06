@@ -412,3 +412,60 @@ fn proxied_domain_group_with_proxied_fallback_skips_peek() {
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
 }
+
+fn d_geo(proto: Protocol, pid: u32, dst: &str, domain: Option<&str>) -> Decision {
+    use q2route_core::geoip::{GeoIp, IpSet};
+    let geo = GeoIp::from_sets([(
+        "ir".to_string(),
+        IpSet::from_cidrs(&[("185.188.104.0".parse().unwrap(), 22)]),
+    )]);
+    run(
+        &RuleSet::compile_with(&cfg(), &geo).unwrap(),
+        &HashSet::new(),
+        proto,
+        pid,
+        dst,
+        domain,
+    )
+}
+
+#[test]
+fn geoip_ir_direct_without_peek() {
+    // digikala.com on an Iranian IP: Direct straight away, no SNI peek needed.
+    assert_eq!(
+        d_geo(Protocol::Tcp, 40, "185.188.107.12:443", None),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+    assert_eq!(
+        d_geo(
+            Protocol::Tcp,
+            40,
+            "185.188.107.12:443",
+            Some("www.digikala.com")
+        ),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+    // Non-HTTP port and UDP to an Iranian IP (Eitaa, games) are Direct too.
+    assert_eq!(
+        d_geo(Protocol::Udp, 40, "185.188.105.1:5000", None),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn geoip_ir_foreign_ip_still_proxied() {
+    assert_eq!(
+        d_geo(Protocol::Tcp, 40, "34.160.111.145:443", Some("ifconfig.me")),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // Without geoip data the Iranian IP is not special: it goes to the proxy.
+    assert_eq!(
+        d(
+            Protocol::Tcp,
+            40,
+            "185.188.107.12:443",
+            Some("www.digikala.com")
+        ),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}

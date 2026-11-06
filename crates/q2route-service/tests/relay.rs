@@ -101,6 +101,7 @@ fn socks_profile(port: u16) -> ProxyProfile {
 
 fn config(proxies: Vec<ProxyProfile>, groups: Vec<Group>) -> Config {
     Config {
+        seed_version: q2route_core::SEED_VERSION,
         proxies,
         groups,
         always_direct: vec![],

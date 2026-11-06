@@ -26,6 +26,11 @@ This creates `dist\Q2Route` with `q2route.exe` (UI), `q2route-service.exe`,
 The service runs from wherever `Install.cmd` was run, so do not move or delete
 the folder while it is installed (run Uninstall first).
 
+**Updating a running install:** while the service runs, `package.ps1` writes to
+`dist\Q2Route-update` instead and adds **Update.cmd**. Double-click it: it
+stops the service, copies the new files into `dist\Q2Route`, and starts the
+service and the UI again. Settings are kept.
+
 Logs: `%ProgramData%\Q2Route\logs\q2route.log.<date>`. Each decided flow logs
 one `flow ...` line (packet layer) and, for relayed flows, one `relay ...`
 line with domain, route, group, reason and outcome.
@@ -52,6 +57,7 @@ Get-NetFirewallRule -DisplayName "Q2Route relay" | Select-Object DisplayName, En
 | # | Step | Expected | Result |
 |---|---|---|---|
 | 1 | Iranian sites. Dashboard shows Running, "Everything else" set to v2ray. Open `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me shows the **v2ray exit IP**; digikala.ir loads; log shows `group=iranian-sites` `route=Direct` for digikala.ir and `group=everything-else` `route=Proxy(v2ray)` for ifconfig.me. | pass (2026-11-06). ifconfig.me showed the German v2ray exit IP. `ipmyp.ir` (used instead of digikala.ir) showed the Iranian IP, log `group=iranian-sites route=Direct`. Note: `www.digikala.com` is not `.ir`, so it goes through the proxy until geoip:ir exists. |
+| 1b | GeoIP IR. The "Iranian sites" card reads `*.ir; GeoIP IR`. Open `https://www.digikala.com`, then stop v2ray and reload it. | Loads both times; log shows `geoip:ir: <N> ranges` at start and `domain=www.digikala.com route=Direct group=iranian-sites` per flow. | |
 | 2 | Steam. Enable "Steam" with Direct, start Steam. | Log shows `exe=steamwebhelper.exe ... route=Direct group=steam reason=Inherited(from_pid=...)`. | |
 | 2b | Launch a game from Steam that has its own rule in a lower group (e.g. add its exe to "Games" with a different action). | Log shows the game exe with its own group and `reason=Own`. | |
 | 3 | Proxy down. Stop v2ray. Reload `https://ifconfig.me` and `https://www.digikala.ir`. | ifconfig.me **fails to load and never shows the real IP**; red banner appears; digikala.ir still loads; log shows `proxy failed: ... (closed, no direct fallback)`. | pass for `.ir` (2026-11-06). With a dead config, foreign sites failed and `.ir` sites loaded; with v2ray closed, log shows `proxy unreachable (closed, no direct fallback)`. The "Iranian site" that failed with v2ray closed was `www.digikala.com` (proxied, not `.ir`): correct per the rules, fixed by geoip:ir. Banner not recorded. |

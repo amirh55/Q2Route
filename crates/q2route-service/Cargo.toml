@@ -35,3 +35,4 @@ windows-service = "0.8"
 
 [dev-dependencies]
 etherparse = "0.21"
+tempfile = "3"

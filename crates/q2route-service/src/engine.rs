@@ -20,12 +20,12 @@ use q2route_core::config::{Config, ConfigError, ProfileId};
 use q2route_core::ipc::{Event, Request, Response, StateSnapshot};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::test_proxy;
-use q2route_core::ruleset::RuleSet;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::geo::GeoCache;
 use crate::ipc_server::{BoxFuture, Control};
 use crate::packet_loop::{
     network_loop, socket_loop, NatLookup, RunState, Shared, NETWORK_FILTER, NETWORK_THREADS,
@@ -52,6 +52,7 @@ pub struct Engine {
 
 struct Inner {
     config_path: PathBuf,
+    geo: GeoCache,
     shared: Arc<Shared>,
     running: AtomicBool,
     run: tokio::sync::Mutex<Option<Running>>,
@@ -77,7 +78,10 @@ impl Engine {
     /// is captured until [`Engine::start`].
     pub fn new(config_path: PathBuf) -> Result<Engine> {
         let cfg = Config::load(&config_path)?;
-        let rules = RuleSet::compile(&cfg)?;
+        let dir = config_path.parent().map(PathBuf::from).unwrap_or_default();
+        let geo = GeoCache::new(dir);
+        geo.reload(&winapi::list_processes());
+        let rules = geo.compile(&cfg)?;
         let (events, _) = broadcast::channel(64);
         let relay = Arc::new(RelayCtx {
             rules: ArcSwap::from_pointee(rules),
@@ -98,6 +102,7 @@ impl Engine {
         Ok(Engine {
             inner: Arc::new(Inner {
                 config_path,
+                geo,
                 shared,
                 running: AtomicBool::new(false),
                 run: tokio::sync::Mutex::new(None),
@@ -160,7 +165,10 @@ impl Inner {
         let _g = self.cfg_lock.lock().await;
         let path = self.config_path.clone();
         let cfg = tokio::task::spawn_blocking(move || Config::load(&path)).await??;
-        let rules = RuleSet::compile(&cfg)?;
+        // Pick up a geoip.dat that v2rayN updated since the last start.
+        let procs = tokio::task::spawn_blocking(winapi::list_processes).await?;
+        self.geo.reload(&procs);
+        let rules = self.geo.compile(&cfg)?;
         self.relay().rules.store(Arc::new(rules));
         self.relay().cfg.store(Arc::new(cfg));
         drop(_g);
@@ -282,7 +290,7 @@ impl Inner {
         let mut next = Config::clone(&self.relay().cfg.load());
         f(&mut next)?;
         next.validate()?;
-        let rules = RuleSet::compile(&next)?;
+        let rules = self.geo.compile(&next)?;
         let path = self.config_path.clone();
         let next = tokio::task::spawn_blocking(move || next.save(&path).map(|()| next)).await??;
         self.relay().rules.store(Arc::new(rules));

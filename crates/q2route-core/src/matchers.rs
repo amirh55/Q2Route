@@ -1,5 +1,6 @@
 //! Domain / IP / port / app matchers compiled from config rule strings.
 
+use crate::geoip::{GeoIp, IpSet};
 use globset::GlobBuilder;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -76,22 +77,60 @@ impl DomainPattern {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IpMatcher(ipnet::IpNet);
+pub enum IpMatcher {
+    Net(ipnet::IpNet),
+    /// `geoip:<code>`. `set` is `None` when no geoip data has that code: it
+    /// then matches nothing, so such traffic falls through to later groups
+    /// (normally the proxy) instead of being sent direct by mistake.
+    Geo {
+        code: String,
+        set: Option<std::sync::Arc<IpSet>>,
+    },
+}
 
 impl IpMatcher {
+    /// Parse without geoip data (`geoip:` entries match nothing).
     pub fn parse(s: &str) -> Result<Self, MatchError> {
+        Self::parse_with(s, &GeoIp::default())
+    }
+
+    pub fn parse_with(s: &str, geo: &GeoIp) -> Result<Self, MatchError> {
         let t = s.trim();
+        if let Some(code) = t.strip_prefix("geoip:") {
+            let code = code.trim().to_lowercase();
+            if code.is_empty() {
+                return Err(MatchError::Ip(s.to_string()));
+            }
+            let set = geo.get(&code);
+            return Ok(Self::Geo { code, set });
+        }
         if let Ok(n) = t.parse::<ipnet::IpNet>() {
-            return Ok(Self(n));
+            return Ok(Self::Net(n));
         }
         t.parse::<IpAddr>()
-            .map(|a| Self(ipnet::IpNet::from(a)))
+            .map(|a| Self::Net(ipnet::IpNet::from(a)))
             .map_err(|_| MatchError::Ip(s.to_string()))
     }
 
     pub fn matches(&self, ip: IpAddr) -> bool {
-        self.0.contains(&ip)
+        match self {
+            Self::Net(n) => n.contains(&ip),
+            Self::Geo { set, .. } => set.as_ref().is_some_and(|s| s.contains(ip)),
+        }
     }
+}
+
+/// Country codes referenced as `geoip:<code>` in `ips` entries, lowercase.
+pub fn geoip_codes<'a>(ips: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut v: Vec<String> = ips
+        .into_iter()
+        .filter_map(|s| s.trim().strip_prefix("geoip:"))
+        .map(|c| c.trim().to_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
