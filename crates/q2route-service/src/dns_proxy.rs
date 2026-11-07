@@ -13,8 +13,8 @@
 //!
 //! **Fail closed:** a query handed here is never sent to its original
 //! server. Without an association (non-SOCKS5 profile, failure,
-//! backoff) an IPv4 query gets an empty TC answer (the client retries over
-//! TCP) and an IPv6 one REFUSED; a deleted profile and overload
+//! backoff) a query gets an empty TC answer (the client retries over TCP,
+//! routed by name); a deleted profile and overload
 //! (`max_inflight`, full queues)
 //! gets REFUSED; a timeout gets nothing (the client retries).
 
@@ -194,14 +194,9 @@ fn answer(sink: &dyn InboundSink, q: &DnsQuery, msg: Option<Vec<u8>>) {
     }
 }
 
-/// No association: TC over IPv4 (retry over TCP), REFUSED over IPv6.
+/// No association: TC (the client retries over TCP, routed by name).
 fn unavailable(sink: &dyn InboundSink, q: &DnsQuery) {
-    let msg = if q.app.is_ipv4() {
-        truncated(&q.msg)
-    } else {
-        refused(&q.msg)
-    };
-    answer(sink, q, msg);
+    answer(sink, q, truncated(&q.msg));
 }
 
 struct Manager {
@@ -276,8 +271,6 @@ struct Upstream {
 struct Pending {
     orig_id: u16,
     name: String,
-    /// The app's query as sent (REFUSED is built from it).
-    query: Vec<u8>,
     app: SocketAddr,
     server: SocketAddr,
     addr: Address,
@@ -416,7 +409,7 @@ impl ProfileTask {
                 self.backoff_until = Some(Instant::now() + self.cfg.backoff);
                 self.state(
                     false,
-                    &format!("association failed: {e} (TC / REFUSED, no direct fallback)"),
+                    &format!("association failed: {e} (TC, no direct fallback)"),
                 );
                 // Same rule as the relays: only an unreachable / silent
                 // proxy is "down".
@@ -505,7 +498,6 @@ impl ProfileTask {
             Pending {
                 orig_id: u16::from_be_bytes([q.msg[0], q.msg[1]]),
                 name,
-                query: q.msg,
                 app: q.app,
                 server: q.server,
                 addr: q.addr,
@@ -553,19 +545,8 @@ impl ProfileTask {
             }
             None => {}
         }
-        // A truncated answer makes the client retry over TCP; IPv6 TCP/53
-        // is not routed by name (M4 gap), so an IPv6 app gets REFUSED.
-        if p.app.is_ipv6() && msg.get(2).is_some_and(|b| b & 0x02 != 0) {
-            tracing::debug!(
-                "dns via '{}': TC answer for {} to an IPv6 app; REFUSED",
-                self.profile,
-                p.name
-            );
-            if let Some(r) = refused(&p.query) {
-                inject(&*self.sink, p.server, p.app, &p.addr, &r);
-            }
-            return;
-        }
+        // A TC answer goes back as is: the client retries over TCP, which
+        // is routed by name (either family).
         inject(&*self.sink, p.server, p.app, &p.addr, &msg);
     }
 

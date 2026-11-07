@@ -13,9 +13,9 @@
 //!   UDP/53 queries are routed by the queried name ([`dns_verdict`]):
 //!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped; a
 //!   UDP/53 payload that is not a DNS query is an ordinary UDP flow.
-//!   IPv4 TCP/53 is redirected to the relay, which routes it by name; IPv6
-//!   TCP/53 is passed untouched (M4 gap). The proxy program's own port-53
-//!   traffic is always passed (spec 5.6).
+//!   TCP/53 (either family) is redirected to the relay, which routes it by
+//!   name; IPv6 TCP/53 is dropped while the relay has no IPv6 listener. The
+//!   proxy program's own port-53 traffic is always passed (spec 5.6).
 //! * DNS answers (sniff only): inbound UDP from port 53 that answers a query
 //!   this loop passed ([`DnsPending`]) feeds the IP -> names map that lets
 //!   domain rules decide flows without a peek.
@@ -385,10 +385,6 @@ fn route_packet(
             return out;
         }
     }
-    // M4 gap (no IPv6 relay until M6): IPv6 TCP/53 is passed untouched.
-    if ipv6_tcp_dns(&f) {
-        return Out::Send;
-    }
     let tcp = f.proto == PROTO_TCP;
     let fam = Family::of(&f.local);
     let tcp4 = tcp && fam == Family::V4;
@@ -406,8 +402,10 @@ fn route_packet(
             .nat
             .get(fam, f.local.port())
             .is_some_and(|o| o.dst == f.remote);
-    // IPv4 TCP/53 is decided by the queried name in the relay.
-    let tcp_dns = tcp4 && f.remote.port() == 53;
+    // TCP/53 (either family) is decided by the queried name in the relay.
+    // Without an IPv6 relay listener a non-Direct IPv6 one is dropped
+    // (classify): fail closed, never passed to the original server.
+    let tcp_dns = tcp && f.remote.port() == 53;
     let relay_v6 = run.relay_v6;
     let action = classify(
         &m,
@@ -484,13 +482,7 @@ fn route_packet(
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
 
-/// IPv6 TCP to port 53: always Direct in M4 (documented gap; there is no
-/// IPv6 relay to route it by name).
-fn ipv6_tcp_dns(f: &FlowId) -> bool {
-    f.proto == PROTO_TCP && f.remote.port() == 53 && f.remote.is_ipv6()
-}
-
-/// The decision for an IPv4 TCP/53 flow: the service's own sockets, proxy
+/// The decision for a TCP/53 flow (either family): the service's own sockets, proxy
 /// endpoints and the proxy program (`own`: why) are Direct; every other
 /// flow is NeedDomain, so its SYN is redirected to the relay (cached
 /// non-Direct, like a proxied flow), which routes it by the queried name
@@ -1759,15 +1751,55 @@ mod tests {
         h.cancel.cancel();
     }
 
-    #[test]
-    fn tcp_dns_ipv6_stays_direct_m4_gap() {
-        // M4 gap (M6 adds an IPv6 relay): IPv6 TCP/53 is passed untouched.
-        assert!(ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:53", true).flow));
-        assert!(!ipv6_tcp_dns(&tcp_meta("8.8.8.8:53", true).flow));
-        assert!(!ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:443", true).flow));
-        let mut udp = tcp_meta("[2001:db8::53]:53", false).flow;
-        udp.proto = PROTO_UDP;
-        assert!(!ipv6_tcp_dns(&udp));
+    /// IPv6 TCP/53 is decided by name in the relay like IPv4: any app's SYN
+    /// is redirected (NAT entry, cached non-Direct); the proxy program, the
+    /// service itself and excluded apps pass.
+    #[tokio::test]
+    async fn ipv6_tcp_dns_goes_to_relay() {
+        let h = harness();
+        let dst = "[2001:db8::53]:53";
+        for (pid, port) in [(BROWSER, 47001), (DIRECT_APP, 47002)] {
+            let local = format!("[2001:db8::2]:{port}");
+            let out = h.route(pid, PROTO_TCP, &local, dst, tcp_pkt(&local, dst, true));
+            assert_eq!(out, Out::Send, "pid {pid}: rewritten toward the relay");
+            assert_eq!(h.cached(PROTO_TCP, &local, dst), Some(Cached::Other));
+            let o = h.run.nat.get(Family::V6, port).expect("NAT entry");
+            assert_eq!(o.dst, sa(dst));
+        }
+        for (pid, port) in [(EXCLUDED, 47003), (XRAY, 47004), (OWN_PID, 47005)] {
+            let local = format!("[2001:db8::2]:{port}");
+            let out = h.route(pid, PROTO_TCP, &local, dst, tcp_pkt(&local, dst, true));
+            assert_eq!(out, Out::Send, "pid {pid}");
+            assert_eq!(h.cached(PROTO_TCP, &local, dst), Some(Cached::Direct));
+            assert!(
+                h.run.nat.get(Family::V6, port).is_none(),
+                "pid {pid} redirected"
+            );
+        }
+        h.cancel.cancel();
+    }
+
+    /// Without an IPv6 relay listener, IPv6 TCP/53 fails closed (a passed
+    /// query could carry a proxied name to the ISP); the proxy program's
+    /// still passes.
+    #[tokio::test]
+    async fn ipv6_tcp_dns_without_relay_v6_is_dropped() {
+        let mut h = harness();
+        h.run = RunState::new(1, false);
+        let dst = "[2001:db8::53]:53";
+        let local = "[2001:db8::2]:48001";
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, local, dst, tcp_pkt(local, dst, true)),
+            Out::Drop
+        );
+        assert!(h.run.nat.get(Family::V6, 48001).is_none());
+        let local = "[2001:db8::2]:48002";
+        assert_eq!(
+            h.route(XRAY, PROTO_TCP, local, dst, tcp_pkt(local, dst, true)),
+            Out::Send
+        );
+        assert_eq!(h.cached(PROTO_TCP, local, dst), Some(Cached::Direct));
+        h.cancel.cancel();
     }
 
     #[test]

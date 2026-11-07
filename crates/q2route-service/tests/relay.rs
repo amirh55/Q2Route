@@ -1545,3 +1545,50 @@ async fn relay_bind_retries_the_pair_for_ipv6() {
     let v6 = ls.v6.as_ref().unwrap().local_addr().unwrap();
     assert_eq!(v6.port(), ls.port(), "same port on both families");
 }
+
+/// IPv6 TCP/53 redirected into the dual-stack relay is routed by the
+/// queried name like IPv4: a proxied name goes to the resolver via the
+/// proxy, a Direct name to the original `[..]:53` server.
+#[tokio::test]
+async fn ipv6_tcp_dns_routed_by_name() {
+    let orig: SocketAddr = "[2001:db8::53]:53".parse().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    DIALS.lock().unwrap().insert(orig, l.local_addr().unwrap());
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    let a = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            a.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(serve_dns(s, tx.clone()));
+        }
+    });
+    let (pport, mut targets, mut queries) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.settings.dns.proxy_resolver = "8.8.4.4:53".into();
+    let c = ctx(cfg);
+    let Some(r) = start_dual(Arc::new(V6Lookup(orig)), c.clone()).await else {
+        return;
+    };
+    // Proxied name: via the proxy to the resolver, original server untouched.
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x1234, "example.com");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut targets).await, "8.8.4.4:53");
+    assert_eq!(recv_t(&mut queries).await, q);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "original server contacted"
+    );
+    // Direct name: to the original IPv6 server, not through the proxy.
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x0bad, "www.digikala.ir");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert!(targets.try_recv().is_err(), "went through the proxy");
+    r.cancel.cancel();
+}

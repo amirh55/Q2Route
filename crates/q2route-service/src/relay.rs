@@ -652,7 +652,7 @@ fn learn_answers(domains: &DomainMap, asked: &Asked, msg: &[u8]) {
     }
 }
 
-/// IPv4 TCP/53: routed by the first query's name only. Direct goes to the
+/// TCP/53 (either family): routed by the first query's name only. Direct goes to the
 /// original server from an own port, Proxy to `proxy_resolver` through the
 /// profile (fail closed: any failure closes the client), Block closes.
 /// Later queries on the connection must decide the same route, else the
