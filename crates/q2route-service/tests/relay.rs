@@ -29,7 +29,7 @@ impl OrigDstLookup for FixedLookup {
     fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
         Some((
             OriginalDst {
-                dst: self.0,
+                dst: self.0.into(),
                 pid: 4242,
             },
             1,
@@ -45,7 +45,7 @@ impl OrigDstLookup for RecordingLookup {
     fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
         Some((
             OriginalDst {
-                dst: self.0,
+                dst: self.0.into(),
                 pid: 4242,
             },
             77,

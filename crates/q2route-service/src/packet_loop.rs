@@ -42,7 +42,7 @@ use crate::classify::{
 use crate::conns::{ConnLog, NewConn};
 use crate::dns_proxy::{bootstrap_direct, DnsProxy, DnsQuery};
 use crate::flows::{FlowKey, FlowTable};
-use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
+use crate::nat::{redirect_outbound, restore_inbound, Family, NatTable, OriginalDst, Verdict};
 use crate::proxy_servers::ServerCache;
 use crate::relay::{describe, exe_name, proxy_program, OrigDstLookup, RelayCtx};
 use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
@@ -198,10 +198,10 @@ impl OrigDstLookup for NatLookup {
         let SocketAddr::V4(peer) = peer else {
             return None;
         };
-        self.0.attach(peer.port(), *peer.ip())
+        self.0.attach(Family::V4, peer.port(), (*peer.ip()).into())
     }
     fn release(&self, peer: SocketAddr, token: u64) {
-        self.0.release(peer.port(), token);
+        self.0.release(Family::of(&peer), peer.port(), token);
     }
 }
 
@@ -406,8 +406,8 @@ fn route_packet(
     let nat_has = tcp4
         && run
             .nat
-            .get(f.local.port())
-            .is_some_and(|o| SocketAddr::V4(o.dst) == f.remote);
+            .get(Family::V4, f.local.port())
+            .is_some_and(|o| o.dst == f.remote);
     // IPv4 TCP/53 is decided by the queried name in the relay.
     let tcp_dns = tcp4 && f.remote.port() == 53;
     let action = classify(&m, own_port, shared.own_pid, &run.cache, nat_has, || {
@@ -436,10 +436,13 @@ fn route_packet(
             Out::ResetApp
         }
         Action::NewRedirect { pid } => {
-            let SocketAddr::V4(dst) = f.remote else {
+            // IPv4 only until the IPv6 relay listener exists.
+            if !f.remote.is_ipv4() {
                 return Out::Drop;
-            };
-            run.nat.insert(f.local.port(), OriginalDst { dst, pid });
+            }
+            let dst = f.remote;
+            run.nat
+                .insert(Family::V4, f.local.port(), OriginalDst { dst, pid });
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
         // Handed to the UDP relay; the packet itself never leaves.
@@ -1328,7 +1331,10 @@ mod tests {
                 h.cached(PROTO_TCP, &local, "203.0.113.5:53"),
                 Some(Cached::Direct)
             );
-            assert!(h.run.nat.get(port).is_none(), "pid {pid} redirected");
+            assert!(
+                h.run.nat.get(Family::V4, port).is_none(),
+                "pid {pid} redirected"
+            );
         }
         // Any other app's TCP/53 goes to the relay (NAT entry, not Direct).
         let local = "10.0.0.2:40003";
@@ -1344,7 +1350,7 @@ mod tests {
             h.cached(PROTO_TCP, local, "203.0.113.5:53"),
             Some(Cached::Other)
         );
-        assert!(h.run.nat.get(40003).is_some());
+        assert!(h.run.nat.get(Family::V4, 40003).is_some());
         // The service itself: passed.
         let local = "10.0.0.2:40004";
         let out = h.route(
@@ -1355,7 +1361,7 @@ mod tests {
             tcp_syn(local, "203.0.113.5:53"),
         );
         assert_eq!(out, Out::Send);
-        assert!(h.run.nat.get(40004).is_none());
+        assert!(h.run.nat.get(Family::V4, 40004).is_none());
         h.cancel.cancel();
     }
 

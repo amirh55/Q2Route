@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -181,7 +181,7 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
     let f = FlowInfo {
         proto: Protocol::Tcp,
         pid: orig.pid,
-        dst: SocketAddr::V4(orig.dst),
+        dst: orig.dst,
         domain,
     };
     let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
@@ -193,15 +193,13 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
 /// (Proxy > Block > Direct). No names: a domain-less flow (`Some("")`), as
 /// before the DNS map existed.
 fn decide_after_empty_peek(ctx: &RelayCtx, orig: &OriginalDst) -> Decision {
-    let names = ctx
-        .domains
-        .names(IpAddr::V4(*orig.dst.ip()), std::time::Instant::now());
+    let names = ctx.domains.names(orig.dst.ip(), std::time::Instant::now());
     let rules = ctx.rules.load();
     let excluded = ctx.excluded.load();
     let f = FlowInfo {
         proto: Protocol::Tcp,
         pid: orig.pid,
-        dst: SocketAddr::V4(orig.dst),
+        dst: orig.dst,
         domain: None,
     };
     let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
@@ -298,7 +296,7 @@ async fn relay_flow(
                 pid: orig.pid,
                 exe: exe.clone(),
                 local: peer,
-                dst: SocketAddr::V4(orig.dst),
+                dst: orig.dst,
                 domain: (!domain.is_empty()).then(|| domain.clone()),
                 route: route.clone(),
                 group_id: info.group_id.clone(),
@@ -326,7 +324,7 @@ async fn relay_flow(
         Route::Block => log("blocked"),
         Route::Proxy(id) => {
             let target = if domain.is_empty() {
-                Target::Ip(SocketAddr::V4(orig.dst))
+                Target::Ip(orig.dst)
             } else {
                 Target::Domain(domain, orig.dst.port())
             };
@@ -386,7 +384,14 @@ async fn connect_proxy(
 
 /// Connects directly to `dst` from a port registered in `own_ports` (so
 /// capture skips it) for as long as the returned guard lives.
-async fn connect_direct(ctx: &RelayCtx, dst: SocketAddrV4) -> io::Result<(TcpStream, OwnPort<'_>)> {
+/// IPv4 only (the capture skips own ports for IPv4 TCP only).
+async fn connect_direct(ctx: &RelayCtx, dst: SocketAddr) -> io::Result<(TcpStream, OwnPort<'_>)> {
+    if !dst.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "IPv6 direct connect",
+        ));
+    }
     let sock = TcpSocket::new_v4()?;
     // Bind first so the local port is known (and skipped by capture) before
     // the SYN leaves.
@@ -397,7 +402,7 @@ async fn connect_direct(ctx: &RelayCtx, dst: SocketAddrV4) -> io::Result<(TcpStr
         ports: &ctx.own_ports,
         port,
     };
-    let up = sock.connect(SocketAddr::V4(dst)).await?;
+    let up = sock.connect(dst).await?;
     Ok((up, own))
 }
 
@@ -592,7 +597,7 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
                 pid: orig.pid,
                 exe: exe.clone(),
                 local: peer,
-                dst: SocketAddr::V4(orig.dst),
+                dst: orig.dst,
                 domain: Some(name.clone()),
                 route: route.clone(),
                 group_id: info.group_id.clone(),
