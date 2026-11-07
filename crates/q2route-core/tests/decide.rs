@@ -386,22 +386,31 @@ fn udp_proxy_ipv4_routes_to_proxy() {
 }
 
 #[test]
-fn udp_443_and_ipv6_stay_blocked() {
+fn udp_443_stays_blocked() {
     // QUIC (UDP/443) stays blocked so apps fall back to TCP through the proxy.
     assert_eq!(
         d(Protocol::Udp, 40, "1.2.3.4:443", None),
         fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
     );
     assert_eq!(
-        d(Protocol::Udp, 40, "[2606:4700::1]:5000", None),
+        d(Protocol::Udp, 40, "[2606:4700::1]:443", None),
         fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
     );
 }
 
 #[test]
-fn ipv6_proxy_blocked_m1() {
+fn ipv6_proxy_routes_to_proxy() {
+    // M6: IPv6 goes through the proxy (dual-stack relay / UDP relay).
     assert_eq!(
         d(Protocol::Tcp, 40, "[2606:4700::1]:443", Some("x.com")),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        d(Protocol::Udp, 40, "[2606:4700::1]:27015", None),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        d(Protocol::Udp, 40, "[2606:4700::1]:443", None),
         fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
     );
 }

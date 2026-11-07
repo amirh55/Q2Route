@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -40,7 +40,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::conns::{ConnBytes, ConnLog, NewConn};
 use crate::dns_proxy::bootstrap_direct;
-use crate::nat::OriginalDst;
+use crate::nat::{Family, OriginalDst};
 use crate::stats::Stats;
 
 /// Maximum client bytes buffered while looking for a domain.
@@ -93,8 +93,10 @@ pub struct RelayCtx {
     pub excluded: ArcSwap<HashSet<u32>>,
     pub stats: Arc<Stats>,
     pub conns: Arc<ConnLog>,
-    /// Local ports of the relay's direct upstream sockets; capture skips them.
-    pub own_ports: Arc<DashSet<u16>>,
+    /// (family, local port) of the relay's direct upstream sockets; capture
+    /// skips them. Keyed by family: an IPv4 and an IPv6 socket may share a
+    /// port number.
+    pub own_ports: Arc<DashSet<(Family, u16)>>,
     pub events: broadcast::Sender<Event>,
     /// A relayed connection with no bytes in either direction for this long
     /// is closed ([`RELAY_IDLE_TIMEOUT`] in production).
@@ -134,15 +136,102 @@ fn set_keepalive(s: &TcpStream) {
     }
 }
 
-/// Accepts until `cancel` fires, then closes every in-flight connection and
-/// returns once they are all gone.
+/// Times the relay tries to bind its IPv4 + IPv6 listener pair on one port.
+pub const RELAY_BIND_ATTEMPTS: usize = 10;
+
+/// The relay's listeners: IPv4, plus IPv6 on the same port when available.
+pub struct RelayListeners {
+    pub v4: TcpListener,
+    pub v6: Option<TcpListener>,
+}
+
+impl RelayListeners {
+    pub fn port(&self) -> u16 {
+        self.v4.local_addr().map_or(0, |a| a.port())
+    }
+
+    pub fn into_vec(self) -> Vec<TcpListener> {
+        std::iter::once(self.v4).chain(self.v6).collect()
+    }
+}
+
+/// Binds the relay listeners: IPv4 on `v4:0`, then IPv6 on `[v6]:<same
+/// port>` with `IPV6_V6ONLY`. Must run inside a tokio runtime.
+pub fn bind_relay(v4: Ipv4Addr, v6: Ipv6Addr) -> io::Result<RelayListeners> {
+    bind_relay_with(v4, |port| bind_v6_only(SocketAddrV6::new(v6, port, 0, 0)))
+}
+
+/// [`bind_relay`] with the IPv6 bind supplied by the caller (tests inject
+/// failures). The pair is retried up to [`RELAY_BIND_ATTEMPTS`] times (the
+/// IPv6 port may be taken); if IPv6 never binds, the relay runs IPv4 only
+/// (and proxied IPv6 TCP stays blocked). An IPv4 bind error is returned.
+pub fn bind_relay_with(
+    v4: Ipv4Addr,
+    mut bind_v6: impl FnMut(u16) -> io::Result<TcpListener>,
+) -> io::Result<RelayListeners> {
+    let mut last = None;
+    for _ in 0..RELAY_BIND_ATTEMPTS {
+        let l4 = std::net::TcpListener::bind((v4, 0))?;
+        l4.set_nonblocking(true)?;
+        let l4 = TcpListener::from_std(l4)?;
+        let port = l4.local_addr()?.port();
+        match bind_v6(port) {
+            Ok(l6) => {
+                return Ok(RelayListeners {
+                    v4: l4,
+                    v6: Some(l6),
+                })
+            }
+            Err(e) => {
+                tracing::debug!("relay IPv6 bind on port {port} failed: {e}");
+                last = Some(l4);
+            }
+        }
+    }
+    let v4 = last.expect("RELAY_BIND_ATTEMPTS > 0");
+    Ok(RelayListeners { v4, v6: None })
+}
+
+/// An IPv6-only (`IPV6_V6ONLY`) listener on `addr`.
+fn bind_v6_only(addr: SocketAddrV6) -> io::Result<TcpListener> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    s.set_only_v6(true)?;
+    s.bind(&SocketAddr::V6(addr).into())?;
+    s.listen(1024)?;
+    s.set_nonblocking(true)?;
+    TcpListener::from_std(s.into())
+}
+
+/// Accepts on every listener until `cancel` fires, then closes every
+/// in-flight connection and returns once they are all gone.
 pub async fn run_relay(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     lookup: Arc<dyn OrigDstLookup>,
     ctx: Arc<RelayCtx>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let tracker = TaskTracker::new();
+    for l in listeners {
+        let (lookup, ctx, cancel) = (lookup.clone(), ctx.clone(), cancel.clone());
+        tracker.spawn(accept_loop(l, lookup, ctx, cancel, tracker.clone()));
+    }
+    tracker.close();
+    tracker.wait().await;
+    Ok(())
+}
+
+/// One listener's accept loop; each connection runs on `tracker`.
+async fn accept_loop(
+    listener: TcpListener,
+    lookup: Arc<dyn OrigDstLookup>,
+    ctx: Arc<RelayCtx>,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
+) {
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -166,9 +255,6 @@ pub async fn run_relay(
             }
         }
     }
-    tracker.close();
-    tracker.wait().await;
-    Ok(())
 }
 
 /// `::ffff:a.b.c.d` (dual-stack listener) becomes `a.b.c.d`.
@@ -389,27 +475,31 @@ async fn connect_proxy(
     }
 }
 
-/// Connects directly to `dst` from a port registered in `own_ports` (so
-/// capture skips it) for as long as the returned guard lives.
-/// IPv4 only (the capture skips own ports for IPv4 TCP only).
+/// Connects directly to `dst` (IPv4 or IPv6) from a `(family, port)`
+/// registered in `own_ports` (so capture skips it) for as long as the
+/// returned guard lives. Only ever called for a Direct route: the relay
+/// never connects to a destination directly otherwise.
 async fn connect_direct(ctx: &RelayCtx, dst: SocketAddr) -> io::Result<(TcpStream, OwnPort<'_>)> {
-    if !dst.is_ipv4() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "IPv6 direct connect",
-        ));
-    }
-    let sock = TcpSocket::new_v4()?;
+    let dst = ctx.direct_dial_override.as_ref().map_or(dst, |f| f(dst));
+    let (sock, any) = match dst {
+        SocketAddr::V4(_) => (
+            TcpSocket::new_v4()?,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        ),
+        SocketAddr::V6(_) => (
+            TcpSocket::new_v6()?,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        ),
+    };
     // Bind first so the local port is known (and skipped by capture) before
     // the SYN leaves.
-    sock.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    let port = sock.local_addr()?.port();
-    ctx.own_ports.insert(port);
+    sock.bind(any)?;
+    let key = (Family::of(&dst), sock.local_addr()?.port());
+    ctx.own_ports.insert(key);
     let own = OwnPort {
         ports: &ctx.own_ports,
-        port,
+        key,
     };
-    let dst = ctx.direct_dial_override.as_ref().map_or(dst, |f| f(dst));
     let up = sock.connect(dst).await?;
     Ok((up, own))
 }
@@ -731,15 +821,16 @@ pub(crate) fn exe_name(tree: &ProcessTree, pid: u32) -> String {
         .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned())
 }
 
-/// Removes a port from `own_ports` when the direct upstream is gone.
+/// Removes a `(family, port)` from `own_ports` when the direct upstream is
+/// gone.
 struct OwnPort<'a> {
-    ports: &'a DashSet<u16>,
-    port: u16,
+    ports: &'a DashSet<(Family, u16)>,
+    key: (Family, u16),
 }
 
 impl Drop for OwnPort<'_> {
     fn drop(&mut self) {
-        self.ports.remove(&self.port);
+        self.ports.remove(&self.key);
     }
 }
 

@@ -321,6 +321,10 @@ fn finish(p: &mut [u8], addr: &mut Address) -> Verdict {
 /// destination matches: reflected to `D:pa -> A:relay_port`, inbound. Such
 /// a packet that cannot be rewritten (IPv6 extension headers) is dropped.
 /// Anything else passes untouched.
+///
+/// **Caller contract:** `Pass` also covers a packet whose ports cannot be
+/// parsed at all, so a caller that already knows the flow is redirected
+/// must treat every verdict other than `Rewritten` as drop, never send.
 pub fn redirect_outbound(
     pkt: &mut [u8],
     addr: &mut Address,
@@ -360,6 +364,10 @@ pub fn redirect_outbound(
 /// inbound. Dropped if there is no NAT entry for `pa` (or it is for another
 /// destination) or it cannot be rewritten (IPv6 extension headers); packets
 /// not from `relay_port` pass untouched.
+///
+/// **Caller contract:** `Pass` also covers a packet whose ports cannot be
+/// parsed at all, so a caller that already knows the packet is the relay's
+/// must treat every verdict other than `Rewritten` as drop, never send.
 pub fn restore_inbound(
     pkt: &mut [u8],
     addr: &mut Address,

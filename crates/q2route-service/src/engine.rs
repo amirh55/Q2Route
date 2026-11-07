@@ -8,7 +8,7 @@
 //! direct), flush DNS.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -21,7 +21,6 @@ use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::{Event, ProcEntry, Request, Response, StateSnapshot};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::test_proxy;
-use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +34,7 @@ use crate::packet_loop::{
     DNS_SNIFF_FILTER, NETWORK_FILTER, NETWORK_THREADS, SOCKET_FILTER,
 };
 use crate::proxy_servers::{self, ServerCache};
-use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
+use crate::relay::{bind_relay, run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
 use crate::udp_relay::UdpRelay;
 use crate::winapi;
@@ -190,9 +189,16 @@ impl Inner {
         refresh_processes(self.relay()).await;
         refresh_exclusions(&self.shared).await;
 
-        let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await?;
-        let relay_port = listener.local_addr()?.port();
-        let state = Arc::new(RunState::new(relay_port));
+        let listeners = bind_relay(Ipv4Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED)?;
+        let relay_port = listeners.port();
+        let relay_v6 = listeners.v6.is_some();
+        if relay_v6 {
+            tracing::info!("relay listening on {relay_port} (IPv4+IPv6)");
+        } else {
+            tracing::info!("relay listening on {relay_port} (IPv4)");
+            tracing::warn!("relay cannot listen on IPv6: proxied IPv6 TCP is blocked for this run");
+        }
+        let state = Arc::new(RunState::new(relay_port, relay_v6));
 
         // Socket layer first so the flow tables fill before packets are held;
         // the DNS answer sniffer after the Network layer.
@@ -272,7 +278,7 @@ impl Inner {
         let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
 
         let relay = tokio::spawn(run_relay(
-            listener,
+            listeners.into_vec(),
             Arc::new(NatLookup(state.nat.clone())),
             self.relay().clone(),
             cancel.clone(),

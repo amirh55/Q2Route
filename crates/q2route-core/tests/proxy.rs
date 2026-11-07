@@ -594,3 +594,58 @@ async fn test_proxy_http_has_no_udp_verdict() {
     assert_eq!(r.udp_ok, None);
     srv.await.unwrap();
 }
+
+#[tokio::test]
+async fn socks5_ipv6_target_atyp4() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(socks5_mock(l, None, 0));
+    let s = connect_via(
+        &profile(ProxyKind::Socks5, port, None),
+        &Target::Ip("[2606:4700::1]:443".parse().unwrap()),
+        T,
+    )
+    .await
+    .unwrap();
+    drop(s);
+    let mut want = vec![4];
+    want.extend_from_slice(
+        &"2606:4700::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    want.extend_from_slice(&443u16.to_be_bytes());
+    assert_eq!(srv.await.unwrap(), want);
+}
+
+#[tokio::test]
+async fn http_connect_ipv6_target_bracketed() {
+    let (l, port) = listen().await;
+    let srv = tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).await.unwrap();
+            buf.push(b[0]);
+        }
+        s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    });
+    let s = connect_via(
+        &profile(ProxyKind::Http, port, None),
+        &Target::Ip("[2606:4700::1]:443".parse().unwrap()),
+        T,
+    )
+    .await
+    .unwrap();
+    drop(s);
+    let req = srv.await.unwrap();
+    assert!(
+        req.starts_with("CONNECT [2606:4700::1]:443 HTTP/1.1\r\n"),
+        "{req}"
+    );
+    assert!(req.contains("\r\nHost: [2606:4700::1]:443\r\n"), "{req}");
+}
