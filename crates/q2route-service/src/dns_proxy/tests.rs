@@ -313,3 +313,58 @@ async fn wait_returns_after_cancel() {
         .await
         .expect("dns proxy tasks ended");
 }
+
+#[test]
+fn proxy_host_matches_hostnames_only() {
+    let mut c = config(profile(ProxyKind::Socks5, 1080));
+    c.proxies[0].host = "Proxy.Example.net.".into();
+    assert!(is_proxy_host(&c, "proxy.example.net"));
+    assert!(is_proxy_host(&c, "PROXY.example.net."));
+    assert!(!is_proxy_host(&c, "example.net"));
+    assert!(!is_proxy_host(&c, "other.proxy.example.net"));
+    assert!(!is_proxy_host(&c, ""));
+    for ip in ["127.0.0.1", "::1", "[::1]"] {
+        c.proxies[0].host = ip.into();
+        assert!(!is_proxy_host(&c, ip), "IP literal {ip}");
+    }
+    c.proxies.clear();
+    assert!(!is_proxy_host(&c, "proxy.example.net"));
+}
+
+#[tokio::test]
+async fn profile_edit_reassociates_and_delete_refuses() {
+    let m1 = mock(MockOpts::default()).await;
+    let m2 = mock(MockOpts::default()).await;
+    let mut r = resolver(Mode::Answer).await;
+    let mut s = setup(
+        dns_config(ProxyKind::Socks5, m1.port, r.addr),
+        DnsProxyConfig::default(),
+    );
+    s.dns.submit(q4(1, "example.com"));
+    let (_, _, p) = parse_inbound(&recv(&mut s.injected).await);
+    assert_eq!((id_of(&p), rcode(&p)), (1, 0));
+    assert_eq!(recv(&mut r.seen).await.0, m1.outer);
+
+    // The profile now points at mock 2: the next query goes through it.
+    s.ctx
+        .cfg
+        .store(Arc::new(dns_config(ProxyKind::Socks5, m2.port, r.addr)));
+    s.dns.submit(q4(2, "example.com"));
+    let (_, _, p) = parse_inbound(&recv(&mut s.injected).await);
+    assert_eq!((id_of(&p), rcode(&p)), (2, 0));
+    assert_eq!(recv(&mut r.seen).await.0, m2.outer, "via the edited proxy");
+    let attempts = |m: &Mock| m.attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((attempts(&m1), attempts(&m2)), (1, 1));
+
+    // Deleted: REFUSED, nothing reaches the resolver.
+    let mut gone = dns_config(ProxyKind::Socks5, m2.port, r.addr);
+    gone.proxies.clear();
+    s.ctx.cfg.store(Arc::new(gone));
+    for id in [3, 4] {
+        s.dns.submit(q4(id, "example.com"));
+        let (_, _, p) = parse_inbound(&recv(&mut s.injected).await);
+        assert_eq!((id_of(&p), rcode(&p)), (id, 5), "REFUSED");
+    }
+    quiet(&mut r.seen).await;
+    assert_eq!((attempts(&m1), attempts(&m2)), (1, 1));
+}

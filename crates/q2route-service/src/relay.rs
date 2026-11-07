@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ProfileId, Protocol};
 use q2route_core::decide::{
-    decide, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
+    decide, decide_mapped_no_peek, Decision, FlowInfo, MatchInfo, MatchReason, Route,
 };
 use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
@@ -182,29 +182,23 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
 }
 
 /// After a peek that found no host: decide by the names DNS answered for
-/// the destination. No names, or names that disagree (`decide_mapped` wants
-/// a peek it already had), decide as a domain-less flow (`Some("")`), as
+/// the destination; disagreeing names give the most protective route
+/// (Proxy > Block > Direct). No names: a domain-less flow (`Some("")`), as
 /// before the DNS map existed.
 fn decide_after_empty_peek(ctx: &RelayCtx, orig: &OriginalDst) -> Decision {
     let names = ctx
         .domains
         .names(IpAddr::V4(*orig.dst.ip()), std::time::Instant::now());
-    if !names.is_empty() {
-        let rules = ctx.rules.load();
-        let excluded = ctx.excluded.load();
-        let f = FlowInfo {
-            proto: Protocol::Tcp,
-            pid: orig.pid,
-            dst: SocketAddr::V4(orig.dst),
-            domain: None,
-        };
-        let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
-        let d = decide_mapped(&rules, &tree, &excluded, &f, &names);
-        if d != Decision::NeedDomain {
-            return d;
-        }
-    }
-    decide_flow(ctx, orig, Some(""))
+    let rules = ctx.rules.load();
+    let excluded = ctx.excluded.load();
+    let f = FlowInfo {
+        proto: Protocol::Tcp,
+        pid: orig.pid,
+        dst: SocketAddr::V4(orig.dst),
+        domain: None,
+    };
+    let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
+    decide_mapped_no_peek(&rules, &tree, &excluded, &f, &names)
 }
 
 /// Reads client bytes until a host is found, the input is not TLS/HTTP, the

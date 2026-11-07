@@ -652,3 +652,43 @@ async fn empty_peek_uses_dns_mapped_names() {
     assert_eq!(row.group_id.as_deref(), Some("ir"));
     r.cancel.cancel();
 }
+
+#[tokio::test]
+async fn empty_peek_disagreeing_names_most_protective() {
+    // One mapped name proxied, one Direct, Direct catch-all: with nothing to
+    // peek, the more protective route (Proxy) wins.
+    let port = mock_socks_reply(0).await;
+    let cfg = config(
+        vec![socks_profile(port)],
+        vec![
+            group(
+                "blocked",
+                Action::Proxy("mock".into()),
+                &["blocked.com"],
+                false,
+            ),
+            group("ir", Action::Direct, &["*.ir"], false),
+            group("rest", Action::Direct, &[], true),
+        ],
+    );
+    let c = ctx(cfg);
+    let now = std::time::Instant::now();
+    c.domains
+        .insert("127.0.0.1".parse().unwrap(), "x.ir", 300, now);
+    c.domains
+        .insert("127.0.0.1".parse().unwrap(), "blocked.com", 300, now);
+    let r = start("127.0.0.1:443".parse().unwrap(), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"not tls\r\n\r\n").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let row = loop {
+        if let Some(row) = c.conns.list().into_iter().next() {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "flow never decided");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(row.route, q2route_core::decide::Route::Proxy("mock".into()));
+    assert_eq!(row.group_id.as_deref(), Some("blocked"));
+    r.cancel.cancel();
+}

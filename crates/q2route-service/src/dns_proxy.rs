@@ -6,23 +6,25 @@
 //! Packet threads [`DnsProxy::submit`] queries (never blocking: bounded
 //! channel; full = REFUSED). One manager task hands them to one task per
 //! profile, which owns that profile's association (opened lazily, reopened
-//! after the control connection ends, not retried for `backoff` after a
-//! failure) and the in-flight queries (re-numbered, so ids from different
+//! after the control connection ends or the profile is edited, not retried
+//! for `backoff` after a failure; the task ends when the profile is deleted)
+//! and the in-flight queries (re-numbered, so ids from different
 //! apps never collide; at most `max_inflight`; dropped after `timeout`).
 //!
 //! **Fail closed:** a query handed here is never sent to its original
-//! server. Without an association (unknown / non-SOCKS5 profile, failure,
+//! server. Without an association (non-SOCKS5 profile, failure,
 //! backoff) an IPv4 query gets an empty TC answer (the client retries over
-//! TCP) and an IPv6 one REFUSED; overload (`max_inflight`, full queues)
+//! TCP) and an IPv6 one REFUSED; a deleted profile and overload
+//! (`max_inflight`, full queues)
 //! gets REFUSED; a timeout gets nothing (the client retries).
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use q2route_core::config::{ProfileId, ProxyKind};
+use q2route_core::config::{Config, ProfileId, ProxyKind, ProxyProfile};
 use q2route_core::dns::{answers, parse_query, refused, response_id, truncated, with_id};
 use q2route_core::ipc::Event;
 use q2route_core::proxy::{decode_udp, encode_udp, udp_associate};
@@ -127,6 +129,19 @@ impl DnsProxy {
     }
 }
 
+/// Whether `name` is the host name (not an IP literal) of a configured
+/// proxy profile: case-insensitive, trailing dots ignored. The DNS path
+/// sends such names direct, since resolving the proxy cannot need the proxy.
+pub fn is_proxy_host(cfg: &Config, name: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    !name.is_empty()
+        && cfg.proxies.iter().any(|p| {
+            let host = p.host.trim_end_matches('.');
+            let literal = host.trim_start_matches('[').trim_end_matches(']');
+            literal.parse::<IpAddr>().is_err() && host.eq_ignore_ascii_case(name)
+        })
+}
+
 /// Injects `msg` (if any) to `app` as a UDP packet from `server`.
 fn inject(sink: &dyn InboundSink, server: SocketAddr, app: SocketAddr, addr: &Address, msg: &[u8]) {
     let pkt = match (server, app) {
@@ -202,6 +217,7 @@ impl Manager {
             up: None,
             backoff_until: None,
             logged_up: None,
+            tried: None,
             pending: HashMap::new(),
             order: BTreeMap::new(),
             next_id: 0,
@@ -249,6 +265,8 @@ struct ProfileTask {
     backoff_until: Option<Instant>,
     /// State last logged at info: associated (true) or failed (false).
     logged_up: Option<bool>,
+    /// The profile of the last association attempt (edits re-associate).
+    tried: Option<ProxyProfile>,
     /// Proxy-side id -> query.
     pending: HashMap<u16, Pending>,
     /// (deadline, serial) -> proxy-side id, oldest first.
@@ -282,18 +300,25 @@ impl ProfileTask {
             let due = self.order.keys().next().map(|k| k.0);
             tokio::select! {
                 q = rx.recv() => match q {
-                    Some(q) => self.query(q).await,
+                    Some(q) => {
+                        if !self.query(q).await {
+                            // Profile deleted: refuse what is queued and end
+                            // (the manager starts a new task if it is re-added).
+                            rx.close();
+                            while let Ok(q) = rx.try_recv() {
+                                answer(&*self.sink, &q, refused(&q.msg));
+                            }
+                            return;
+                        }
+                    }
                     None => return,
                 },
                 ev = next_up(&mut self.up, &mut buf, &mut ctl) => match ev {
                     UpEvent::Reply(n) => self.reply(&buf[..n]),
                     UpEvent::Closed => {
-                        // Re-associated on the next query; in-flight answers
-                        // cannot arrive any more (the client retries).
+                        // Re-associated on the next query.
                         tracing::debug!("dns via '{}': association closed", self.profile);
-                        self.up = None;
-                        self.pending.clear();
-                        self.order.clear();
+                        self.drop_up();
                     }
                     UpEvent::Nothing => {}
                 },
@@ -314,26 +339,18 @@ impl ProfileTask {
         self.logged_up = Some(up);
     }
 
-    /// Opens the association unless backing off; false if there is none.
-    async fn associate(&mut self) -> bool {
+    /// Opens the association through `p` unless backing off; false if
+    /// there is none.
+    async fn associate(&mut self, p: ProxyProfile) -> bool {
         if self.backoff_until.is_some_and(|t| Instant::now() < t) {
             return false;
         }
         let id = self.profile.clone();
-        let found = self
-            .ctx
-            .cfg
-            .load()
-            .proxies
-            .iter()
-            .find(|p| p.id == id)
-            .cloned();
-        let up = match found {
-            None => Err(("unknown proxy profile".to_string(), false)),
-            Some(p) if p.kind != ProxyKind::Socks5 => {
-                Err(("UDP needs a SOCKS5 proxy".to_string(), false))
-            }
-            Some(p) => match udp_associate(&p, ASSOCIATE_TIMEOUT).await {
+        self.tried = Some(p.clone());
+        let up = if p.kind != ProxyKind::Socks5 {
+            Err(("UDP needs a SOCKS5 proxy".to_string(), false))
+        } else {
+            match udp_associate(&p, ASSOCIATE_TIMEOUT).await {
                 Ok(a) => match bind_relay_socket(&a).await {
                     Ok(sock) => Ok(Upstream {
                         control: a.control,
@@ -342,7 +359,7 @@ impl ProfileTask {
                     Err(e) => Err((e.to_string(), false)),
                 },
                 Err(e) => Err((e.to_string(), e.is_proxy_down())),
-            },
+            }
         };
         match up {
             Ok(u) => {
@@ -371,36 +388,73 @@ impl ProfileTask {
         }
     }
 
-    async fn query(&mut self, q: DnsQuery) {
+    /// Ends the association; its in-flight answers cannot arrive any more
+    /// (the clients retry).
+    fn drop_up(&mut self) {
+        self.up = None;
+        self.pending.clear();
+        self.order.clear();
+    }
+
+    /// Handles one query; false once the profile is gone from the config
+    /// (the task then ends).
+    async fn query(&mut self, q: DnsQuery) -> bool {
         // The packet loop only submits parsed queries; anything else is dropped.
         let Some(name) = parse_query(&q.msg).map(|p| p.name) else {
-            return;
+            return true;
         };
+        let current = self
+            .ctx
+            .cfg
+            .load()
+            .proxies
+            .iter()
+            .find(|p| p.id == self.profile)
+            .cloned();
+        let Some(current) = current else {
+            tracing::debug!("dns via '{}': profile gone; REFUSED", self.profile);
+            self.drop_up();
+            answer(&*self.sink, &q, refused(&q.msg));
+            return false;
+        };
+        // Edited since the last association attempt: start over with it.
+        if self.tried.as_ref().is_some_and(|t| *t != current) {
+            tracing::debug!(
+                "dns via '{}': profile changed; re-associating",
+                self.profile
+            );
+            self.drop_up();
+            self.backoff_until = None;
+        }
         if self.pending.len() >= self.cfg.max_inflight.min(usize::from(u16::MAX)) {
             tracing::debug!(
                 "dns via '{}': {} in flight; REFUSED",
                 self.profile,
                 self.pending.len()
             );
-            return answer(&*self.sink, &q, refused(&q.msg));
+            answer(&*self.sink, &q, refused(&q.msg));
+            return true;
         }
-        if self.up.is_none() && !self.associate().await {
-            return unavailable(&*self.sink, &q);
+        if self.up.is_none() && !self.associate(current).await {
+            unavailable(&*self.sink, &q);
+            return true;
         }
         let resolver = self.ctx.cfg.load().settings.dns.proxy_resolver.clone();
         let Ok(resolver) = resolver.parse::<SocketAddr>() else {
             tracing::debug!("dns proxy resolver '{resolver}' is not ip:port");
-            return unavailable(&*self.sink, &q);
+            unavailable(&*self.sink, &q);
+            return true;
         };
         let id = self.alloc_id();
-        let Some(up) = &self.up else { return };
+        let Some(up) = &self.up else { return true };
         if let Err(e) = up
             .sock
             .send(&encode_udp(resolver, &with_id(&q.msg, id)))
             .await
         {
             tracing::debug!("dns via '{}': send failed: {e}", self.profile);
-            return unavailable(&*self.sink, &q);
+            unavailable(&*self.sink, &q);
+            return true;
         }
         self.serial += 1;
         let due = (Instant::now() + self.cfg.timeout, self.serial);
@@ -416,6 +470,7 @@ impl ProfileTask {
                 due,
             },
         );
+        true
     }
 
     /// A proxy-side id not in flight (there are fewer than 65535 in flight).

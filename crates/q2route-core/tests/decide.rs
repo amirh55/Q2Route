@@ -737,3 +737,68 @@ fn no_names_same_as_decide() {
         );
     }
 }
+
+fn dm_no_peek(dst: &str, names: &[&str], rs: &RuleSet) -> Decision {
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    decide_mapped_no_peek(
+        rs,
+        &tree(),
+        &HashSet::new(),
+        &FlowInfo {
+            proto: Protocol::Tcp,
+            pid: 40,
+            dst: dst.parse().unwrap(),
+            domain: None,
+        },
+        &names,
+    )
+}
+
+#[test]
+fn mapped_no_peek_most_protective_on_443() {
+    let mut c = cfg();
+    c.set_group_action("everything-else", Action::Direct)
+        .unwrap();
+    c.groups.insert(
+        0,
+        Group {
+            id: "blocked".into(),
+            name: "Blocked".into(),
+            enabled: true,
+            action: Action::Proxy("v2ray".into()),
+            rules: vec![Rule {
+                domains: vec!["blocked.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    let names = ["x.ir", "blocked.com"];
+    assert_eq!(dm(40, "5.6.7.8:443", &names, &rs), Decision::NeedDomain);
+    assert_eq!(
+        dm_no_peek("5.6.7.8:443", &names, &rs),
+        fin(
+            Route::Proxy("v2ray".into()),
+            Some("blocked"),
+            MatchReason::Own
+        )
+    );
+    // Agreeing names: that route, first name's info.
+    assert_eq!(
+        dm_no_peek("5.6.7.8:443", &["x.ir", "y.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn mapped_no_peek_without_names_is_empty_domain() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    for dst in ["5.6.7.8:443", "5.6.7.8:5222"] {
+        assert_eq!(
+            dm_no_peek(dst, &[], &rs),
+            run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, Some(""))
+        );
+        assert_ne!(dm_no_peek(dst, &[], &rs), Decision::NeedDomain);
+    }
+}

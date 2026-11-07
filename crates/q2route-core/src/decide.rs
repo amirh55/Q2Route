@@ -336,6 +336,12 @@ pub fn decide_mapped(
         // domain-less decision rather than guess.
         return decide(rs, tree, excluded_pids, f);
     }
+    most_protective(finals)
+}
+
+/// The most protective of non-empty `finals` (Proxy > Block > Direct; the
+/// first one on ties).
+fn most_protective(finals: Vec<(Route, MatchInfo)>) -> Decision {
     let rank = |r: &Route| match r {
         Route::Proxy(_) => 2,
         Route::Block => 1,
@@ -344,6 +350,51 @@ pub fn decide_mapped(
     let (r, i) = finals
         .into_iter()
         .reduce(|a, b| if rank(&b.0) > rank(&a.0) { b } else { a })
-        .expect("names non-empty");
+        .expect("finals non-empty");
     Decision::Final(r, i)
+}
+
+/// Like [`decide_mapped`] for a flow whose peek found nothing (no further
+/// peek is possible): never `NeedDomain`. No names -> `decide` with an empty
+/// domain (matches no domain rule). Otherwise each name is decided and the
+/// most protective route wins (Proxy > Block > Direct), on any port.
+pub fn decide_mapped_no_peek(
+    rs: &RuleSet,
+    tree: &ProcessTree,
+    excluded_pids: &HashSet<u32>,
+    f: &FlowInfo,
+    names: &[String],
+) -> Decision {
+    let empty = FlowInfo {
+        domain: Some(""),
+        ..f.clone()
+    };
+    if names.is_empty() {
+        return decide(rs, tree, excluded_pids, &empty);
+    }
+    let finals: Vec<(Route, MatchInfo)> = names
+        .iter()
+        .map(|n| {
+            let fi = FlowInfo {
+                domain: Some(n),
+                ..f.clone()
+            };
+            // With a domain set this is always Final; the empty-domain
+            // decision stands in defensively.
+            match decide(rs, tree, excluded_pids, &fi) {
+                Decision::Final(r, i) => (r, i),
+                Decision::NeedDomain => match decide(rs, tree, excluded_pids, &empty) {
+                    Decision::Final(r, i) => (r, i),
+                    Decision::NeedDomain => (
+                        Route::Block,
+                        MatchInfo {
+                            group_id: None,
+                            reason: MatchReason::NoMatch,
+                        },
+                    ),
+                },
+            }
+        })
+        .collect();
+    most_protective(finals)
 }

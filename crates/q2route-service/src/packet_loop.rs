@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use q2route_core::config::{Action as GroupAction, ProfileId, Protocol};
+use q2route_core::config::{Action as GroupAction, Config, ProfileId, Protocol};
 use q2route_core::decide::{
     decide_dns, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
 };
@@ -35,7 +35,7 @@ use crate::classify::{
     build_rst_to_app, classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP,
 };
 use crate::conns::{ConnLog, NewConn};
-use crate::dns_proxy::{DnsProxy, DnsQuery};
+use crate::dns_proxy::{is_proxy_host, DnsProxy, DnsQuery};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
@@ -425,6 +425,8 @@ fn udp_payload(p: &[u8]) -> Option<&[u8]> {
 enum DnsVerdict {
     /// Send it to the server the app asked.
     Pass,
+    /// A configured proxy's own host name: always sent direct.
+    ProxyHost,
     Drop,
     /// Answer REFUSED.
     Refuse,
@@ -432,10 +434,15 @@ enum DnsVerdict {
     Proxy(ProfileId),
 }
 
-/// Routes a UDP/53 payload by its queried name ([`decide_dns`]). A payload
+/// Routes a UDP/53 payload by its queried name: a proxy's host name
+/// ([`is_proxy_host`]) passes, anything else by [`decide_dns`]. A payload
 /// that is not a single-question query only passes when the catch-all is
 /// Direct (it could carry a proxied name), else it is dropped.
-fn dns_verdict<'a>(rules: &RuleSet, msg: Option<&'a [u8]>) -> (DnsVerdict, Option<Query<'a>>) {
+fn dns_verdict<'a>(
+    rules: &RuleSet,
+    cfg: &Config,
+    msg: Option<&'a [u8]>,
+) -> (DnsVerdict, Option<Query<'a>>) {
     let Some(q) = msg.and_then(parse_query) else {
         let direct = rules
             .groups
@@ -449,6 +456,9 @@ fn dns_verdict<'a>(rules: &RuleSet, msg: Option<&'a [u8]>) -> (DnsVerdict, Optio
         };
         return (v, None);
     };
+    if is_proxy_host(cfg, &q.name) {
+        return (DnsVerdict::ProxyHost, Some(q));
+    }
     let v = match decide_dns(rules, &q.name).0 {
         Route::Direct => DnsVerdict::Pass,
         Route::Block => DnsVerdict::Refuse,
@@ -471,9 +481,10 @@ fn dns_packet(
         return Out::Send;
     }
     let msg = udp_payload(pkt);
-    let (v, q) = dns_verdict(&shared.relay.rules.load(), msg);
+    let (v, q) = dns_verdict(&shared.relay.rules.load(), &shared.relay.cfg.load(), msg);
     let via = match &v {
         DnsVerdict::Pass => "direct".to_string(),
+        DnsVerdict::ProxyHost => "direct (proxy host)".to_string(),
         DnsVerdict::Drop => "drop".to_string(),
         DnsVerdict::Refuse => "block".to_string(),
         DnsVerdict::Proxy(id) => format!("proxy '{id}'"),
@@ -484,7 +495,7 @@ fn dns_packet(
     }
     let msg = msg.unwrap_or_default();
     match v {
-        DnsVerdict::Pass => Out::Send,
+        DnsVerdict::Pass | DnsVerdict::ProxyHost => Out::Send,
         DnsVerdict::Drop => Out::Drop,
         DnsVerdict::Refuse => {
             let reply = refused(msg).and_then(|r| match (f.remote, f.local) {
@@ -651,7 +662,6 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
 mod tests {
     use super::*;
     use crate::windivert::{check_filter, Layer};
-    use q2route_core::config::Config;
 
     #[test]
     fn udp4_payload_slices_after_header() {
@@ -734,32 +744,60 @@ mod tests {
     #[test]
     fn malformed_query_dropped_when_catch_all_proxied() {
         let rules = seed_rules();
-        assert_eq!(dns_verdict(&rules, Some(b"garbage")).0, DnsVerdict::Drop);
-        assert_eq!(dns_verdict(&rules, None).0, DnsVerdict::Drop);
+        assert_eq!(
+            dns_verdict(&rules, &Config::seed(), Some(b"garbage")).0,
+            DnsVerdict::Drop
+        );
+        assert_eq!(
+            dns_verdict(&rules, &Config::seed(), None).0,
+            DnsVerdict::Drop
+        );
         let mut cfg = Config::seed();
         for g in cfg.groups.iter_mut().filter(|g| g.catch_all) {
             g.action = q2route_core::config::Action::Direct;
         }
         let direct = RuleSet::compile(&cfg).unwrap();
-        assert_eq!(dns_verdict(&direct, Some(b"garbage")).0, DnsVerdict::Pass);
+        assert_eq!(
+            dns_verdict(&direct, &cfg, Some(b"garbage")).0,
+            DnsVerdict::Pass
+        );
     }
 
     #[test]
     fn dns_query_routed_by_name() {
         let rules = seed_rules();
         let q = dns_query("example.com");
-        let (v, parsed) = dns_verdict(&rules, Some(&q));
+        let (v, parsed) = dns_verdict(&rules, &Config::seed(), Some(&q));
         assert_eq!(v, DnsVerdict::Proxy("v2ray".into()));
         assert_eq!(parsed.unwrap().name, "example.com");
         let q = dns_query("www.digikala.ir");
-        assert_eq!(dns_verdict(&rules, Some(&q)).0, DnsVerdict::Pass);
+        assert_eq!(
+            dns_verdict(&rules, &Config::seed(), Some(&q)).0,
+            DnsVerdict::Pass
+        );
         let mut cfg = Config::seed();
         for g in cfg.groups.iter_mut().filter(|g| g.catch_all) {
             g.action = q2route_core::config::Action::Block;
         }
         let block = RuleSet::compile(&cfg).unwrap();
         let q = dns_query("example.com");
-        assert_eq!(dns_verdict(&block, Some(&q)).0, DnsVerdict::Refuse);
+        assert_eq!(dns_verdict(&block, &cfg, Some(&q)).0, DnsVerdict::Refuse);
+    }
+
+    #[test]
+    fn proxy_host_query_goes_direct() {
+        let mut cfg = Config::seed();
+        cfg.proxies[0].host = "Proxy.Example.net".into();
+        let rules = RuleSet::compile(&cfg).unwrap();
+        for name in ["proxy.example.net", "PROXY.example.NET"] {
+            let q = dns_query(name);
+            assert_eq!(dns_verdict(&rules, &cfg, Some(&q)).0, DnsVerdict::ProxyHost);
+        }
+        let q = dns_query("other.example.net");
+        assert_eq!(
+            dns_verdict(&rules, &cfg, Some(&q)).0,
+            DnsVerdict::Proxy("v2ray".into())
+        );
     }
 
     #[test]
