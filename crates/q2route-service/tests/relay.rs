@@ -692,3 +692,388 @@ async fn empty_peek_disagreeing_names_most_protective() {
     assert_eq!(row.group_id.as_deref(), Some("blocked"));
     r.cancel.cancel();
 }
+
+// ---- DNS over TCP (port 53) through the relay ----
+
+const NINE: [u8; 4] = [9, 9, 9, 9];
+
+/// A standard query (RD) for `name`, type A.
+fn dns_query(id: u16, name: &str) -> Vec<u8> {
+    let mut m = id.to_be_bytes().to_vec();
+    m.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for l in name.split('.') {
+        m.push(l.len() as u8);
+        m.extend_from_slice(l.as_bytes());
+    }
+    m.extend_from_slice(&[0, 0, 1, 0, 1]);
+    m
+}
+
+/// The answer to `q` (uncompressed question): one A record, 9.9.9.9.
+fn dns_answer(q: &[u8]) -> Vec<u8> {
+    let mut end = 12;
+    while q[end] != 0 {
+        end += 1 + q[end] as usize;
+    }
+    end += 5;
+    let mut r = q[..end].to_vec();
+    r[2] |= 0x80;
+    r[3] = 0x80;
+    r[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
+    r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+    r.extend_from_slice(&NINE);
+    r
+}
+
+fn framed(m: &[u8]) -> Vec<u8> {
+    let mut f = (m.len() as u16).to_be_bytes().to_vec();
+    f.extend_from_slice(m);
+    f
+}
+
+async fn read_frame(s: &mut TcpStream) -> Vec<u8> {
+    let mut l = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut l))
+        .await
+        .expect("no reply")
+        .unwrap();
+    let mut m = vec![0u8; u16::from_be_bytes(l) as usize];
+    s.read_exact(&mut m).await.unwrap();
+    m
+}
+
+async fn recv_t<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out")
+        .unwrap()
+}
+
+/// Answers every length-prefixed query on `s` with A 9.9.9.9; reports each
+/// query.
+async fn serve_dns(mut s: TcpStream, seen: mpsc::UnboundedSender<Vec<u8>>) {
+    loop {
+        let mut l = [0u8; 2];
+        if s.read_exact(&mut l).await.is_err() {
+            return;
+        }
+        let mut q = vec![0u8; u16::from_be_bytes(l) as usize];
+        if s.read_exact(&mut q).await.is_err() {
+            return;
+        }
+        let _ = seen.send(q.clone());
+        if s.write_all(&framed(&dns_answer(&q))).await.is_err() {
+            return;
+        }
+    }
+}
+
+type DnsServer = (
+    SocketAddrV4,
+    Arc<AtomicUsize>,
+    mpsc::UnboundedReceiver<Vec<u8>>,
+);
+
+/// Mock DNS-over-TCP server on `ip:53` (a distinct loopback ip per test):
+/// counts accepts, reports queries.
+async fn dns_server(ip: &str) -> DnsServer {
+    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
+    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let count = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let c = count.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            c.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(serve_dns(s, tx.clone()));
+        }
+    });
+    (addr, count, rx)
+}
+
+fn http_profile(port: u16) -> ProxyProfile {
+    ProxyProfile {
+        kind: ProxyKind::Http,
+        ..socks_profile(port)
+    }
+}
+
+type ConnectDns = (
+    u16,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<Vec<u8>>,
+);
+
+/// Mock HTTP CONNECT proxy that is itself a DNS-over-TCP resolver behind
+/// the tunnel: reports each CONNECT target and each tunnelled query.
+async fn mock_connect_dns() -> ConnectDns {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (ttx, targets) = mpsc::unbounded_channel();
+    let (qtx, queries) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let (ttx, qtx) = (ttx.clone(), qtx.clone());
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let target = head.split(' ').nth(1).unwrap_or_default().to_string();
+                let _ = ttx.send(target);
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                serve_dns(s, qtx).await;
+            });
+        }
+    });
+    (port, targets, queries)
+}
+
+/// `*.ir` Direct, `bad.example` Block, catch-all Proxy("mock").
+fn dns_groups() -> Vec<Group> {
+    vec![
+        group("ir", Action::Direct, &["*.ir"], false),
+        group("bad", Action::Block, &["bad.example"], false),
+        group("rest", Action::Proxy("mock".into()), &[], true),
+    ]
+}
+
+async fn wait_row(c: &RelayCtx) -> q2route_core::ipc::ConnInfo {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(row) = c.conns.list().into_iter().next() {
+            return row;
+        }
+        assert!(Instant::now() < deadline, "flow never logged");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn names_of_nine(c: &RelayCtx) -> Vec<String> {
+    c.domains
+        .names("9.9.9.9".parse().unwrap(), std::time::Instant::now())
+}
+
+#[tokio::test]
+async fn tcp_dns_proxied_name_goes_to_resolver_via_proxy() {
+    let (orig, accepts, _) = dns_server("127.53.0.1").await;
+    let (pport, mut targets, mut queries) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.settings.dns.proxy_resolver = "8.8.4.4:53".into();
+    let c = ctx(cfg);
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x1234, "example.com");
+    client.write_all(&framed(&q)).await.unwrap();
+    let reply = read_frame(&mut client).await;
+    assert_eq!(&reply[..2], &[0x12, 0x34], "original id");
+    assert_eq!(reply, dns_answer(&q));
+    assert_eq!(recv_t(&mut targets).await, "8.8.4.4:53");
+    assert_eq!(recv_t(&mut queries).await, q);
+    // A second query on the same connection, same route: also via the proxy.
+    let q2 = dns_query(0x0042, "other.com");
+    client.write_all(&framed(&q2)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q2));
+    // Answers learned.
+    let names = names_of_nine(&c);
+    assert!(names.contains(&"example.com".to_string()), "{names:?}");
+    assert!(names.contains(&"other.com".to_string()), "{names:?}");
+    let row = wait_row(&c).await;
+    assert_eq!(row.domain.as_deref(), Some("example.com"));
+    assert_eq!(row.route, q2route_core::decide::Route::Proxy("mock".into()));
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "original server contacted"
+    );
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_direct_name_goes_to_original_server() {
+    let (orig, accepts, mut seen) = dns_server("127.53.0.2").await;
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let c = ctx(config(vec![http_profile(pport)], dns_groups()));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x0bad, "www.digikala.ir");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert!(targets.try_recv().is_err(), "went through the proxy");
+    let row = wait_row(&c).await;
+    assert_eq!(row.domain.as_deref(), Some("www.digikala.ir"));
+    assert_eq!(row.route, q2route_core::decide::Route::Direct);
+    assert_eq!(row.group_id.as_deref(), Some("ir"));
+    assert_eq!(names_of_nine(&c), vec!["www.digikala.ir".to_string()]);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_blocked_name_closes() {
+    let (orig, accepts, _) = dns_server("127.53.0.3").await;
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let c = ctx(config(vec![http_profile(pport)], dns_groups()));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client
+        .write_all(&framed(&dns_query(1, "bad.example")))
+        .await
+        .unwrap();
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    let row = wait_row(&c).await;
+    assert_eq!(row.domain.as_deref(), Some("bad.example"));
+    assert_eq!(row.route, q2route_core::decide::Route::Block);
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    assert!(targets.try_recv().is_err());
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_malformed_query_closes() {
+    let (orig, accepts, _) = dns_server("127.53.0.5").await;
+    let groups = vec![group("rest", Action::Direct, &[], true)];
+    let c = ctx(config(vec![], groups));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(&framed(b"not a dns query")).await.unwrap();
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_later_query_with_other_route_closes() {
+    let (orig, _, mut seen) = dns_server("127.53.0.6").await;
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let c = ctx(config(vec![http_profile(pport)], dns_groups()));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(1, "x.ir");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    // Same route (Direct): still served on this connection.
+    let q2 = dns_query(2, "y.ir");
+    client.write_all(&framed(&q2)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q2));
+    assert_eq!(recv_t(&mut seen).await, q2);
+    // Decides Proxy: must never reach the original server.
+    client
+        .write_all(&framed(&dns_query(3, "blocked.com")))
+        .await
+        .unwrap();
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        seen.try_recv().is_err(),
+        "proxied name sent to the original server"
+    );
+    assert!(targets.try_recv().is_err());
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_proxy_down_fails_closed() {
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let (orig, accepts, _) = dns_server("127.53.0.7").await;
+    let c = ctx(config(vec![socks_profile(dead_port)], dns_groups()));
+    let mut events = c.events.subscribe();
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client
+        .write_all(&framed(&dns_query(1, "example.com")))
+        .await
+        .unwrap();
+    assert_closed(&mut client, Duration::from_secs(6)).await;
+    let ev = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, Event::ProxyDown { id: "mock".into() });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0, "fell back to direct");
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_proxy_host_name_goes_direct() {
+    let (orig, accepts, mut seen) = dns_server("127.53.0.8").await;
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let mut p = http_profile(pport);
+    p.host = "proxy.example.net".into();
+    let c = ctx(config(vec![p], dns_groups()));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(7, "proxy.example.net");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert!(targets.try_recv().is_err());
+    assert_eq!(
+        wait_row(&c).await.route,
+        q2route_core::decide::Route::Direct
+    );
+    r.cancel.cancel();
+}
+
+/// Hands every injected packet to the test.
+struct ChanSink(mpsc::UnboundedSender<Vec<u8>>);
+
+impl q2route_service::udp_relay::InboundSink for ChanSink {
+    fn inject(&self, pkt: Vec<u8>, _addr: &q2route_service::windivert::Address) {
+        let _ = self.0.send(pkt);
+    }
+}
+
+#[tokio::test]
+async fn udp_unavailable_answers_tc_then_tcp_resolves_via_proxy() {
+    use q2route_service::dns_proxy::{DnsProxy, DnsProxyConfig, DnsQuery};
+    let (orig, accepts, _) = dns_server("127.53.0.4").await;
+    let (pport, mut targets, mut queries) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.settings.dns.proxy_resolver = "8.8.4.4:53".into();
+    let c = ctx(cfg);
+    let (tx, mut injected) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let dns = DnsProxy::new(
+        c.clone(),
+        Arc::new(ChanSink(tx)),
+        cancel.clone(),
+        DnsProxyConfig::default(),
+    );
+    let q = dns_query(0x5151, "example.com");
+    // UDP: an HTTP-only profile has no UDP association -> empty TC answer.
+    dns.submit(DnsQuery {
+        profile: "mock".into(),
+        app: "10.0.0.5:50000".parse().unwrap(),
+        server: SocketAddr::V4(orig),
+        msg: q.clone(),
+        addr: Default::default(),
+    });
+    let pkt = recv_t(&mut injected).await;
+    let tc = &pkt[28..];
+    assert_eq!(&tc[..2], &[0x51, 0x51]);
+    assert_ne!(tc[2] & 0x02, 0, "TC bit set");
+    // The client retries over TCP: resolved through the CONNECT proxy.
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut targets).await, "8.8.4.4:53");
+    assert_eq!(recv_t(&mut queries).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    r.cancel.cancel();
+    cancel.cancel();
+}

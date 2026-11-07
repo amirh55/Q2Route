@@ -11,6 +11,8 @@
 //!   injected reply from the real IP) is dropped; any other passes as before.
 //!   UDP/53 queries are routed by the queried name ([`dns_verdict`]):
 //!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped.
+//!   IPv4 TCP/53 is redirected to the relay, which routes it by name; IPv6
+//!   TCP/53 is passed untouched (M4 gap).
 //! * DNS answers (sniff only): inbound UDP from port 53 feeds the IP -> names
 //!   map that lets domain rules decide flows without a peek.
 
@@ -292,9 +294,8 @@ fn route_packet(
     if f.proto == PROTO_UDP && f.remote.port() == 53 {
         return dns_packet(pkt, addr, &f, shared, run, dns);
     }
-    // M4 Task 4 replaces this: until then TCP/53 behaves exactly as before
-    // (passed through untouched).
-    if f.proto == PROTO_TCP && f.remote.port() == 53 {
+    // M4 gap (no IPv6 relay until M6): IPv6 TCP/53 is passed untouched.
+    if ipv6_tcp_dns(&f) {
         return Out::Send;
     }
     let tcp4 = f.proto == PROTO_TCP && f.local.is_ipv4();
@@ -308,8 +309,16 @@ fn route_packet(
             .nat
             .get(f.local.port())
             .is_some_and(|o| SocketAddr::V4(o.dst) == f.remote);
+    // IPv4 TCP/53 is decided by the queried name in the relay.
+    let tcp_dns = tcp4 && f.remote.port() == 53;
     let action = classify(&m, own_port, shared.own_pid, &run.cache, nat_has, || {
-        decide_flow(shared, run, &f)
+        if tcp_dns {
+            let pid = lookup_pid(run, &f);
+            let own = pid == shared.own_pid || shared.proxy_endpoints.load().contains(&f.remote);
+            tcp_dns_decision(pid, own)
+        } else {
+            decide_flow(shared, run, &f)
+        }
     });
     match action {
         Action::Pass => Out::Send,
@@ -358,6 +367,24 @@ fn route_packet(
 }
 
 const PROTO_ICMP: u8 = 1;
+
+/// IPv6 TCP to port 53: always Direct in M4 (documented gap; there is no
+/// IPv6 relay to route it by name).
+fn ipv6_tcp_dns(f: &FlowId) -> bool {
+    f.proto == PROTO_TCP && f.remote.port() == 53 && f.remote.is_ipv6()
+}
+
+/// The decision for an IPv4 TCP/53 flow: the service's own sockets and
+/// proxy endpoints (`own`) are Direct; every other flow is NeedDomain, so
+/// its SYN is redirected to the relay (cached non-Direct, like a proxied
+/// flow), which routes it by the queried name ([`crate::relay`]).
+fn tcp_dns_decision(pid: u32, own: bool) -> (u32, Decision) {
+    if own {
+        (pid, direct(MatchReason::ExcludedPid))
+    } else {
+        (pid, Decision::NeedDomain)
+    }
+}
 
 /// For an IPv4 ICMP destination unreachable (type 3) quoting an IPv4/UDP
 /// packet: the quoted UDP destination port (the local port the triggering
@@ -661,6 +688,7 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::Cached;
     use crate::windivert::{check_filter, Layer};
 
     #[test]
@@ -844,6 +872,73 @@ mod tests {
         );
         learn_answers(&map, &pkt[..30], now);
         assert_eq!(map.len(), 1);
+    }
+
+    fn tcp_meta(remote: &str, syn: bool) -> crate::classify::PktMeta {
+        crate::classify::PktMeta {
+            flow: FlowId {
+                proto: PROTO_TCP,
+                local: if remote.starts_with('[') {
+                    "[2001:db8::2]:50000".parse().unwrap()
+                } else {
+                    "10.0.0.2:50000".parse().unwrap()
+                },
+                remote: remote.parse().unwrap(),
+            },
+            syn,
+            rst: false,
+            syn_ack: false,
+        }
+    }
+
+    #[test]
+    fn tcp_dns_v4_syn_goes_to_relay_and_stays_there() {
+        const OWN: u32 = 7;
+        let cache = FlowCache::default();
+        let syn = tcp_meta("8.8.8.8:53", true);
+        let a = classify(&syn, false, OWN, &cache, false, || {
+            tcp_dns_decision(4242, false)
+        });
+        assert_eq!(a, Action::NewRedirect { pid: 4242 });
+        assert_eq!(cache.get(&syn.flow), Some(Cached::Other));
+        // Later packets of the flow follow the NAT entry, never direct.
+        let data = tcp_meta("8.8.8.8:53", false);
+        let never = || -> (u32, Decision) { panic!("re-decided") };
+        assert_eq!(
+            classify(&data, false, OWN, &cache, true, never),
+            Action::Redirect
+        );
+        assert_eq!(
+            classify(&data, false, OWN, &cache, false, never),
+            Action::Reset
+        );
+        // A flow that predates Q2Route (no SYN seen): reset, not passed.
+        let old = FlowCache::default();
+        assert_eq!(
+            classify(&data, false, OWN, &old, false, || tcp_dns_decision(
+                1, false
+            )),
+            Action::Reset
+        );
+        // The service's own (and proxy endpoints): Direct.
+        let own = FlowCache::default();
+        assert_eq!(
+            classify(&syn, false, OWN, &own, false, || tcp_dns_decision(
+                OWN, true
+            )),
+            Action::Pass
+        );
+    }
+
+    #[test]
+    fn tcp_dns_ipv6_stays_direct_m4_gap() {
+        // M4 gap (M6 adds an IPv6 relay): IPv6 TCP/53 is passed untouched.
+        assert!(ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:53", true).flow));
+        assert!(!ipv6_tcp_dns(&tcp_meta("8.8.8.8:53", true).flow));
+        assert!(!ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:443", true).flow));
+        let mut udp = tcp_meta("[2001:db8::53]:53", false).flow;
+        udp.proto = PROTO_UDP;
+        assert!(!ipv6_tcp_dns(&udp));
     }
 
     #[test]
