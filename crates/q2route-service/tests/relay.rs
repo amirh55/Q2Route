@@ -1,10 +1,10 @@
 //! Relay tests: localhost mocks, with `RuleSet::lan_direct = false` so that
 //! loopback destinations are routed by the rules under test.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -111,6 +111,28 @@ fn config(proxies: Vec<ProxyProfile>, groups: Vec<Group>) -> Config {
     }
 }
 
+/// Original destination -> the mock server's real address. The relay's
+/// direct connects (in every test `ctx`) dial through this map, so a NAT
+/// entry can name e.g. `127.53.0.2:53` (keeping the port-53 DNS branch)
+/// while the mock listens on `127.0.0.1:<ephemeral>`: connects to loopback
+/// addresses other than 127.0.0.1 are not reliable on every machine.
+static DIALS: LazyLock<Mutex<HashMap<SocketAddr, SocketAddr>>> = LazyLock::new(Default::default);
+
+/// Binds a mock server on 127.0.0.1 standing in for `orig` (`ip:53`).
+async fn bind_as(ip: &str) -> (SocketAddrV4, TcpListener) {
+    let orig: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    DIALS
+        .lock()
+        .unwrap()
+        .insert(orig.into(), l.local_addr().unwrap());
+    (orig, l)
+}
+
+fn dial(dst: SocketAddr) -> SocketAddr {
+    DIALS.lock().unwrap().get(&dst).copied().unwrap_or(dst)
+}
+
 fn ctx(cfg: Config) -> Arc<RelayCtx> {
     let mut rules = RuleSet::compile(&cfg).unwrap();
     rules.lan_direct = false;
@@ -128,6 +150,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
         proxy_servers: ArcSwap::from_pointee(vec![]),
+        direct_dial_override: Some(Arc::new(dial)),
     })
 }
 
@@ -465,6 +488,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
         proxy_servers: ArcSwap::from_pointee(vec![]),
+        direct_dial_override: c.direct_dial_override.clone(),
     });
     let r = start(v4(origin), c).await;
     let mut client = TcpStream::connect(r.addr).await.unwrap();
@@ -776,11 +800,10 @@ type DnsServer = (
     mpsc::UnboundedReceiver<Vec<u8>>,
 );
 
-/// Mock DNS-over-TCP server on `ip:53` (a distinct loopback ip per test):
-/// counts accepts, reports queries.
+/// Mock DNS-over-TCP server standing in for `ip:53` (a distinct ip per
+/// test, see [`bind_as`]): counts accepts, reports queries.
 async fn dns_server(ip: &str) -> DnsServer {
-    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as(ip).await;
     let count = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::unbounded_channel();
     let c = count.clone();
@@ -939,10 +962,10 @@ async fn tcp_dns_blocked_name_closes() {
     r.cancel.cancel();
 }
 
-/// Echo server on `ip:53` (a non-DNS service on port 53): counts accepts.
+/// Echo server standing in for `ip:53` (a non-DNS service on port 53):
+/// counts accepts.
 async fn echo_53(ip: &str) -> (SocketAddrV4, Arc<AtomicUsize>) {
-    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as(ip).await;
     let count = Arc::new(AtomicUsize::new(0));
     let c = count.clone();
     tokio::spawn(async move {
@@ -1042,8 +1065,7 @@ async fn tcp_dns_partial_frame_closes() {
 /// queries forwarded on it (same id and name).
 #[tokio::test]
 async fn tcp_dns_answers_for_names_never_asked_are_not_learned() {
-    let addr: SocketAddrV4 = "127.53.0.16:53".parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as("127.53.0.16").await;
     tokio::spawn(async move {
         let (mut s, _) = l.accept().await.unwrap();
         let mut len = [0u8; 2];

@@ -105,6 +105,7 @@ impl Engine {
             proxy_down: DashSet::new(),
             domains: Arc::new(DomainMap::new()),
             proxy_servers: ArcSwap::from_pointee(Vec::new()),
+            direct_dial_override: None,
         });
         let shared = Arc::new(Shared {
             relay,

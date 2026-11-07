@@ -108,7 +108,14 @@ pub struct RelayCtx {
     /// Server names detected from the running proxy client's config
     /// (refreshed by the engine): their DNS queries are resolved directly.
     pub proxy_servers: ArcSwap<Vec<String>>,
+    /// Test hook: maps an original destination to the address a direct
+    /// connect actually dials (mock servers on 127.0.0.1). `None` in
+    /// production.
+    pub direct_dial_override: Option<DialOverride>,
 }
+
+/// See [`RelayCtx::direct_dial_override`].
+pub type DialOverride = Arc<dyn Fn(SocketAddr) -> SocketAddr + Send + Sync>;
 
 /// Production idle timeout of a relayed connection.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -402,6 +409,7 @@ async fn connect_direct(ctx: &RelayCtx, dst: SocketAddr) -> io::Result<(TcpStrea
         ports: &ctx.own_ports,
         port,
     };
+    let dst = ctx.direct_dial_override.as_ref().map_or(dst, |f| f(dst));
     let up = sock.connect(dst).await?;
     Ok((up, own))
 }

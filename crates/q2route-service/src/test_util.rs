@@ -75,6 +75,7 @@ pub fn ctx(cfg: Config) -> Arc<RelayCtx> {
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
         proxy_servers: ArcSwap::from_pointee(vec![]),
+        direct_dial_override: None,
     })
 }
 
