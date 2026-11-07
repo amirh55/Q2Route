@@ -469,6 +469,18 @@ impl Inner {
                 let _ = self.relay().events.send(ev);
                 Response::ProxyTest(res)
             }
+            Request::SetDns(d) => {
+                let r = self.apply(|c| c.set_dns(d)).await;
+                if matches!(r, Response::Ok) {
+                    // Cached answers came from the old resolver setup.
+                    let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
+                }
+                r
+            }
+            Request::FlushDns => {
+                let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
+                Response::Ok
+            }
             // The pipe server answers Subscribe itself (via `subscribe`).
             Request::Subscribe => Response::Ok,
         }

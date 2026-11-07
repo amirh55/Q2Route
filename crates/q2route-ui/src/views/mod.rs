@@ -2,6 +2,7 @@
 
 pub mod connections;
 pub mod dashboard;
+pub mod dns;
 pub mod groups;
 pub mod placeholder;
 pub mod proxies;

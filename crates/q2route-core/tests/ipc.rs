@@ -183,3 +183,17 @@ fn proxy_test_result_without_udp_ok_decodes() {
         serde_json::from_str(r#"{"tcp_ok":true,"latency_ms":5,"error":null}"#).unwrap();
     assert_eq!(r.udp_ok, None);
 }
+
+#[test]
+fn set_dns_and_flush_roundtrip() {
+    for r in [
+        Request::SetDns(q2route_core::config::DnsSettings {
+            proxy_resolver: "9.9.9.9:53".into(),
+            block_doh: false,
+        }),
+        Request::FlushDns,
+    ] {
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
+    }
+}

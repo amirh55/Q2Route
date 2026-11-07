@@ -1,6 +1,8 @@
 //! UI <-> service IPC: u32-LE length-prefixed JSON frames over a named pipe.
 
-use crate::config::{Action, Config, GroupId, ProfileId, Protocol, ProxyProfile, Rule};
+use crate::config::{
+    Action, Config, DnsSettings, GroupId, ProfileId, Protocol, ProxyProfile, Rule,
+};
 use crate::decide::Route;
 use crate::proxy::ProxyTestResult;
 use serde::de::DeserializeOwned;
@@ -33,6 +35,8 @@ pub enum Request {
     AddRule { group_id: GroupId, rule: Rule },
     GetConnections,
     ListProcesses,
+    SetDns(DnsSettings),
+    FlushDns,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
