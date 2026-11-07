@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Action, Config, Group, ProxyKind, ProxyProfile, Rule, Settings};
+use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::ruleset::RuleSet;
@@ -125,6 +126,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         events,
         idle_timeout: Duration::from_secs(7200),
         proxy_down: DashSet::new(),
+        domains: Arc::new(DomainMap::new()),
     })
 }
 
@@ -460,6 +462,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         own_ports: c.own_ports.clone(),
         events: c.events.clone(),
         proxy_down: DashSet::new(),
+        domains: Arc::new(DomainMap::new()),
     });
     let r = start(v4(origin), c).await;
     let mut client = TcpStream::connect(r.addr).await.unwrap();
@@ -613,5 +616,39 @@ async fn relayed_connection_is_listed_with_bytes() {
         assert!(Instant::now() < deadline, "connection never ended");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn empty_peek_uses_dns_mapped_names() {
+    // 127.0.0.1:443 with lan_direct off: only the rules decide. Nothing in
+    // the first bytes names a host, but DNS answered 127.0.0.1 for x.ir.
+    let cfg = config(
+        vec![],
+        vec![
+            group("ir", Action::Direct, &["*.ir"], false),
+            group("rest", Action::Block, &[], true),
+        ],
+    );
+    let c = ctx(cfg);
+    c.domains.insert(
+        "127.0.0.1".parse().unwrap(),
+        "x.ir",
+        300,
+        std::time::Instant::now(),
+    );
+    let r = start("127.0.0.1:443".parse().unwrap(), c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"not tls\r\n\r\n").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let row = loop {
+        if let Some(row) = c.conns.list().into_iter().next() {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "flow never decided");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(row.route, q2route_core::decide::Route::Direct);
+    assert_eq!(row.group_id.as_deref(), Some("ir"));
     r.cancel.cancel();
 }

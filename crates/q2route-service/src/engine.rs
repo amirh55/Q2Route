@@ -17,6 +17,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ConfigError, ProfileId};
+use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::{Event, ProcEntry, Request, Response, StateSnapshot};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::test_proxy;
@@ -26,11 +27,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::conns::ConnLog;
+use crate::dns_proxy::{DnsProxy, DnsProxyConfig};
 use crate::geo::GeoCache;
 use crate::ipc_server::{BoxFuture, Control};
 use crate::packet_loop::{
-    network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared, NETWORK_FILTER,
-    NETWORK_THREADS, SOCKET_FILTER,
+    dns_sniff_loop, network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared,
+    DNS_SNIFF_FILTER, NETWORK_FILTER, NETWORK_THREADS, SOCKET_FILTER,
 };
 use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
@@ -74,6 +76,9 @@ struct Running {
     threads: Vec<std::thread::JoinHandle<()>>,
     relay: JoinHandle<std::io::Result<()>>,
     udp: Arc<UdpRelay>,
+    dns: Arc<DnsProxy>,
+    /// Sniff-only DNS answer handle.
+    sniff: Arc<Handle>,
 }
 
 impl Engine {
@@ -97,6 +102,7 @@ impl Engine {
             events,
             idle_timeout: RELAY_IDLE_TIMEOUT,
             proxy_down: DashSet::new(),
+            domains: Arc::new(DomainMap::new()),
         });
         let shared = Arc::new(Shared {
             relay,
@@ -184,19 +190,29 @@ impl Inner {
         let relay_port = listener.local_addr()?.port();
         let state = Arc::new(RunState::new(relay_port));
 
-        // Socket layer first so the flow tables fill before packets are held.
-        let (sock, net) = tokio::task::spawn_blocking(|| -> std::io::Result<_> {
+        // Socket layer first so the flow tables fill before packets are held;
+        // the DNS answer sniffer after the Network layer.
+        let (sock, net, sniff) = tokio::task::spawn_blocking(|| -> std::io::Result<_> {
             let sock = Handle::open(SOCKET_FILTER, Layer::Socket, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?;
             let net = Handle::open(NETWORK_FILTER, Layer::Network, 0, 0)?;
-            Ok((Arc::new(sock), Arc::new(net)))
+            let sniff = Handle::open(
+                DNS_SNIFF_FILTER,
+                Layer::Network,
+                0,
+                FLAG_SNIFF | FLAG_RECV_ONLY,
+            )?;
+            Ok((Arc::new(sock), Arc::new(net), Arc::new(sniff)))
         })
         .await??;
 
         let cancel = CancellationToken::new();
-        let udp = UdpRelay::new(
+        let sink = Arc::new(NetworkSink(net.clone()));
+        let udp = UdpRelay::new(self.relay().clone(), sink.clone(), cancel.clone());
+        let dns = DnsProxy::new(
             self.relay().clone(),
-            Arc::new(NetworkSink(net.clone())),
+            sink,
             cancel.clone(),
+            DnsProxyConfig::default(),
         );
         let mut threads = Vec::new();
         let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
@@ -214,20 +230,36 @@ impl Inner {
         )
         .map(|t| threads.push(t));
         for i in 0..NETWORK_THREADS {
-            let (h, sh, s, u) = (net.clone(), self.shared.clone(), state.clone(), udp.clone());
+            let (h, sh, s, u, d) = (
+                net.clone(),
+                self.shared.clone(),
+                state.clone(),
+                udp.clone(),
+                dns.clone(),
+            );
             spawned = spawned.and_then(|()| {
                 spawn(
                     format!("q2r-net-{i}"),
-                    Box::new(move || network_loop(h, sh, s, u)),
+                    Box::new(move || network_loop(h, sh, s, u, d)),
                 )
                 .map(|t| threads.push(t))
             });
         }
+        let (h, m, s) = (sniff.clone(), self.relay().domains.clone(), state.clone());
+        spawned = spawned.and_then(|()| {
+            spawn(
+                "q2r-dns-sniff".into(),
+                Box::new(move || dns_sniff_loop(h, m, s)),
+            )
+            .map(|t| threads.push(t))
+        });
         if let Err(e) = spawned {
             // Unwind: the threads already running exit once the handles shut down.
             state.stopping.store(true, Ordering::SeqCst);
             cancel.cancel();
             udp.wait().await;
+            dns.wait().await;
+            sniff.shutdown();
             net.shutdown();
             sock.shutdown();
             return Err(e.into());
@@ -252,6 +284,8 @@ impl Inner {
             threads,
             relay,
             udp,
+            dns,
+            sniff,
         });
         self.running.store(true, Ordering::SeqCst);
         tracing::info!("routing started (relay port {relay_port})");
@@ -263,7 +297,7 @@ impl Inner {
         let Some(r) = run.take() else { return Ok(()) };
         // 1. Close every proxied connection (the relay's FIN/RST is still
         //    restored to the apps while capture is up) and every UDP
-        //    session (control connections closed).
+        //    session and DNS association (control connections closed).
         r.cancel.cancel();
         match r.relay.await {
             Ok(Err(e)) => tracing::warn!("relay ended with error: {e}"),
@@ -271,9 +305,11 @@ impl Inner {
             Ok(Ok(())) => {}
         }
         r.udp.wait().await;
+        r.dns.wait().await;
         tokio::time::sleep(STOP_DRAIN).await;
         // 2. Close capture: from here on everything is direct.
         r.state.stopping.store(true, Ordering::SeqCst);
+        r.sniff.shutdown();
         r.net.shutdown();
         r.sock.shutdown();
         let threads = r.threads;
@@ -283,7 +319,7 @@ impl Inner {
             }
         });
         let _ = joined.await;
-        drop((r.net, r.sock));
+        drop((r.sniff, r.net, r.sock));
         *mutex(&self.current) = None;
         let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
         self.running.store(false, Ordering::SeqCst);

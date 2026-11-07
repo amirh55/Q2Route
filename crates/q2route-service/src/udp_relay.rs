@@ -613,7 +613,7 @@ impl Session {
 /// UDP socket bound to 0.0.0.0:0 (or [::]:0 for an IPv6 relay) and
 /// connected to the proxy's relay, so only datagrams from the relay are
 /// accepted.
-async fn bind_relay_socket(a: &UdpAssociation) -> std::io::Result<UdpSocket> {
+pub(crate) async fn bind_relay_socket(a: &UdpAssociation) -> std::io::Result<UdpSocket> {
     let bind = if a.relay.is_ipv6() {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
     } else {

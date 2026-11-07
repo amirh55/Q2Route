@@ -9,26 +9,37 @@
 //!   Outbound ICMPv4 destination-unreachable is captured too: one quoting a
 //!   UDP packet to a port the UDP relay serves (the stack answering an
 //!   injected reply from the real IP) is dropped; any other passes as before.
+//!   UDP/53 queries are routed by the queried name ([`dns_verdict`]):
+//!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped.
+//! * DNS answers (sniff only): inbound UDP from port 53 feeds the IP -> names
+//!   map that lets domain rules decide flows without a peek.
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use q2route_core::config::Protocol;
-use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, MatchReason, Route};
+use q2route_core::config::{Action as GroupAction, ProfileId, Protocol};
+use q2route_core::decide::{
+    decide_dns, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
+};
+use q2route_core::dns::{answers, parse_query, refused, Query};
+use q2route_core::domain_map::DomainMap;
 use q2route_core::process_tree::ProcessTree;
+use q2route_core::ruleset::RuleSet;
 use q2route_core::suggest::reason_text;
 
 use crate::classify::{
     build_rst_to_app, classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP,
 };
 use crate::conns::{ConnLog, NewConn};
+use crate::dns_proxy::{DnsProxy, DnsQuery};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
+use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
 use crate::udp_relay::{Datagram, InboundSink, UdpRelay};
 use crate::winapi;
 use crate::windivert::{
@@ -40,6 +51,8 @@ pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event ==
      or (udp and event == BIND) or (tcp and event == ACCEPT)";
 pub const NETWORK_FILTER: &str =
     "outbound and !loopback and ((tcp or udp) or (icmp and icmp.Type == 3))";
+/// Sniff-only handle: DNS answers arriving from the network.
+pub const DNS_SNIFF_FILTER: &str = "inbound and !loopback and udp.SrcPort == 53";
 /// Threads receiving from the Network-layer handle.
 pub const NETWORK_THREADS: usize = 4;
 /// Ancestors refreshed on demand for an unknown pid (Ruling R5).
@@ -183,7 +196,13 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp:
     }
 }
 
-pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>, udp: Arc<UdpRelay>) {
+pub fn network_loop(
+    h: Arc<Handle>,
+    shared: Arc<Shared>,
+    run: Arc<RunState>,
+    udp: Arc<UdpRelay>,
+    dns: Arc<DnsProxy>,
+) {
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
         let (n, mut addr) = match h.recv(&mut buf) {
@@ -192,7 +211,7 @@ pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>, udp
             Err(_) => return,
         };
         let pkt = &mut buf[..n];
-        match route_packet(pkt, &mut addr, &shared, &run, &udp) {
+        match route_packet(pkt, &mut addr, &shared, &run, &udp, &dns) {
             Out::Send => {
                 if let Err(e) = h.send(pkt, &addr) {
                     tracing::debug!("reinject failed: {e}");
@@ -212,6 +231,8 @@ pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>, udp
                     tracing::debug!("rst inject failed: {e}");
                 }
             }
+            // The packet is dropped; the reply goes inbound to the app.
+            Out::Inject(reply) => NetworkSink(h.clone()).inject(reply, &addr),
         }
     }
 }
@@ -224,6 +245,8 @@ enum Out {
     Drop,
     /// Drop it and inject an RST toward the app.
     ResetApp,
+    /// Drop it and inject this (complete) packet inbound toward the app.
+    Inject(Vec<u8>),
 }
 
 impl From<bool> for Out {
@@ -239,13 +262,15 @@ impl From<bool> for Out {
 /// Decides one captured packet; may rewrite it (NAT). Every `Send` comes
 /// from: an inbound packet (never captured by the filter), a restored relay
 /// reply, a NAT-rewritten packet, or `classify` returning `Pass` (Direct
-/// flow / own socket). `ResetApp` never sends the packet itself.
+/// flow / own socket), or a UDP/53 query whose name decides Direct (or the
+/// service's own). `ResetApp` / `Inject` never send the packet itself.
 fn route_packet(
     pkt: &mut [u8],
     addr: &mut Address,
     shared: &Shared,
     run: &RunState,
     udp: &UdpRelay,
+    dns: &DnsProxy,
 ) -> Out {
     if !addr.outbound() {
         return Out::Send;
@@ -264,9 +289,12 @@ fn route_packet(
         return Out::Drop;
     };
     let f = m.flow;
-    // M4 Task 3 replaces this (UDP); Task 4 (TCP): until the DNS path lands,
-    // port 53 behaves exactly as before (passed through untouched).
-    if (f.proto == PROTO_UDP || f.proto == PROTO_TCP) && f.remote.port() == 53 {
+    if f.proto == PROTO_UDP && f.remote.port() == 53 {
+        return dns_packet(pkt, addr, &f, shared, run, dns);
+    }
+    // M4 Task 4 replaces this: until then TCP/53 behaves exactly as before
+    // (passed through untouched).
+    if f.proto == PROTO_TCP && f.remote.port() == 53 {
         return Out::Send;
     }
     let tcp4 = f.proto == PROTO_TCP && f.local.is_ipv4();
@@ -375,6 +403,135 @@ fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
     p.get(ihl + 8..ihl + udp_len)
 }
 
+/// UDP payload of an IPv4 or IPv6 UDP packet. IPv6 with extension headers
+/// is not parsed (`None`: treated as malformed by the DNS path).
+fn udp_payload(p: &[u8]) -> Option<&[u8]> {
+    match *p.first()? >> 4 {
+        4 if p.get(9) == Some(&PROTO_UDP) => udp4_payload(p),
+        6 if p.get(6) == Some(&PROTO_UDP) => {
+            let total = 40 + usize::from(u16::from_be_bytes([*p.get(4)?, *p.get(5)?]));
+            let udp_len = usize::from(u16::from_be_bytes([*p.get(44)?, *p.get(45)?]));
+            if udp_len < 8 || 40 + udp_len > total.min(p.len()) {
+                return None;
+            }
+            p.get(48..40 + udp_len)
+        }
+        _ => None,
+    }
+}
+
+/// What the DNS rules do with a UDP/53 query.
+#[derive(Debug, PartialEq, Eq)]
+enum DnsVerdict {
+    /// Send it to the server the app asked.
+    Pass,
+    Drop,
+    /// Answer REFUSED.
+    Refuse,
+    /// Resolve through this profile's proxy ([`DnsProxy`]).
+    Proxy(ProfileId),
+}
+
+/// Routes a UDP/53 payload by its queried name ([`decide_dns`]). A payload
+/// that is not a single-question query only passes when the catch-all is
+/// Direct (it could carry a proxied name), else it is dropped.
+fn dns_verdict<'a>(rules: &RuleSet, msg: Option<&'a [u8]>) -> (DnsVerdict, Option<Query<'a>>) {
+    let Some(q) = msg.and_then(parse_query) else {
+        let direct = rules
+            .groups
+            .iter()
+            .find(|g| g.catch_all)
+            .is_some_and(|g| g.action == GroupAction::Direct);
+        let v = if direct {
+            DnsVerdict::Pass
+        } else {
+            DnsVerdict::Drop
+        };
+        return (v, None);
+    };
+    let v = match decide_dns(rules, &q.name).0 {
+        Route::Direct => DnsVerdict::Pass,
+        Route::Block => DnsVerdict::Refuse,
+        Route::Proxy(id) => DnsVerdict::Proxy(id),
+    };
+    (v, Some(q))
+}
+
+/// An outbound UDP/53 packet: the service's own (and anything to a proxy
+/// endpoint) passes; everything else is routed by the queried name only.
+fn dns_packet(
+    pkt: &[u8],
+    addr: &Address,
+    f: &FlowId,
+    shared: &Shared,
+    run: &RunState,
+    dns: &DnsProxy,
+) -> Out {
+    if shared.proxy_endpoints.load().contains(&f.remote) || lookup_pid(run, f) == shared.own_pid {
+        return Out::Send;
+    }
+    let msg = udp_payload(pkt);
+    let (v, q) = dns_verdict(&shared.relay.rules.load(), msg);
+    let via = match &v {
+        DnsVerdict::Pass => "direct".to_string(),
+        DnsVerdict::Drop => "drop".to_string(),
+        DnsVerdict::Refuse => "block".to_string(),
+        DnsVerdict::Proxy(id) => format!("proxy '{id}'"),
+    };
+    match &q {
+        Some(q) => tracing::debug!("dns name={} type={} via={via}", q.name, q.qtype),
+        None => tracing::debug!("dns malformed query {} -> {} via={via}", f.local, f.remote),
+    }
+    let msg = msg.unwrap_or_default();
+    match v {
+        DnsVerdict::Pass => Out::Send,
+        DnsVerdict::Drop => Out::Drop,
+        DnsVerdict::Refuse => {
+            let reply = refused(msg).and_then(|r| match (f.remote, f.local) {
+                (SocketAddr::V4(s), SocketAddr::V4(a)) => build_inbound_udp(s, a, &r).ok(),
+                (SocketAddr::V6(s), SocketAddr::V6(a)) => build_inbound_udp6(s, a, &r).ok(),
+                _ => None,
+            });
+            reply.map_or(Out::Drop, Out::Inject)
+        }
+        DnsVerdict::Proxy(profile) => {
+            dns.submit(DnsQuery {
+                profile,
+                app: f.local,
+                server: f.remote,
+                msg: msg.to_vec(),
+                addr: *addr,
+            });
+            Out::Drop
+        }
+    }
+}
+
+/// Learns names from one sniffed inbound DNS answer packet.
+fn learn_answers(domains: &DomainMap, pkt: &[u8], now: Instant) {
+    let Some(msg) = udp_payload(pkt) else { return };
+    let (Some(name), ips) = answers(msg) else {
+        return;
+    };
+    for (ip, ttl) in ips {
+        domains.insert(ip, &name, ttl, now);
+    }
+}
+
+/// Sniff-only loop over inbound DNS answers (never reinjects: the handle is
+/// `FLAG_SNIFF | FLAG_RECV_ONLY`). Ends when the handle shuts down on stop.
+pub fn dns_sniff_loop(h: Arc<Handle>, domains: Arc<DomainMap>, run: Arc<RunState>) {
+    let mut buf = vec![0u8; MAX_PACKET];
+    loop {
+        let n = match h.recv(&mut buf) {
+            Ok((n, _)) => n,
+            Err(e) if keep_going(&run, "dns sniff", &e) => continue,
+            Err(_) => return,
+        };
+        learn_answers(&domains, &buf[..n], Instant::now());
+    }
+}
+
 /// Ruling R14: FlowTable by (local, remote) -> by local -> OS socket table
 /// by local port -> 0 (no app rule matches pid 0: catch-all, the safe side).
 fn lookup_pid(run: &RunState, f: &FlowId) -> u32 {
@@ -444,10 +601,13 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
         dst: f.remote,
         domain: None,
     };
+    // Names DNS answered for this destination (the flow itself carries none
+    // at the packet layer); taken before the tree lock.
+    let names = shared.relay.domains.names(f.remote.ip(), Instant::now());
     let rules = shared.relay.rules.load();
     let excluded = shared.relay.excluded.load();
     let tree = shared.relay.tree.read().unwrap_or_else(|e| e.into_inner());
-    let d = decide(&rules, &tree, &excluded, &info);
+    let d = decide_mapped(&rules, &tree, &excluded, &info, &names);
     // One line per decided flow (decide_flow runs only when the flow cache
     // cannot answer). LAN / DNS / NTP flows are frequent and uninteresting.
     let proto_name = if proto == Protocol::Tcp { "tcp" } else { "udp" };
@@ -491,6 +651,7 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
 mod tests {
     use super::*;
     use crate::windivert::{check_filter, Layer};
+    use q2route_core::config::Config;
 
     #[test]
     fn udp4_payload_slices_after_header() {
@@ -555,10 +716,103 @@ mod tests {
         assert_eq!(icmp_quoted_udp_dst_port(&udp), None);
     }
 
+    fn seed_rules() -> RuleSet {
+        RuleSet::compile(&Config::seed()).unwrap()
+    }
+
+    /// A standard query (RD) for `name`, type A.
+    fn dns_query(name: &str) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in name.split('.') {
+            m.push(l.len() as u8);
+            m.extend_from_slice(l.as_bytes());
+        }
+        m.extend_from_slice(&[0, 0, 1, 0, 1]);
+        m
+    }
+
+    #[test]
+    fn malformed_query_dropped_when_catch_all_proxied() {
+        let rules = seed_rules();
+        assert_eq!(dns_verdict(&rules, Some(b"garbage")).0, DnsVerdict::Drop);
+        assert_eq!(dns_verdict(&rules, None).0, DnsVerdict::Drop);
+        let mut cfg = Config::seed();
+        for g in cfg.groups.iter_mut().filter(|g| g.catch_all) {
+            g.action = q2route_core::config::Action::Direct;
+        }
+        let direct = RuleSet::compile(&cfg).unwrap();
+        assert_eq!(dns_verdict(&direct, Some(b"garbage")).0, DnsVerdict::Pass);
+    }
+
+    #[test]
+    fn dns_query_routed_by_name() {
+        let rules = seed_rules();
+        let q = dns_query("example.com");
+        let (v, parsed) = dns_verdict(&rules, Some(&q));
+        assert_eq!(v, DnsVerdict::Proxy("v2ray".into()));
+        assert_eq!(parsed.unwrap().name, "example.com");
+        let q = dns_query("www.digikala.ir");
+        assert_eq!(dns_verdict(&rules, Some(&q)).0, DnsVerdict::Pass);
+        let mut cfg = Config::seed();
+        for g in cfg.groups.iter_mut().filter(|g| g.catch_all) {
+            g.action = q2route_core::config::Action::Block;
+        }
+        let block = RuleSet::compile(&cfg).unwrap();
+        let q = dns_query("example.com");
+        assert_eq!(dns_verdict(&block, Some(&q)).0, DnsVerdict::Refuse);
+    }
+
+    #[test]
+    fn udp_payload_v4_and_v6() {
+        let p4 = crate::udp_packet::build_inbound_udp(
+            "10.0.0.2:5000".parse().unwrap(),
+            "8.8.8.8:53".parse().unwrap(),
+            b"q4",
+        )
+        .unwrap();
+        assert_eq!(udp_payload(&p4), Some(&b"q4"[..]));
+        let p6 = crate::udp_packet::build_inbound_udp6(
+            "[2001:db8::2]:5000".parse().unwrap(),
+            "[2001:db8::53]:53".parse().unwrap(),
+            b"q6",
+        )
+        .unwrap();
+        assert_eq!(udp_payload(&p6), Some(&b"q6"[..]));
+        assert_eq!(udp_payload(&p6[..45]), None, "truncated");
+        let mut ext = p6.clone();
+        ext[6] = 0; // hop-by-hop header: not parsed here
+        assert_eq!(udp_payload(&ext), None);
+    }
+
+    #[test]
+    fn sniffed_answer_learns_names() {
+        let mut ans = dns_query("example.com");
+        ans[2] |= 0x80;
+        ans[3] = 0x80;
+        ans[6..8].copy_from_slice(&[0, 1]);
+        ans.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 9, 9, 9, 9]);
+        let pkt = crate::udp_packet::build_inbound_udp(
+            "8.8.8.8:53".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+            &ans,
+        )
+        .unwrap();
+        let map = DomainMap::new();
+        let now = std::time::Instant::now();
+        learn_answers(&map, &pkt, now);
+        assert_eq!(
+            map.names("9.9.9.9".parse().unwrap(), now),
+            vec!["example.com".to_string()]
+        );
+        learn_answers(&map, &pkt[..30], now);
+        assert_eq!(map.len(), 1);
+    }
+
     #[test]
     fn filters_compile() {
         check_filter(SOCKET_FILTER, Layer::Socket).unwrap();
         check_filter(NETWORK_FILTER, Layer::Network).unwrap();
+        check_filter(DNS_SNIFF_FILTER, Layer::Network).unwrap();
         check_filter(
             "outbound and !loopback and icmp and icmp.Type == 3",
             Layer::Network,

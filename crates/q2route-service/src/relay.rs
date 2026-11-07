@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -18,7 +18,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ProfileId, Protocol};
-use q2route_core::decide::{decide, Decision, FlowInfo, MatchInfo, MatchReason, Route};
+use q2route_core::decide::{
+    decide, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
+};
+use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
 use q2route_core::peek::{peek_host, PeekResult};
 use q2route_core::process_tree::ProcessTree;
@@ -95,6 +98,9 @@ pub struct RelayCtx {
     /// Profiles the relay last saw down (unreachable / silent); the first
     /// successful connect through one emits `Event::ProxyUp`.
     pub proxy_down: DashSet<ProfileId>,
+    /// IP -> names learned from DNS answers (sniffed and proxied), so
+    /// domain rules can decide flows that carry no SNI / Host.
+    pub domains: Arc<DomainMap>,
 }
 
 /// Production idle timeout of a relayed connection.
@@ -175,6 +181,32 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
     decide(&rules, &tree, &excluded, &f)
 }
 
+/// After a peek that found no host: decide by the names DNS answered for
+/// the destination. No names, or names that disagree (`decide_mapped` wants
+/// a peek it already had), decide as a domain-less flow (`Some("")`), as
+/// before the DNS map existed.
+fn decide_after_empty_peek(ctx: &RelayCtx, orig: &OriginalDst) -> Decision {
+    let names = ctx
+        .domains
+        .names(IpAddr::V4(*orig.dst.ip()), std::time::Instant::now());
+    if !names.is_empty() {
+        let rules = ctx.rules.load();
+        let excluded = ctx.excluded.load();
+        let f = FlowInfo {
+            proto: Protocol::Tcp,
+            pid: orig.pid,
+            dst: SocketAddr::V4(orig.dst),
+            domain: None,
+        };
+        let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
+        let d = decide_mapped(&rules, &tree, &excluded, &f, &names);
+        if d != Decision::NeedDomain {
+            return d;
+        }
+    }
+    decide_flow(ctx, orig, Some(""))
+}
+
 /// Reads client bytes until a host is found, the input is not TLS/HTTP, the
 /// buffer cap is reached, the client stops sending, or `limit` passes.
 async fn peek(client: &mut TcpStream, buf: &mut Vec<u8>, limit: Duration) -> Option<String> {
@@ -218,8 +250,12 @@ async fn handle(
     if decision == Decision::NeedDomain {
         let limit = Duration::from_millis(ctx.cfg.load().settings.peek_timeout_ms);
         domain = peek(&mut client, &mut buf, limit).await.unwrap_or_default();
-        // An empty domain matches no domain rule, so this cannot be NeedDomain again.
-        decision = decide_flow(ctx, &orig, Some(&domain));
+        decision = if domain.is_empty() {
+            decide_after_empty_peek(ctx, &orig)
+        } else {
+            // A domain is set, so this cannot be NeedDomain again.
+            decide_flow(ctx, &orig, Some(&domain))
+        };
     }
     let (route, info) = match decision {
         Decision::Final(route, info) => (route, info),

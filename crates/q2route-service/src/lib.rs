@@ -3,6 +3,7 @@
 
 pub mod classify;
 pub mod conns;
+pub mod dns_proxy;
 pub mod engine;
 pub mod flows;
 pub mod geo;
@@ -11,6 +12,8 @@ pub mod nat;
 pub mod packet_loop;
 pub mod relay;
 pub mod stats;
+#[cfg(test)]
+mod test_util;
 pub mod udp_packet;
 pub mod udp_relay;
 pub mod winapi;
