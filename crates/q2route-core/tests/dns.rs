@@ -161,3 +161,36 @@ fn doh_hosts() {
     assert!(!is_doh_host("www.dns.google"));
     assert_eq!(DOH_HOSTS.len(), 13);
 }
+
+#[test]
+fn qdcount_must_be_one() {
+    let mut m = query(1, "a.example", 1);
+    m[5] = 2;
+    assert!(parse_query(&m).is_none());
+    assert!(refused(&m).is_none());
+    assert!(truncated(&m).is_none());
+}
+
+#[test]
+fn many_cnames_are_capped() {
+    let mut m = query(5, "c0.example", 1);
+    m[2] = 0x81;
+    let n = 1000usize;
+    m[6] = ((n + 2) >> 8) as u8;
+    m[7] = (n + 2) as u8;
+    for i in 0..n {
+        m.extend(rr(
+            &qname(&format!("c{i}.example")),
+            5,
+            60,
+            &qname(&format!("c{}.example", i + 1)),
+        ));
+    }
+    m.extend(rr(&qname("c5.example"), 1, 10, &[5, 5, 5, 5]));
+    m.extend(rr(&qname("c999.example"), 1, 10, &[9, 9, 9, 9]));
+    let t = std::time::Instant::now();
+    let (_, ans) = answers(&m);
+    assert!(t.elapsed().as_secs() < 1);
+    assert_eq!(ans, vec![("5.5.5.5".parse::<IpAddr>().unwrap(), 10)]);
+    assert_eq!(MAX_CNAMES, 32);
+}

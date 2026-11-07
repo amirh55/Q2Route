@@ -127,10 +127,18 @@ fn unknown_domain_other_port_no_peek() {
 fn server_first_no_domain() {
     let mut c = cfg();
     c.groups.remove(0);
+    c.settings.dns.block_doh = false;
     let rs = RuleSet::compile(&c).unwrap();
     assert_eq!(
         run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // with DoH blocking on, a proxied 443 flow peeks the SNI first
+    c.settings.dns.block_doh = true;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
+        Decision::NeedDomain
     );
 }
 
@@ -520,6 +528,7 @@ fn proxied_domain_group_with_proxied_fallback_skips_peek() {
     // Both outcomes are the same proxy: no peek needed.
     let mut c = cfg();
     c.groups[0].action = Action::Proxy("v2ray".into());
+    c.settings.dns.block_doh = false;
     let rs = RuleSet::compile(&c).unwrap();
     assert_eq!(
         run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
@@ -581,5 +590,78 @@ fn geoip_ir_foreign_ip_still_proxied() {
             Some("www.digikala.com")
         ),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn doh_unknown_domain_peeks_when_proxied() {
+    // catch-all Proxy, TCP 443, no domain yet -> peek
+    let mut c = cfg();
+    c.groups.remove(0);
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
+    // block_doh off -> no peek
+    c.settings.dns.block_doh = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // port 80 and UDP are unaffected
+    c.settings.dns.block_doh = true;
+    let rs = RuleSet::compile(&c).unwrap();
+    let r = |p, dst| run(&rs, &HashSet::new(), p, 40, dst, None);
+    assert_eq!(
+        r(Protocol::Tcp, "8.8.8.8:80"),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        r(Protocol::Udp, "8.8.8.8:443"),
+        fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn doh_peek_covers_proxy_proxy_shortcut() {
+    // domain rule -> Proxy, rest -> Proxy: eval_from would skip the peek
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "dom".into(),
+            name: "d".into(),
+            enabled: true,
+            action: Action::Proxy("v2ray".into()),
+            rules: vec![Rule {
+                domains: vec!["example.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
+}
+
+#[test]
+fn direct_tcp443_without_domain_needs_no_peek() {
+    let mut c = cfg();
+    c.set_group_action("everything-else", Action::Direct)
+        .unwrap();
+    let rs = RuleSet::compile(&c).unwrap();
+    // *.ir rule may still need the domain, but Direct/Direct shortcut applies
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        fin(
+            Route::Direct,
+            Some("everything-else"),
+            MatchReason::CatchAll
+        )
     );
 }

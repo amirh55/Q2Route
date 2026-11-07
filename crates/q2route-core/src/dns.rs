@@ -6,6 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 const HEADER: usize = 12;
 const MAX_NAME: usize = 255;
 const MAX_HOPS: usize = 16;
+/// CNAME records considered per response; further ones are ignored.
+pub const MAX_CNAMES: usize = 32;
 
 /// A parsed client query (first question only).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +66,7 @@ fn read_name(m: &[u8], pos: usize, compress: bool) -> Option<(String, usize)> {
 
 /// End offset of the first question, and its (name, qtype).
 fn first_question(m: &[u8]) -> Option<(String, u16, usize)> {
-    if m.len() < HEADER || u16_at(m, 4)? == 0 {
+    if m.len() < HEADER || u16_at(m, 4)? != 1 {
         return None;
     }
     let (name, p) = read_name(m, HEADER, false)?;
@@ -73,7 +75,7 @@ fn first_question(m: &[u8]) -> Option<(String, u16, usize)> {
     Some((name.to_ascii_lowercase(), qtype, p + 4))
 }
 
-/// Parses a client query: QR=0, QDCOUNT >= 1, first question only. Compressed
+/// Parses a client query: QR=0, QDCOUNT == 1 (anything else is malformed). Compressed
 /// names in the question and names over 255 bytes are rejected.
 pub fn parse_query(msg: &[u8]) -> Option<Query<'_>> {
     if msg.get(2)? & 0x80 != 0 {
@@ -174,7 +176,7 @@ fn parse_answers(m: &[u8]) -> Option<(String, Vec<(IpAddr, u32)>)> {
                 let a: [u8; 16] = data.try_into().ok()?;
                 addrs.push((owner, IpAddr::V6(Ipv6Addr::from(a)), ttl));
             }
-            5 => {
+            5 if cnames.len() < MAX_CNAMES => {
                 let (target, _) = read_name(m, rd, true)?;
                 cnames.push((owner, target.to_ascii_lowercase()));
             }

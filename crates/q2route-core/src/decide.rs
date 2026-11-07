@@ -185,7 +185,18 @@ pub fn decide(
             }
         }
     }
-    eval_from(rs, &cands, f)
+    let d = eval_from(rs, &cands, f);
+    // A proxied TCP/443 flow with no domain yet could be DoH: peek the SNI so
+    // `finalize` can check it (this also covers eval_from's no-peek shortcut).
+    if rs.block_doh
+        && f.domain.is_none()
+        && f.proto == Protocol::Tcp
+        && f.dst.port() == 443
+        && matches!(d, Decision::Final(Route::Proxy(_), _))
+    {
+        return Decision::NeedDomain;
+    }
+    d
 }
 
 type Candidate<'r> = (&'r CompiledGroup, &'r CompiledRule, MatchReason);
