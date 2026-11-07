@@ -121,6 +121,32 @@ domains = ["a.com"]
 }
 
 #[test]
+fn proxy_ipv6_defaults_on_for_old_configs() {
+    assert!(Config::seed().settings.proxy_ipv6);
+    // A config written before the setting existed loads with it on.
+    let c: Config = toml::from_str(
+        r#"
+default_proxy = "v2ray"
+[settings]
+peek_timeout_ms = 300
+[settings.dns]
+block_doh = true
+"#,
+    )
+    .unwrap();
+    assert!(c.settings.proxy_ipv6);
+    let off: Config = toml::from_str(
+        r#"
+default_proxy = "v2ray"
+[settings]
+proxy_ipv6 = false
+"#,
+    )
+    .unwrap();
+    assert!(!off.settings.proxy_ipv6);
+}
+
+#[test]
 fn validate_rejects() {
     let mut c = Config::seed();
     c.groups[0].action = Action::Proxy("nope".into());

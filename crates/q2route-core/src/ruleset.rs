@@ -31,6 +31,8 @@ pub struct RuleSet {
     pub lan_direct: bool,
     /// Block DoH/DoT on proxied flows (`settings.dns.block_doh`).
     pub block_doh: bool,
+    /// Proxy IPv6 destinations (`settings.proxy_ipv6`); off, they are blocked.
+    pub proxy_ipv6: bool,
 }
 
 fn all<T>(
@@ -87,6 +89,7 @@ impl RuleSet {
             always_direct,
             lan_direct: true,
             block_doh: cfg.settings.dns.block_doh,
+            proxy_ipv6: cfg.settings.proxy_ipv6,
         })
     }
 }

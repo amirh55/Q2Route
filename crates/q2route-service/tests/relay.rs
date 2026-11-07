@@ -1391,6 +1391,85 @@ async fn relayed_ipv6_connection_via_proxy() {
     r.cancel.cancel();
 }
 
+/// The SOCKS5 request for one proxied flow to `dst` (catch-all proxy, the
+/// first bytes "ping"), with `name` mapped to `dst` by DNS when given;
+/// `None` when the IPv6 relay cannot bind [::1].
+async fn proxied_v6_request(dst: &str, name: Option<&str>) -> Option<SocksReq> {
+    let (sport, mut reqs) = mock_socks(4).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let dst: SocketAddr = dst.parse().unwrap();
+    let c = ctx(cfg);
+    if let Some(n) = name {
+        c.domains
+            .insert(dst.ip(), n, 300, std::time::Instant::now());
+    }
+    let r = start_dual(Arc::new(V6Lookup(dst)), c).await?;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    r.cancel.cancel();
+    Some(req)
+}
+
+/// A proxied IPv6 flow with no peeked host asks the proxy for the name DNS
+/// answered for the destination (an IPv4-only proxy exit can still reach
+/// it), both without a peek (port 22) and after an empty one (443).
+#[tokio::test]
+async fn proxied_ipv6_without_domain_uses_mapped_name() {
+    for dst in ["[2606:4700::1]:22", "[2606:4700::1]:443"] {
+        let Some(req) = proxied_v6_request(dst, Some("ssh.example.com")).await else {
+            return;
+        };
+        assert_eq!(req.atyp, 3, "{dst}: SOCKS5 ATYP domain");
+        assert_eq!(req.host, b"ssh.example.com", "{dst}");
+        assert_eq!(req.first, b"ping");
+    }
+}
+
+/// Without a mapped name the IPv6 address itself is asked for.
+#[tokio::test]
+async fn proxied_ipv6_without_name_uses_address() {
+    let Some(req) = proxied_v6_request("[2606:4700::1]:22", None).await else {
+        return;
+    };
+    assert_eq!(req.atyp, 4, "SOCKS5 ATYP IPv6");
+    assert_eq!(req.port, 22);
+}
+
+/// IPv4 is unchanged: a mapped name is not used as the proxy target.
+#[tokio::test]
+async fn proxied_ipv4_without_domain_keeps_address() {
+    let (sport, mut reqs) = mock_socks(4).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let dst: SocketAddrV4 = "203.0.113.7:22".parse().unwrap();
+    let c = ctx(cfg);
+    c.domains.insert(
+        (*dst.ip()).into(),
+        "ssh.example.com",
+        300,
+        std::time::Instant::now(),
+    );
+    let r = start(dst, c).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.atyp, 1);
+    assert_eq!(req.host, [203, 0, 113, 7]);
+    r.cancel.cancel();
+}
+
 #[tokio::test]
 async fn direct_ipv6_connection_from_relay() {
     let Ok(l) = TcpListener::bind("[::1]:0").await else {

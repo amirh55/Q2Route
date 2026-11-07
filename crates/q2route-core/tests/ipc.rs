@@ -194,6 +194,8 @@ fn set_dns_and_flush_roundtrip() {
             direct_names: vec!["vpn.example.com".into()],
         }),
         Request::FlushDns,
+        Request::SetProxyIpv6 { enabled: false },
+        Request::SetProxyIpv6 { enabled: true },
     ] {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);

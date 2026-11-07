@@ -106,6 +106,9 @@ fn finalize(rs: &RuleSet, action: &Action, f: &FlowInfo, mut info: MatchInfo) ->
         // Proxied UDP/443 (QUIC, either family) is blocked so apps fall back
         // to TCP through the proxy. Blocked, never leaked direct.
         Action::Proxy(_) if f.proto == Protocol::Udp && f.dst.port() == 443 => Route::Block,
+        // `proxy_ipv6` off (a proxy server without IPv6): proxied IPv6 is
+        // blocked so apps fall back to IPv4 through the proxy.
+        Action::Proxy(_) if !rs.proxy_ipv6 && f.dst.is_ipv6() => Route::Block,
         Action::Proxy(id) => Route::Proxy(id.clone()),
     };
     if rs.block_doh && matches!(route, Route::Proxy(_)) && is_doh_flow(f) {

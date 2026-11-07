@@ -492,6 +492,13 @@ impl Inner {
                 let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
                 Response::Ok
             }
+            Request::SetProxyIpv6 { enabled } => {
+                self.apply(|c| {
+                    c.settings.proxy_ipv6 = enabled;
+                    Ok(())
+                })
+                .await
+            }
             // The pipe server answers Subscribe itself (via `subscribe`).
             Request::Subscribe => Response::Ok,
         }

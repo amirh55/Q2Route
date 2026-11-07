@@ -8,6 +8,11 @@
 //! closed; there is no direct fallback. `Event::ProxyDown` is emitted only
 //! when the proxy itself is unreachable or silent, and `Event::ProxyUp` on
 //! the first successful connect after that.
+//!
+//! **IPv6 exposure:** IPv6 has no NAT in front of the machine, and the
+//! firewall rule for the service is program-scoped, so the IPv6 relay port
+//! can be reached from the internet. A connection with no NAT entry (no
+//! original destination) is closed immediately, so nothing is exposed.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -171,9 +176,7 @@ pub fn bind_relay_with(
 ) -> io::Result<RelayListeners> {
     let mut last = None;
     for _ in 0..RELAY_BIND_ATTEMPTS {
-        let l4 = std::net::TcpListener::bind((v4, 0))?;
-        l4.set_nonblocking(true)?;
-        let l4 = TcpListener::from_std(l4)?;
+        let l4 = bind_v4(SocketAddrV4::new(v4, 0))?;
         let port = l4.local_addr()?.port();
         match bind_v6(port) {
             Ok(l6) => {
@@ -190,6 +193,19 @@ pub fn bind_relay_with(
     }
     let v4 = last.expect("RELAY_BIND_ATTEMPTS > 0");
     Ok(RelayListeners { v4, v6: None })
+}
+
+/// An IPv4 listener on `addr` (backlog 1024, as tokio's `bind`).
+fn bind_v4(addr: SocketAddrV4) -> io::Result<TcpListener> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    s.bind(&SocketAddr::V4(addr).into())?;
+    s.listen(1024)?;
+    s.set_nonblocking(true)?;
+    TcpListener::from_std(s.into())
 }
 
 /// An IPv6-only (`IPV6_V6ONLY`) listener on `addr`.
@@ -416,11 +432,7 @@ async fn relay_flow(
     match route {
         Route::Block => log("blocked"),
         Route::Proxy(id) => {
-            let target = if domain.is_empty() {
-                Target::Ip(orig.dst)
-            } else {
-                Target::Domain(domain, orig.dst.port())
-            };
+            let target = proxy_target(ctx, orig.dst, domain);
             match connect_proxy(ctx, &id, &target).await {
                 Ok(up) => {
                     log(&format!("proxied via '{id}'"));
@@ -438,6 +450,23 @@ async fn relay_flow(
             Err(e) => log(&format!("direct connect failed: {e}")),
         },
     }
+}
+
+/// What a proxied flow asks the proxy for: the peeked `domain` when there
+/// is one. An IPv6 destination without one goes by the most recent name DNS
+/// answered for it, so a proxy whose exit has no IPv6 can still reach the
+/// site over IPv4; otherwise (and always for IPv4) the original address.
+fn proxy_target(ctx: &RelayCtx, dst: SocketAddr, domain: String) -> Target {
+    if !domain.is_empty() {
+        return Target::Domain(domain, dst.port());
+    }
+    if dst.is_ipv6() {
+        let names = ctx.domains.names(dst.ip(), std::time::Instant::now());
+        if let Some(name) = names.into_iter().next() {
+            return Target::Domain(name, dst.port());
+        }
+    }
+    Target::Ip(dst)
 }
 
 /// Connects to `target` through profile `id`. Emits `Event::ProxyDown` when
@@ -652,9 +681,10 @@ fn learn_answers(domains: &DomainMap, asked: &Asked, msg: &[u8]) {
     }
 }
 
-/// TCP/53 (either family): routed by the first query's name only. Direct goes to the
-/// original server from an own port, Proxy to `proxy_resolver` through the
-/// profile (fail closed: any failure closes the client), Block closes.
+/// TCP/53 (either family): routed by the first query's name only. Direct
+/// goes to the original server from an own port, Proxy to `proxy_resolver`
+/// through the profile (fail closed: any failure closes the client), Block
+/// closes.
 /// Later queries on the connection must decide the same route, else the
 /// connection is closed before that query is sent anywhere. A connection
 /// that is not DNS at all (a VPN on port 53) carries no name: it is relayed
@@ -739,8 +769,9 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
 
 /// [`pump`] for DNS over TCP: relays whole length-prefixed messages. Each
 /// client query is parsed and its name checked with `same_route` (decides
-/// the first query's route) before it is sent (a query that does not parse or decides differently ends the
-/// connection); each answer feeds `ctx.domains` on its way back.
+/// the first query's route) before it is sent (a query that does not parse
+/// or decides differently ends the connection); each answer feeds
+/// `ctx.domains` on its way back.
 async fn dns_pump(
     client: TcpStream,
     upstream: TcpStream,

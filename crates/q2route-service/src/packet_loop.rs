@@ -14,8 +14,10 @@
 //!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped; a
 //!   UDP/53 payload that is not a DNS query is an ordinary UDP flow.
 //!   TCP/53 (either family) is redirected to the relay, which routes it by
-//!   name; IPv6 TCP/53 is dropped while the relay has no IPv6 listener. The
-//!   proxy program's own port-53 traffic is always passed (spec 5.6).
+//!   name. Without an IPv6 relay listener only *non-Direct* IPv6 TCP/53 is
+//!   dropped: the proxy program (proxy endpoints' pids and always-direct
+//!   apps), the service's own pid and connections to proxy endpoints are
+//!   Direct and pass in either family (spec 5.6).
 //! * DNS answers (sniff only): inbound UDP from port 53 that answers a query
 //!   this loop passed ([`DnsPending`]) feeds the IP -> names map that lets
 //!   domain rules decide flows without a peek.
@@ -482,11 +484,15 @@ fn route_packet(
 const PROTO_ICMP: u8 = 1;
 const PROTO_ICMPV6: u8 = 58;
 
-/// The decision for a TCP/53 flow (either family): the service's own sockets, proxy
-/// endpoints and the proxy program (`own`: why) are Direct; every other
-/// flow is NeedDomain, so its SYN is redirected to the relay (cached
-/// non-Direct, like a proxied flow), which routes it by the queried name
-/// ([`crate::relay`]).
+/// The decision for a TCP/53 flow (either family): the service's own
+/// sockets, proxy endpoints and the proxy program (`own`: why) are Direct;
+/// every other flow is NeedDomain, so its SYN is redirected to the relay
+/// (cached non-Direct, like a proxied flow), which routes it by the queried
+/// name ([`crate::relay`]). Excluded apps (pids on a proxy endpoint, and
+/// always-direct exes) are Direct here through [`is_proxy_program`], the
+/// same Direct verdict [`decide_flow`] gives them for any other port; a
+/// TCP/53 connection the relay finds is not DNS is decided by the relay's
+/// ordinary flow decision, which also sends them Direct.
 fn tcp_dns_decision(pid: u32, own: Option<MatchReason>) -> (u32, Decision) {
     match own {
         Some(reason) => (pid, direct(reason)),

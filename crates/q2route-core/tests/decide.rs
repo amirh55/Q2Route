@@ -416,6 +416,49 @@ fn ipv6_proxy_routes_to_proxy() {
 }
 
 #[test]
+fn proxy_ipv6_off_blocks_proxied_ipv6_only() {
+    // settings.proxy_ipv6 off (a proxy server without IPv6): proxied IPv6
+    // TCP and UDP are blocked (apps fall back to IPv4), as before M6.
+    let mut c = cfg();
+    assert!(c.settings.proxy_ipv6, "default on");
+    c.settings.proxy_ipv6 = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    let ex = HashSet::new();
+    let catch = |r: Route| fin(r, Some("everything-else"), MatchReason::CatchAll);
+    for (proto, dst, domain) in [
+        (Protocol::Tcp, "[2606:4700::1]:443", Some("x.com")),
+        (Protocol::Tcp, "[2606:4700::1]:22", None),
+        (Protocol::Udp, "[2606:4700::1]:27015", None),
+    ] {
+        assert_eq!(
+            run(&rs, &ex, proto, 40, dst, domain),
+            catch(Route::Block),
+            "{proto:?} {dst}"
+        );
+    }
+    // IPv4 is unaffected.
+    assert_eq!(
+        run(&rs, &ex, Protocol::Tcp, 40, "1.2.3.4:443", Some("x.com")),
+        catch(proxy())
+    );
+    assert_eq!(
+        run(&rs, &ex, Protocol::Udp, 40, "1.2.3.4:27015", None),
+        catch(proxy())
+    );
+    // On: proxied IPv6 TCP and UDP go to the proxy.
+    c.settings.proxy_ipv6 = true;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &ex, Protocol::Tcp, 40, "[2606:4700::1]:22", None),
+        catch(proxy())
+    );
+    assert_eq!(
+        run(&rs, &ex, Protocol::Udp, 40, "[2606:4700::1]:27015", None),
+        catch(proxy())
+    );
+}
+
+#[test]
 fn empty_rule_matches_nothing_and_no_catch_all_is_block() {
     let mut c = cfg();
     c.groups.retain(|g| g.id == "games");

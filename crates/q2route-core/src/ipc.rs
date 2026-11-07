@@ -37,6 +37,7 @@ pub enum Request {
     ListProcesses,
     SetDns(DnsSettings),
     FlushDns,
+    SetProxyIpv6 { enabled: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

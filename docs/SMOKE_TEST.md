@@ -120,7 +120,7 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 
 ## M6: IPv6 through the proxy
 
-Install this update with `dist\Q2Route-update\Update.cmd`.
+Install this update with `dist\Q2Route-update\Update.cmd`. On IPv6 the relay port can be reached from the internet (there is no NAT, and the firewall rule is scoped to the program, not the port); connections without a NAT entry are closed immediately, so nothing is exposed.
 
 | # | Step | Expected | Result |
 |---|---|---|---|
@@ -129,6 +129,7 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | V3 | Check the service log after start. | The log shows `relay listening on <port> (IPv4+IPv6)`; on a machine without IPv6 it shows IPv4 only and nothing breaks. | |
 | V4 | `nslookup -vc example.com <your IPv6 DNS server>` (forces TCP). | It resolves; Connections shows the TCP/53 row routed via the proxy. | |
 | V5 | A proxied game over IPv6 (if available). | Connections shows its UDP rows with route Proxy. | |
+| V6 | With a VPN server that has no IPv6: browse a site that has IPv6 and use a non-web proxied app (e.g. a game or SSH to an IPv6-capable host). | Works. If it doesn't, turn off "Proxy IPv6 traffic" on the Proxies page → it works over IPv4. | |
 
 ## Leak checks
 

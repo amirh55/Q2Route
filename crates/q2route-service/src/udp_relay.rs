@@ -649,10 +649,11 @@ impl Session {
 }
 
 /// The inbound packet carrying a reply from `src` to the app socket `local`
-/// (IPv4 or IPv6, as `local`); `None` for a reply of the other family (it
-/// cannot reach that socket) or one too large.
+/// (IPv4 or IPv6, as `local`); a v4-mapped `src` counts as IPv4. `None` for
+/// a reply of the other family (it cannot reach that socket) or one too
+/// large.
 fn inbound_packet(src: SocketAddr, local: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    match (src, local) {
+    match (unmap(src), local) {
         (SocketAddr::V4(s), SocketAddr::V4(l)) => build_inbound_udp(s, l, payload).ok(),
         (SocketAddr::V6(s), SocketAddr::V6(l)) => build_inbound_udp6(s, l, payload).ok(),
         _ => None,

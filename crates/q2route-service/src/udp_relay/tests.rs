@@ -627,3 +627,25 @@ fn close_matching_is_family_aware() {
     assert!(!same_local(&v4, a("10.0.0.3:5000")));
     assert!(!same_local(&v4, a("10.0.0.2:5001")));
 }
+
+/// A reply whose source is v4-mapped (`::ffff:a.b.c.d`) for an IPv4 app
+/// socket is delivered as IPv4 from `a.b.c.d`; a real IPv6 source for an
+/// IPv4 socket (and the reverse) is not.
+#[test]
+fn inbound_packet_unmaps_v4_mapped_source() {
+    let l4 = SocketAddr::V4(local());
+    let mapped: SocketAddr = "[::ffff:203.0.113.9]:4000".parse().unwrap();
+    let pkt = inbound_packet(mapped, l4, b"hi").expect("delivered");
+    let p = etherparse::SlicedPacket::from_ip(&pkt).unwrap();
+    let Some(etherparse::NetSlice::Ipv4(ip)) = p.net else {
+        panic!("not IPv4");
+    };
+    assert_eq!(ip.header().source_addr(), Ipv4Addr::new(203, 0, 113, 9));
+    assert_eq!(ip.header().destination_addr(), *local().ip());
+    let v6: SocketAddr = "[2001:db8::9]:4000".parse().unwrap();
+    assert!(inbound_packet(v6, l4, b"hi").is_none());
+    let l6: SocketAddr = "[2001:db8::2]:5000".parse().unwrap();
+    assert!(inbound_packet(v6, l6, b"hi").is_some());
+    let v4: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+    assert!(inbound_packet(v4, l6, b"hi").is_none());
+}

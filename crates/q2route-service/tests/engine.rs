@@ -96,3 +96,19 @@ async fn test_unknown_proxy_is_an_error() {
         .await;
     assert!(matches!(r, Response::Error(_)), "{r:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_proxy_ipv6_persists() {
+    let path = temp_config("proxy-ipv6");
+    let engine = Engine::new(path.clone()).unwrap();
+    assert!(engine.snapshot().config.settings.proxy_ipv6, "default on");
+    let r = engine
+        .handle(Request::SetProxyIpv6 { enabled: false })
+        .await;
+    assert_eq!(r, Response::Ok);
+    assert!(!Config::load(&path).unwrap().settings.proxy_ipv6);
+    assert!(!engine.snapshot().config.settings.proxy_ipv6);
+    let r = engine.handle(Request::SetProxyIpv6 { enabled: true }).await;
+    assert_eq!(r, Response::Ok);
+    assert!(Config::load(&path).unwrap().settings.proxy_ipv6);
+}
