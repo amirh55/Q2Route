@@ -802,3 +802,30 @@ fn mapped_no_peek_without_names_is_empty_domain() {
         assert_ne!(dm_no_peek(dst, &[], &rs), Decision::NeedDomain);
     }
 }
+
+/// Names from (forgeable) DNS answers alone never skip the peek on a web
+/// port for a flow that is not Direct without a domain.
+#[test]
+fn mapped_direct_name_on_web_port_still_peeks() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    // Proxied app (chrome, catch-all Proxy), IP mapped only to x.ir.
+    for dst in ["5.6.7.8:443", "5.6.7.8:80"] {
+        assert_eq!(dm(40, dst, &["x.ir"], &rs), Decision::NeedDomain, "{dst}");
+        assert_eq!(dm(40, dst, &["x.ir", "y.ir"], &rs), Decision::NeedDomain);
+    }
+    // Not a web port: the mapped name decides, as before.
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+    // A Direct app (steam child): Direct without a peek.
+    assert!(matches!(
+        dm(20, "5.6.7.8:443", &["x.ir"], &rs),
+        Decision::Final(Route::Direct, _)
+    ));
+    // Proxy from names alone stays final on 443 (no peek needed to protect).
+    assert!(matches!(
+        dm(40, "5.6.7.8:443", &["example.com"], &rs),
+        Decision::Final(Route::Proxy(_), _)
+    ));
+}

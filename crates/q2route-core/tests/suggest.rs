@@ -65,4 +65,8 @@ fn reason_texts() {
     assert_eq!(s(MatchReason::ExcludedPid), "excluded");
     assert_eq!(s(MatchReason::NoMatch), "no match");
     assert_eq!(s(MatchReason::DohBlocked), "DoH/DoT blocked");
+    assert_eq!(
+        s(MatchReason::BootstrapName),
+        "resolved directly (VPN bootstrap)"
+    );
 }

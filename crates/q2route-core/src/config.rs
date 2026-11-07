@@ -406,6 +406,20 @@ impl Config {
                 return bad(format!("catch-all group '{}' must be last", g.id));
             }
         }
+        let dns = &self.settings.dns;
+        if dns.proxy_resolver.parse::<std::net::SocketAddr>().is_err() {
+            return bad(format!(
+                "DNS proxy resolver '{}' is not an address:port",
+                dns.proxy_resolver
+            ));
+        }
+        if let Some(n) = dns
+            .direct_names
+            .iter()
+            .find(|n| DomainPattern::parse(n).is_err())
+        {
+            return bad(format!("DNS direct name '{n}' is not a valid domain"));
+        }
         // Ruling R18: an enabled catch-all must always exist, so unmatched
         // traffic is never silently routed some other way.
         match self.groups.last() {
@@ -435,18 +449,8 @@ impl Config {
     }
 
     pub fn set_dns(&mut self, d: DnsSettings) -> Result<(), ConfigError> {
+        // Checked by `validate` (resolver address, direct name patterns).
         self.mutate(|c| {
-            if d.proxy_resolver.parse::<std::net::SocketAddr>().is_err() {
-                return Err(ConfigError::Invalid(format!(
-                    "DNS proxy resolver '{}' is not an address:port",
-                    d.proxy_resolver
-                )));
-            }
-            for n in &d.direct_names {
-                DomainPattern::parse(n).map_err(|_| {
-                    ConfigError::Invalid(format!("DNS direct name '{n}' is not a valid domain"))
-                })?;
-            }
             c.settings.dns = d;
             Ok(())
         })

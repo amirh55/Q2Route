@@ -456,3 +456,22 @@ fn dns_direct_names_validated() {
     let old: DnsSettings = serde_json::from_str(json).unwrap();
     assert!(old.direct_names.is_empty());
 }
+
+#[test]
+fn hand_edited_bad_dns_settings_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut c = Config::seed();
+    c.settings.dns.proxy_resolver = "not-an-address".into();
+    c.save(&path).unwrap();
+    let e = Config::load(&path).unwrap_err().to_string();
+    assert!(e.contains("not-an-address"), "{e}");
+    let mut c = Config::seed();
+    c.settings.dns.direct_names = vec!["ok.example.com".into(), "*.".into()];
+    c.save(&path).unwrap();
+    let e = Config::load(&path).unwrap_err().to_string();
+    assert!(e.contains("'*.'"), "{e}");
+    c.settings.dns.direct_names = vec!["ok.example.com".into()];
+    c.save(&path).unwrap();
+    assert_eq!(Config::load(&path).unwrap(), c);
+}

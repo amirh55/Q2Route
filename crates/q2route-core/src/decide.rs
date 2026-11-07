@@ -42,6 +42,10 @@ pub enum MatchReason {
     /// DoH (known host on TCP 443) or DoT/DoQ (port 853) on a flow that
     /// would have been proxied: blocked so clients fall back to plain DNS.
     DohBlocked,
+    /// A DNS query resolved directly so the VPN can come up: the proxy
+    /// program's own query, or a proxy host / `direct_names` / detected
+    /// proxy server name.
+    BootstrapName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,8 +304,10 @@ pub fn decide_dns(rs: &RuleSet, name: &str) -> (Route, MatchInfo) {
 
 /// Decide with names learned from DNS for `f.dst` (used when `f.domain` is
 /// None). No names -> `decide`. All names give the same Final route -> that
-/// decision with the first name's MatchInfo. Otherwise TCP 80/443 ->
-/// `NeedDomain` (peek); else the most protective route (Proxy > Block > Direct).
+/// decision with the first name's MatchInfo, except that a Direct result on
+/// TCP 80/443 still peeks (`NeedDomain`) unless the flow is Direct without a
+/// domain. Otherwise TCP 80/443 -> `NeedDomain` (peek); else the most
+/// protective route (Proxy > Block > Direct).
 pub fn decide_mapped(
     rs: &RuleSet,
     tree: &ProcessTree,
@@ -324,11 +330,24 @@ pub fn decide_mapped(
             Decision::NeedDomain => unresolved = true,
         }
     }
+    let web = f.proto == Protocol::Tcp && matches!(f.dst.port(), 80 | 443);
     if !unresolved && finals.iter().all(|(r, _)| *r == finals[0].0) {
         let (r, i) = finals.swap_remove(0);
+        // Names come from DNS answers anyone on the path could forge: on a
+        // web port a Direct verdict from names alone is confirmed by a peek,
+        // unless the flow is Direct without any domain.
+        if web
+            && r == Route::Direct
+            && !matches!(
+                decide(rs, tree, excluded_pids, f),
+                Decision::Final(Route::Direct, _)
+            )
+        {
+            return Decision::NeedDomain;
+        }
         return Decision::Final(r, i);
     }
-    if f.proto == Protocol::Tcp && matches!(f.dst.port(), 80 | 443) {
+    if web {
         return Decision::NeedDomain;
     }
     if unresolved {

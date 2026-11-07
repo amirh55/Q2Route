@@ -83,5 +83,6 @@ pub fn reason_text(reason: &MatchReason, tree: &ProcessTree) -> String {
         MatchReason::CatchAll => "catch-all".into(),
         MatchReason::NoMatch => "no match".into(),
         MatchReason::DohBlocked => "DoH/DoT blocked".into(),
+        MatchReason::BootstrapName => "resolved directly (VPN bootstrap)".into(),
     }
 }
