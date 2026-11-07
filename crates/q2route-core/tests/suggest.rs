@@ -64,4 +64,5 @@ fn reason_texts() {
     assert_eq!(s(MatchReason::AlwaysDirectDst), "always-direct app");
     assert_eq!(s(MatchReason::ExcludedPid), "excluded");
     assert_eq!(s(MatchReason::NoMatch), "no match");
+    assert_eq!(s(MatchReason::DohBlocked), "DoH/DoT blocked");
 }

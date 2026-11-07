@@ -410,3 +410,24 @@ fn move_group_huge_index_is_rejected() {
     assert!(c.move_group("games", usize::MAX).is_err());
     assert_eq!(c, before);
 }
+
+#[test]
+fn dns_settings_defaults_and_validation() {
+    let mut c = Config::seed();
+    assert_eq!(c.settings.dns.proxy_resolver, "1.1.1.1:53");
+    assert!(c.settings.dns.block_doh);
+    let bad = DnsSettings {
+        proxy_resolver: "1.1.1.1".into(),
+        block_doh: true,
+    };
+    let e = c.set_dns(bad).unwrap_err().to_string();
+    assert!(e.contains("1.1.1.1"));
+    assert_eq!(c.settings.dns.proxy_resolver, "1.1.1.1:53");
+    c.set_dns(DnsSettings {
+        proxy_resolver: "9.9.9.9:53".into(),
+        block_doh: false,
+    })
+    .unwrap();
+    assert_eq!(c.settings.dns.proxy_resolver, "9.9.9.9:53");
+    assert!(!c.settings.dns.block_doh);
+}

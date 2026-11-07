@@ -149,6 +149,30 @@ pub struct Group {
     pub catch_all: bool,
 }
 
+fn default_resolver() -> String {
+    "1.1.1.1:53".into()
+}
+
+/// DNS routing settings: DNS is routed by the queried name; names that
+/// resolve through the proxy go to `proxy_resolver` over the proxy.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DnsSettings {
+    #[serde(default = "default_resolver")]
+    pub proxy_resolver: String,
+    /// Block DoH (known hosts on TCP 443) and DoT/DoQ (port 853) for proxied flows.
+    #[serde(default = "yes")]
+    pub block_doh: bool,
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        DnsSettings {
+            proxy_resolver: default_resolver(),
+            block_doh: true,
+        }
+    }
+}
+
 fn default_peek() -> u64 {
     300
 }
@@ -166,6 +190,8 @@ pub struct Settings {
     /// Whether routing was running when the service last stopped (restored on start).
     #[serde(default = "yes")]
     pub last_running: bool,
+    #[serde(default)]
+    pub dns: DnsSettings,
 }
 
 impl Default for Settings {
@@ -176,6 +202,7 @@ impl Default for Settings {
             tray_traffic_icon: false,
             peek_timeout_ms: 300,
             last_running: true,
+            dns: DnsSettings::default(),
         }
     }
 }
@@ -399,6 +426,19 @@ impl Config {
             .iter_mut()
             .find(|g| g.id == id)
             .ok_or_else(|| ConfigError::Invalid(format!("unknown group '{id}'")))
+    }
+
+    pub fn set_dns(&mut self, d: DnsSettings) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            if d.proxy_resolver.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "DNS proxy resolver '{}' is not an address:port",
+                    d.proxy_resolver
+                )));
+            }
+            c.settings.dns = d;
+            Ok(())
+        })
     }
 
     pub fn set_group_action(&mut self, id: &str, a: Action) -> Result<(), ConfigError> {

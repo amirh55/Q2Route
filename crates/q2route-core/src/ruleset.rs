@@ -29,6 +29,8 @@ pub struct RuleSet {
     pub always_direct: Vec<AppMatcher>,
     /// Whether loopback/LAN destinations are forced Direct (always true outside relay tests).
     pub lan_direct: bool,
+    /// Block DoH/DoT on proxied flows (`settings.dns.block_doh`).
+    pub block_doh: bool,
 }
 
 fn all<T>(
@@ -84,6 +86,7 @@ impl RuleSet {
             groups,
             always_direct,
             lan_direct: true,
+            block_doh: cfg.settings.dns.block_doh,
         })
     }
 }

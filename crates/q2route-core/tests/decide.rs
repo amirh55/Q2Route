@@ -261,11 +261,112 @@ fn lan_rule_off() {
 }
 
 #[test]
-fn dns_ntp_direct_m1() {
+fn ntp_still_always_direct() {
     let direct = fin(Route::Direct, None, MatchReason::AlwaysDirectDst);
-    assert_eq!(d(Protocol::Udp, 60, "8.8.8.8:53", None), direct);
     assert_eq!(d(Protocol::Udp, 60, "1.2.3.4:123", None), direct);
-    assert_eq!(d(Protocol::Tcp, 60, "8.8.8.8:53", None), direct);
+    assert_eq!(d(Protocol::Udp, 60, "192.168.1.1:80", None), direct);
+}
+
+#[test]
+fn lan_resolver_still_routed_by_name() {
+    let direct = fin(Route::Direct, None, MatchReason::AlwaysDirectDst);
+    assert_ne!(d(Protocol::Udp, 60, "192.168.1.1:53", None), direct);
+    assert_ne!(d(Protocol::Tcp, 60, "127.0.0.1:53", None), direct);
+    assert_ne!(d(Protocol::Udp, 60, "8.8.8.8:53", None), direct);
+}
+
+#[test]
+fn dns_by_name() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    assert_eq!(
+        decide_dns(&rs, "foo.ir"),
+        (
+            Route::Direct,
+            MatchInfo {
+                group_id: Some("iranian-sites".into()),
+                reason: MatchReason::Own
+            }
+        )
+    );
+    assert_eq!(
+        decide_dns(&rs, "example.com"),
+        (
+            proxy(),
+            MatchInfo {
+                group_id: Some("everything-else".into()),
+                reason: MatchReason::CatchAll
+            }
+        )
+    );
+}
+
+#[test]
+fn dns_ignores_app_rules() {
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "appdom".into(),
+            name: "x".into(),
+            enabled: true,
+            action: Action::Direct,
+            rules: vec![Rule {
+                apps: vec!["x.exe".into()],
+                domains: vec!["example.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    let (r, i) = decide_dns(&rs, "example.com");
+    assert_eq!(r, proxy());
+    assert_eq!(i.reason, MatchReason::CatchAll);
+}
+
+#[test]
+fn doh_blocked_only_when_proxied() {
+    let blocked = fin(
+        Route::Block,
+        Some("everything-else"),
+        MatchReason::DohBlocked,
+    );
+    assert_eq!(
+        d(Protocol::Tcp, 40, "8.8.8.8:443", Some("dns.google")),
+        blocked
+    );
+    assert_eq!(d(Protocol::Udp, 40, "8.8.8.8:853", None), blocked);
+    assert_eq!(d(Protocol::Tcp, 40, "8.8.8.8:853", None), blocked);
+    // not a DoH host
+    assert_eq!(
+        d(Protocol::Tcp, 40, "8.8.8.8:443", Some("example.com")),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // disabled
+    let mut c = cfg();
+    c.settings.dns.block_doh = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "8.8.8.8:443",
+            Some("dns.google")
+        ),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // a direct-matched flow to 853 stays Direct
+    assert_eq!(
+        d(Protocol::Tcp, 40, "5.6.7.8:853", Some("foo.ir")),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn dns_settings_defaults() {
+    assert_eq!(Config::seed().settings.dns, DnsSettings::default());
 }
 
 #[test]

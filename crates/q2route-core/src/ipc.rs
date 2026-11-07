@@ -52,6 +52,8 @@ pub struct StateSnapshot {
     pub total_down_bps: u64,
 }
 
+// The snapshot embeds Config (now with DNS settings); boxing would ripple through every IPC site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Response {
     Ok,

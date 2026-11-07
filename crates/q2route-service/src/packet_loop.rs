@@ -264,6 +264,11 @@ fn route_packet(
         return Out::Drop;
     };
     let f = m.flow;
+    // M4 Task 3 replaces this (UDP); Task 4 (TCP): until the DNS path lands,
+    // port 53 behaves exactly as before (passed through untouched).
+    if (f.proto == PROTO_UDP || f.proto == PROTO_TCP) && f.remote.port() == 53 {
+        return Out::Send;
+    }
     let tcp4 = f.proto == PROTO_TCP && f.local.is_ipv4();
     if tcp4 && f.local.port() == run.relay_port {
         return (restore_inbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into();

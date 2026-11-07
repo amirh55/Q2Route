@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use crate::config::{Action, GroupId, ProfileId, Protocol};
+use crate::dns::is_doh_host;
 use crate::matchers::is_always_direct_dst;
 use crate::process_tree::ProcessTree;
 use crate::ruleset::{CompiledGroup, CompiledRule, RuleSet};
@@ -38,6 +39,9 @@ pub enum MatchReason {
     /// No group matched and the rule set has no enabled catch-all. Fails
     /// closed: the route is [`Route::Block`], never Direct (Ruling R18).
     NoMatch,
+    /// DoH (known host on TCP 443) or DoT/DoQ (port 853) on a flow that
+    /// would have been proxied: blocked so clients fall back to plain DNS.
+    DohBlocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,8 +95,8 @@ fn eval_conditions(rule: &CompiledRule, f: &FlowInfo) -> RuleOutcome {
     RuleOutcome::Match
 }
 
-fn finalize(action: &Action, f: &FlowInfo, info: MatchInfo) -> Decision {
-    let route = match action {
+fn finalize(rs: &RuleSet, action: &Action, f: &FlowInfo, mut info: MatchInfo) -> Decision {
+    let mut route = match action {
         Action::Direct => Route::Direct,
         Action::Block => Route::Block,
         // IPv6 has no relay; proxied UDP/443 (QUIC) is blocked so apps fall back
@@ -104,7 +108,16 @@ fn finalize(action: &Action, f: &FlowInfo, info: MatchInfo) -> Decision {
         }
         Action::Proxy(id) => Route::Proxy(id.clone()),
     };
+    if rs.block_doh && matches!(route, Route::Proxy(_)) && is_doh_flow(f) {
+        route = Route::Block;
+        info.reason = MatchReason::DohBlocked;
+    }
     Decision::Final(route, info)
+}
+
+fn is_doh_flow(f: &FlowInfo) -> bool {
+    f.dst.port() == 853
+        || (f.proto == Protocol::Tcp && f.dst.port() == 443 && f.domain.is_some_and(is_doh_host))
 }
 
 fn direct(reason: MatchReason) -> Decision {
@@ -127,11 +140,11 @@ pub fn decide(
     excluded_pids: &HashSet<u32>,
     f: &FlowInfo,
 ) -> Decision {
-    // 1. Always-direct destinations (LAN, multicast, DNS, NTP).
+    // 1. Always-direct destinations (LAN, multicast, NTP). Port 53 is excluded:
+    //    DNS is routed by the queried name (`decide_dns`), not by destination.
     if rs.lan_direct {
         let port = f.dst.port();
-        if is_always_direct_dst(f.dst.ip())
-            || port == 53
+        if (is_always_direct_dst(f.dst.ip()) && port != 53)
             || (f.proto == Protocol::Udp && port == 123)
         {
             return direct(MatchReason::AlwaysDirectDst);
@@ -189,10 +202,10 @@ fn eval_from(rs: &RuleSet, cands: &[Candidate], f: &FlowInfo) -> Decision {
             reason: reason.clone(),
         };
         match eval_conditions(r, f) {
-            RuleOutcome::Match => return finalize(&g.action, f, info()),
+            RuleOutcome::Match => return finalize(rs, &g.action, f, info()),
             RuleOutcome::NoMatch => {}
             RuleOutcome::NeedDomain => {
-                let Decision::Final(if_match, _) = finalize(&g.action, f, info()) else {
+                let Decision::Final(if_match, _) = finalize(rs, &g.action, f, info()) else {
                     return Decision::NeedDomain;
                 };
                 return match eval_from(rs, &cands[i + 1..], f) {
@@ -207,6 +220,7 @@ fn eval_from(rs: &RuleSet, cands: &[Candidate], f: &FlowInfo) -> Decision {
     // 6. Catch-all.
     match rs.groups.iter().find(|g| g.catch_all) {
         Some(g) => finalize(
+            rs,
             &g.action,
             f,
             MatchInfo {
@@ -217,6 +231,53 @@ fn eval_from(rs: &RuleSet, cands: &[Candidate], f: &FlowInfo) -> Decision {
         // Fail closed (Ruling R18): without a catch-all, unmatched traffic
         // is blocked, never sent direct from the real IP.
         None => Decision::Final(
+            Route::Block,
+            MatchInfo {
+                group_id: None,
+                reason: MatchReason::NoMatch,
+            },
+        ),
+    }
+}
+
+/// Route a DNS query by its name only. Only pure domain rules (rules whose sole
+/// conditions are domains) count: rules with apps, ips, ports or a protocol
+/// describe connections, not names. First matching enabled group wins, else the
+/// catch-all's action. The DNS layer handles transport, so no IPv6/UDP-443
+/// conversion happens here; a missing catch-all fails closed.
+pub fn decide_dns(rs: &RuleSet, name: &str) -> (Route, MatchInfo) {
+    let route_of = |a: &Action| match a {
+        Action::Direct => Route::Direct,
+        Action::Block => Route::Block,
+        Action::Proxy(id) => Route::Proxy(id.clone()),
+    };
+    for g in rs.groups.iter().filter(|g| !g.catch_all) {
+        let hit = g.rules.iter().any(|r| {
+            r.apps.is_empty()
+                && r.ips.is_empty()
+                && r.ports.is_empty()
+                && r.protocol.is_none()
+                && r.domains.iter().any(|m| m.matches(name))
+        });
+        if hit {
+            return (
+                route_of(&g.action),
+                MatchInfo {
+                    group_id: Some(g.id.clone()),
+                    reason: MatchReason::Own,
+                },
+            );
+        }
+    }
+    match rs.groups.iter().find(|g| g.catch_all) {
+        Some(g) => (
+            route_of(&g.action),
+            MatchInfo {
+                group_id: Some(g.id.clone()),
+                reason: MatchReason::CatchAll,
+            },
+        ),
+        None => (
             Route::Block,
             MatchInfo {
                 group_id: None,
