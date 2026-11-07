@@ -10,6 +10,7 @@ pub mod geo;
 pub mod ipc_server;
 pub mod nat;
 pub mod packet_loop;
+pub mod proxy_servers;
 pub mod relay;
 pub mod stats;
 #[cfg(test)]

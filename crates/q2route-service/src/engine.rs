@@ -34,6 +34,7 @@ use crate::packet_loop::{
     dns_sniff_loop, network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared,
     DNS_SNIFF_FILTER, NETWORK_FILTER, NETWORK_THREADS, SOCKET_FILTER,
 };
+use crate::proxy_servers::{self, ServerCache};
 use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
 use crate::udp_relay::UdpRelay;
@@ -103,11 +104,13 @@ impl Engine {
             idle_timeout: RELAY_IDLE_TIMEOUT,
             proxy_down: DashSet::new(),
             domains: Arc::new(DomainMap::new()),
+            proxy_servers: ArcSwap::from_pointee(Vec::new()),
         });
         let shared = Arc::new(Shared {
             relay,
             proxy_endpoints: ArcSwap::from_pointee(HashSet::new()),
             own_pid: std::process::id(),
+            server_cache: Arc::new(Mutex::new(ServerCache::default())),
         });
         Ok(Engine {
             inner: Arc::new(Inner {
@@ -382,6 +385,7 @@ impl Inner {
             proxy_up: mutex(&self.proxy_up).clone(),
             total_up_bps,
             total_down_bps,
+            proxy_servers: Vec::clone(&self.relay().proxy_servers.load()),
         }
     }
 
@@ -576,6 +580,8 @@ async fn refresh_processes(relay: &RelayCtx) {
 
 /// Resolves every proxy's `host:port` (always Direct) and finds the pid
 /// listening on it (excluded: always Direct), plus the service itself.
+/// Then refreshes the proxy server names from those listeners' configs
+/// ([`crate::proxy_servers`]; files are re-read only when changed).
 async fn refresh_exclusions(shared: &Shared) {
     let proxies: Vec<(String, u16)> = shared
         .relay
@@ -604,8 +610,32 @@ async fn refresh_exclusions(shared: &Shared) {
     })
     .await
     .unwrap_or_else(|_| HashSet::from([own]));
+    let exes: Vec<PathBuf> = {
+        let tree = shared.relay.tree.read().unwrap_or_else(|e| e.into_inner());
+        excluded
+            .iter()
+            .filter(|&&pid| pid != own)
+            .filter_map(|&pid| tree.get(pid).map(|p| p.exe.clone()))
+            .collect()
+    };
     shared.relay.excluded.store(Arc::new(excluded));
     shared.proxy_endpoints.store(Arc::new(endpoints));
+    let cache = shared.server_cache.clone();
+    let servers = tokio::task::spawn_blocking(move || {
+        mutex(&cache).refresh(&proxy_servers::find_configs(&exes))
+    })
+    .await;
+    if let Ok(servers) = servers {
+        if *shared.relay.proxy_servers.load_full() != servers {
+            let names = if servers.is_empty() {
+                "none".to_string()
+            } else {
+                servers.join(", ")
+            };
+            tracing::info!("proxy servers resolved directly: {names}");
+            shared.relay.proxy_servers.store(Arc::new(servers));
+        }
+    }
 }
 
 /// Per-run upkeep: process tree (1 s), exclusions (5 s), NAT and flow-cache

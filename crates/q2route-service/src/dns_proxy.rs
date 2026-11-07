@@ -27,6 +27,7 @@ use std::time::Duration;
 use q2route_core::config::{Config, ProfileId, ProxyKind, ProxyProfile};
 use q2route_core::dns::{answers, parse_query, refused, response_id, truncated, with_id};
 use q2route_core::ipc::Event;
+use q2route_core::matchers::DomainPattern;
 use q2route_core::proxy::{decode_udp, encode_udp, udp_associate};
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
@@ -140,6 +141,39 @@ pub fn is_proxy_host(cfg: &Config, name: &str) -> bool {
             let literal = host.trim_start_matches('[').trim_end_matches(']');
             literal.parse::<IpAddr>().is_err() && host.eq_ignore_ascii_case(name)
         })
+}
+
+/// Names the DNS paths always resolve directly, checked before the rules
+/// (the proxy cannot resolve the names it needs to come up). Returns the
+/// reason label, or `None` (routed by name as usual):
+/// - `"proxy host"`: a configured proxy's host name ([`is_proxy_host`]);
+/// - `"direct name"`: matches an entry of `settings.dns.direct_names`
+///   (invalid entries never match);
+/// - `"proxy server"`: equals a name in `auto`, the servers detected from
+///   the running proxy client's config ([`crate::proxy_servers`]).
+pub fn bootstrap_direct(cfg: &Config, auto: &[String], name: &str) -> Option<&'static str> {
+    if is_proxy_host(cfg, name) {
+        return Some("proxy host");
+    }
+    let bare = name.trim_end_matches('.');
+    if bare.is_empty() {
+        return None;
+    }
+    let direct = cfg
+        .settings
+        .dns
+        .direct_names
+        .iter()
+        .any(|n| DomainPattern::parse(n).is_ok_and(|p| p.matches(bare)));
+    if direct {
+        return Some("direct name");
+    }
+    auto.iter()
+        .any(|a| {
+            let a = a.trim_end_matches('.');
+            !a.is_empty() && a.eq_ignore_ascii_case(bare)
+        })
+        .then_some("proxy server")
 }
 
 /// Injects `msg` (if any) to `app` as a UDP packet from `server`.

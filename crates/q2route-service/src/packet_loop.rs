@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -37,10 +37,11 @@ use crate::classify::{
     build_rst_to_app, classify, parse, Action, FlowCache, FlowId, PROTO_TCP, PROTO_UDP,
 };
 use crate::conns::{ConnLog, NewConn};
-use crate::dns_proxy::{is_proxy_host, DnsProxy, DnsQuery};
+use crate::dns_proxy::{bootstrap_direct, DnsProxy, DnsQuery};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
-use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
+use crate::proxy_servers::ServerCache;
+use crate::relay::{describe, exe_name, proxy_program, OrigDstLookup, RelayCtx};
 use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
 use crate::udp_relay::{Datagram, InboundSink, UdpRelay};
 use crate::winapi;
@@ -69,6 +70,9 @@ pub struct Shared {
     /// relay's upstream connections can never loop back into the relay.
     pub proxy_endpoints: ArcSwap<HashSet<SocketAddr>>,
     pub own_pid: u32,
+    /// Engine-only: proxy client config files already read
+    /// ([`crate::proxy_servers`]); never touched on the packet path.
+    pub server_cache: Arc<Mutex<ServerCache>>,
 }
 
 /// State of one Start..Stop run.
@@ -452,8 +456,9 @@ fn udp_payload(p: &[u8]) -> Option<&[u8]> {
 enum DnsVerdict {
     /// Send it to the server the app asked.
     Pass,
-    /// A configured proxy's own host name: always sent direct.
-    ProxyHost,
+    /// A bootstrap name ([`bootstrap_direct`], the label says which
+    /// source): always sent direct.
+    Bootstrap(&'static str),
     Drop,
     /// Answer REFUSED.
     Refuse,
@@ -461,13 +466,15 @@ enum DnsVerdict {
     Proxy(ProfileId),
 }
 
-/// Routes a UDP/53 payload by its queried name: a proxy's host name
-/// ([`is_proxy_host`]) passes, anything else by [`decide_dns`]. A payload
+/// Routes a UDP/53 payload by its queried name: a bootstrap name
+/// ([`bootstrap_direct`]: proxy hosts, `direct_names`, the detected proxy
+/// servers in `auto`) passes, anything else by [`decide_dns`]. A payload
 /// that is not a single-question query only passes when the catch-all is
 /// Direct (it could carry a proxied name), else it is dropped.
 fn dns_verdict<'a>(
     rules: &RuleSet,
     cfg: &Config,
+    auto: &[String],
     msg: Option<&'a [u8]>,
 ) -> (DnsVerdict, Option<Query<'a>>) {
     let Some(q) = msg.and_then(parse_query) else {
@@ -483,8 +490,8 @@ fn dns_verdict<'a>(
         };
         return (v, None);
     };
-    if is_proxy_host(cfg, &q.name) {
-        return (DnsVerdict::ProxyHost, Some(q));
+    if let Some(why) = bootstrap_direct(cfg, auto, &q.name) {
+        return (DnsVerdict::Bootstrap(why), Some(q));
     }
     let v = match decide_dns(rules, &q.name).0 {
         Route::Direct => DnsVerdict::Pass,
@@ -495,7 +502,8 @@ fn dns_verdict<'a>(
 }
 
 /// An outbound UDP/53 packet: the service's own (and anything to a proxy
-/// endpoint) passes; everything else is routed by the queried name only.
+/// endpoint) passes, and so does the proxy program's ([`proxy_program`]);
+/// everything else is routed by the queried name only.
 fn dns_packet(
     pkt: &[u8],
     addr: &Address,
@@ -504,14 +512,44 @@ fn dns_packet(
     run: &RunState,
     dns: &DnsProxy,
 ) -> Out {
-    if shared.proxy_endpoints.load().contains(&f.remote) || lookup_pid(run, f) == shared.own_pid {
+    if shared.proxy_endpoints.load().contains(&f.remote) {
+        return Out::Send;
+    }
+    let pid = lookup_pid(run, f);
+    if pid == shared.own_pid {
         return Out::Send;
     }
     let msg = udp_payload(pkt);
-    let (v, q) = dns_verdict(&shared.relay.rules.load(), &shared.relay.cfg.load(), msg);
+    ensure_process(&shared.relay.tree, pid);
+    let program = {
+        let tree = shared.relay.tree.read().unwrap_or_else(|e| e.into_inner());
+        let rules = shared.relay.rules.load();
+        proxy_program(&rules, &tree, &shared.relay.excluded.load(), pid).is_some()
+    };
+    if program {
+        match msg.and_then(parse_query) {
+            Some(q) => tracing::debug!(
+                "dns name={} type={} pid={pid} via=direct (proxy program)",
+                q.name,
+                q.qtype
+            ),
+            None => tracing::debug!(
+                "dns {} -> {} pid={pid} via=direct (proxy program)",
+                f.local,
+                f.remote
+            ),
+        }
+        return Out::Send;
+    }
+    let (v, q) = dns_verdict(
+        &shared.relay.rules.load(),
+        &shared.relay.cfg.load(),
+        &shared.relay.proxy_servers.load(),
+        msg,
+    );
     let via = match &v {
         DnsVerdict::Pass => "direct".to_string(),
-        DnsVerdict::ProxyHost => "direct (proxy host)".to_string(),
+        DnsVerdict::Bootstrap(why) => format!("direct ({why})"),
         DnsVerdict::Drop => "drop".to_string(),
         DnsVerdict::Refuse => "block".to_string(),
         DnsVerdict::Proxy(id) => format!("proxy '{id}'"),
@@ -522,7 +560,7 @@ fn dns_packet(
     }
     let msg = msg.unwrap_or_default();
     match v {
-        DnsVerdict::Pass | DnsVerdict::ProxyHost => Out::Send,
+        DnsVerdict::Pass | DnsVerdict::Bootstrap(_) => Out::Send,
         DnsVerdict::Drop => Out::Drop,
         DnsVerdict::Refuse => {
             let reply = refused(msg).and_then(|r| match (f.remote, f.local) {
@@ -773,11 +811,11 @@ mod tests {
     fn malformed_query_dropped_when_catch_all_proxied() {
         let rules = seed_rules();
         assert_eq!(
-            dns_verdict(&rules, &Config::seed(), Some(b"garbage")).0,
+            dns_verdict(&rules, &Config::seed(), &[], Some(b"garbage")).0,
             DnsVerdict::Drop
         );
         assert_eq!(
-            dns_verdict(&rules, &Config::seed(), None).0,
+            dns_verdict(&rules, &Config::seed(), &[], None).0,
             DnsVerdict::Drop
         );
         let mut cfg = Config::seed();
@@ -786,7 +824,7 @@ mod tests {
         }
         let direct = RuleSet::compile(&cfg).unwrap();
         assert_eq!(
-            dns_verdict(&direct, &cfg, Some(b"garbage")).0,
+            dns_verdict(&direct, &cfg, &[], Some(b"garbage")).0,
             DnsVerdict::Pass
         );
     }
@@ -795,12 +833,12 @@ mod tests {
     fn dns_query_routed_by_name() {
         let rules = seed_rules();
         let q = dns_query("example.com");
-        let (v, parsed) = dns_verdict(&rules, &Config::seed(), Some(&q));
+        let (v, parsed) = dns_verdict(&rules, &Config::seed(), &[], Some(&q));
         assert_eq!(v, DnsVerdict::Proxy("v2ray".into()));
         assert_eq!(parsed.unwrap().name, "example.com");
         let q = dns_query("www.digikala.ir");
         assert_eq!(
-            dns_verdict(&rules, &Config::seed(), Some(&q)).0,
+            dns_verdict(&rules, &Config::seed(), &[], Some(&q)).0,
             DnsVerdict::Pass
         );
         let mut cfg = Config::seed();
@@ -809,7 +847,10 @@ mod tests {
         }
         let block = RuleSet::compile(&cfg).unwrap();
         let q = dns_query("example.com");
-        assert_eq!(dns_verdict(&block, &cfg, Some(&q)).0, DnsVerdict::Refuse);
+        assert_eq!(
+            dns_verdict(&block, &cfg, &[], Some(&q)).0,
+            DnsVerdict::Refuse
+        );
     }
 
     #[test]
@@ -819,13 +860,30 @@ mod tests {
         let rules = RuleSet::compile(&cfg).unwrap();
         for name in ["proxy.example.net", "PROXY.example.NET"] {
             let q = dns_query(name);
-            assert_eq!(dns_verdict(&rules, &cfg, Some(&q)).0, DnsVerdict::ProxyHost);
+            assert_eq!(
+                dns_verdict(&rules, &cfg, &[], Some(&q)).0,
+                DnsVerdict::Bootstrap("proxy host")
+            );
         }
         let q = dns_query("other.example.net");
         assert_eq!(
-            dns_verdict(&rules, &cfg, Some(&q)).0,
+            dns_verdict(&rules, &cfg, &[], Some(&q)).0,
             DnsVerdict::Proxy("v2ray".into())
         );
+    }
+
+    #[test]
+    fn bootstrap_names_go_direct() {
+        let mut cfg = Config::seed();
+        cfg.settings.dns.direct_names = vec!["*.manual.example".into()];
+        let rules = RuleSet::compile(&cfg).unwrap();
+        let auto = vec!["vpn.example.com".to_string()];
+        let v = |n: &str| dns_verdict(&rules, &cfg, &auto, Some(&dns_query(n))).0;
+        assert_eq!(v("vpn.example.com"), DnsVerdict::Bootstrap("proxy server"));
+        assert_eq!(v("a.manual.example"), DnsVerdict::Bootstrap("direct name"));
+        // Everything else still decides by the rules (catch-all Proxy).
+        assert_eq!(v("x.vpn.example.com"), DnsVerdict::Proxy("v2ray".into()));
+        assert_eq!(v("example.com"), DnsVerdict::Proxy("v2ray".into()));
     }
 
     #[test]

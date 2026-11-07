@@ -18,6 +18,7 @@ fn snapshot() -> StateSnapshot {
         proxy_up: Default::default(),
         total_up_bps: 0,
         total_down_bps: 0,
+        proxy_servers: vec![],
     }
 }
 

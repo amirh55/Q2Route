@@ -54,6 +54,7 @@ async fn server_msgs_roundtrip() {
         proxy_up: HashMap::from([("v2ray".to_string(), true)]),
         total_up_bps: 10,
         total_down_bps: 20,
+        proxy_servers: vec!["vpn.example.com".into()],
     };
     let msgs = vec![
         ServerMsg::Response(Response::Ok),
@@ -190,10 +191,28 @@ fn set_dns_and_flush_roundtrip() {
         Request::SetDns(q2route_core::config::DnsSettings {
             proxy_resolver: "9.9.9.9:53".into(),
             block_doh: false,
+            direct_names: vec!["vpn.example.com".into()],
         }),
         Request::FlushDns,
     ] {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
     }
+}
+
+#[test]
+fn snapshot_without_proxy_servers_decodes() {
+    let snap = StateSnapshot {
+        running: false,
+        config: Config::seed(),
+        groups: HashMap::new(),
+        proxy_up: HashMap::new(),
+        total_up_bps: 0,
+        total_down_bps: 0,
+        proxy_servers: vec!["x.example".into()],
+    };
+    let mut v = serde_json::to_value(&snap).unwrap();
+    v.as_object_mut().unwrap().remove("proxy_servers");
+    let old: StateSnapshot = serde_json::from_value(v).unwrap();
+    assert!(old.proxy_servers.is_empty());
 }

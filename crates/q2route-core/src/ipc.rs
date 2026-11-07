@@ -54,6 +54,10 @@ pub struct StateSnapshot {
     pub proxy_up: HashMap<ProfileId, bool>,
     pub total_up_bps: u64,
     pub total_down_bps: u64,
+    /// Proxy server names detected from the running proxy client's config
+    /// (resolved directly).
+    #[serde(default)]
+    pub proxy_servers: Vec<String>,
 }
 
 // The snapshot embeds Config (now with DNS settings); boxing would ripple through every IPC site.

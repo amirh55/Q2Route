@@ -12,7 +12,7 @@ use dashmap::DashSet;
 use q2route_core::config::{Action, Config, Group, ProxyKind, ProxyProfile, Rule, Settings};
 use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
-use q2route_core::process_tree::ProcessTree;
+use q2route_core::process_tree::{ProcInfo, ProcessTree};
 use q2route_core::ruleset::RuleSet;
 use q2route_service::nat::OriginalDst;
 use q2route_service::relay::{run_relay, OrigDstLookup, RelayCtx};
@@ -127,6 +127,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         idle_timeout: Duration::from_secs(7200),
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
+        proxy_servers: ArcSwap::from_pointee(vec![]),
     })
 }
 
@@ -463,6 +464,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         events: c.events.clone(),
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
+        proxy_servers: ArcSwap::from_pointee(vec![]),
     });
     let r = start(v4(origin), c).await;
     let mut client = TcpStream::connect(r.addr).await.unwrap();
@@ -1076,4 +1078,93 @@ async fn udp_unavailable_answers_tc_then_tcp_resolves_via_proxy() {
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
     r.cancel.cancel();
     cancel.cancel();
+}
+
+/// Sends one query for `name` through the relay and checks it reached the
+/// original server directly and was logged Direct.
+async fn assert_tcp_dns_direct(server_ip: &str, c: Arc<RelayCtx>, name: &str) {
+    let (orig, accepts, mut seen) = dns_server(server_ip).await;
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(7, name);
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    let row = wait_row(&c).await;
+    assert_eq!(row.domain.as_deref(), Some(name));
+    assert_eq!(row.route, q2route_core::decide::Route::Direct);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_from_excluded_pid_goes_direct() {
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let c = ctx(config(vec![http_profile(pport)], dns_groups()));
+    c.excluded.store(Arc::new(HashSet::from([4242])));
+    assert_tcp_dns_direct("127.53.0.9", c, "example.com").await;
+    assert!(targets.try_recv().is_err(), "went through the proxy");
+}
+
+#[tokio::test]
+async fn tcp_dns_from_always_direct_exe_goes_direct() {
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.always_direct = vec!["xray.exe".into()];
+    let c = ctx(cfg);
+    c.tree.write().unwrap().insert(ProcInfo {
+        pid: 4242,
+        parent: 1,
+        exe: r"C:\v2rayN\bin\xray\xray.exe".into(),
+        start_time: 0,
+    });
+    assert_tcp_dns_direct("127.53.0.10", c, "example.com").await;
+    assert!(targets.try_recv().is_err(), "went through the proxy");
+}
+
+/// Own exe only (Ruling R8): an app started by an always-direct GUI is
+/// still routed by name.
+#[tokio::test]
+async fn tcp_dns_child_of_always_direct_exe_is_routed() {
+    let (orig, accepts, _) = dns_server("127.53.0.11").await;
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.always_direct = vec!["v2rayn.exe".into()];
+    let c = ctx(cfg);
+    {
+        let mut t = c.tree.write().unwrap();
+        t.insert(ProcInfo {
+            pid: 100,
+            parent: 1,
+            exe: r"C:\v2rayN\v2rayN.exe".into(),
+            start_time: 0,
+        });
+        t.insert(ProcInfo {
+            pid: 4242,
+            parent: 100,
+            exe: r"C:\Apps\browser.exe".into(),
+            start_time: 0,
+        });
+    }
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(9, "example.com");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut targets).await, "1.1.1.1:53");
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_dns_bootstrap_names_go_direct() {
+    let (pport, mut targets, _) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.settings.dns.direct_names = vec!["*.manual.example".into()];
+    let c = ctx(cfg.clone());
+    c.proxy_servers
+        .store(Arc::new(vec!["vpn.example.com".to_string()]));
+    assert_tcp_dns_direct("127.53.0.12", c, "vpn.example.com").await;
+    assert_tcp_dns_direct("127.53.0.13", ctx(cfg), "a.manual.example").await;
+    assert!(targets.try_recv().is_err(), "went through the proxy");
 }

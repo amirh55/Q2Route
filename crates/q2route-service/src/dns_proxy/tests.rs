@@ -331,6 +331,48 @@ fn proxy_host_matches_hostnames_only() {
     assert!(!is_proxy_host(&c, "proxy.example.net"));
 }
 
+#[test]
+fn bootstrap_direct_sources() {
+    let mut c = config(profile(ProxyKind::Socks5, 1080));
+    c.proxies[0].host = "proxy.example.net".into();
+    c.settings.dns.direct_names = vec![
+        "manual.example.com".into(),
+        "*.cdn.example.org".into(),
+        "keyword:myvpn".into(),
+    ];
+    let auto = vec!["vpn.example.com".to_string()];
+    let bd = |n: &str| bootstrap_direct(&c, &auto, n);
+    assert_eq!(bd("proxy.example.net"), Some("proxy host"));
+    assert_eq!(bd("Manual.Example.com."), Some("direct name"));
+    assert_eq!(bd("a.cdn.example.org"), Some("direct name"));
+    assert_eq!(bd("cdn.example.org"), Some("direct name"));
+    assert_eq!(bd("www.myvpn.io"), Some("direct name"));
+    assert_eq!(bd("vpn.example.com"), Some("proxy server"));
+    assert_eq!(bd("VPN.example.com."), Some("proxy server"));
+    // Fail closed: only the exact names.
+    for n in [
+        "example.com",
+        "sub.vpn.example.com",
+        "manual.example.com.evil.net",
+        "example.org",
+        "",
+        ".",
+    ] {
+        assert_eq!(bd(n), None, "{n}");
+    }
+    // The proxy host wins over the other sources.
+    c.settings.dns.direct_names = vec!["proxy.example.net".into()];
+    assert_eq!(
+        bootstrap_direct(&c, &[], "proxy.example.net"),
+        Some("proxy host")
+    );
+    // An invalid stored entry is ignored, never a panic.
+    c.settings.dns.direct_names = vec!["*.".into()];
+    assert_eq!(bootstrap_direct(&c, &[], "x.example"), None);
+    // An empty auto entry never matches.
+    assert_eq!(bootstrap_direct(&c, &[String::new()], ""), None);
+}
+
 #[tokio::test]
 async fn profile_edit_reassociates_and_delete_refuses() {
     let m1 = mock(MockOpts::default()).await;

@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::conns::{ConnBytes, ConnLog, NewConn};
-use crate::dns_proxy::is_proxy_host;
+use crate::dns_proxy::bootstrap_direct;
 use crate::nat::OriginalDst;
 use crate::stats::Stats;
 
@@ -105,6 +105,9 @@ pub struct RelayCtx {
     /// IP -> names learned from DNS answers (sniffed and proxied), so
     /// domain rules can decide flows that carry no SNI / Host.
     pub domains: Arc<DomainMap>,
+    /// Server names detected from the running proxy client's config
+    /// (refreshed by the engine): their DNS queries are resolved directly.
+    pub proxy_servers: ArcSwap<Vec<String>>,
 }
 
 /// Production idle timeout of a relayed connection.
@@ -388,11 +391,43 @@ async fn connect_direct(ctx: &RelayCtx, dst: SocketAddrV4) -> io::Result<(TcpStr
 const DNS_FIRST_MAX: usize = 4096;
 const DNS_FIRST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Route of a DNS query for `name`: a configured proxy's own host name is
-/// Direct (resolving the proxy cannot need the proxy), anything else by
-/// [`decide_dns`] (the queried name only).
-fn dns_route(ctx: &RelayCtx, name: &str) -> (Route, MatchInfo) {
-    if is_proxy_host(&ctx.cfg.load(), name) {
+/// Whether `pid` is the proxy program itself: a pid listening on a
+/// configured proxy endpoint (`excluded`) or a process whose OWN exe is
+/// always-direct (Ruling R8; children are not). Its DNS is always Direct.
+pub fn proxy_program(
+    rules: &RuleSet,
+    tree: &ProcessTree,
+    excluded: &HashSet<u32>,
+    pid: u32,
+) -> Option<MatchReason> {
+    if excluded.contains(&pid) {
+        return Some(MatchReason::ExcludedPid);
+    }
+    tree.get(pid)
+        .is_some_and(|p| rules.always_direct.iter().any(|m| m.matches(&p.exe)))
+        .then_some(MatchReason::AlwaysDirectApp)
+}
+
+/// Route of a DNS query for `name` from `pid`: the proxy program's own
+/// queries ([`proxy_program`]) and bootstrap names ([`bootstrap_direct`])
+/// are Direct, anything else by [`decide_dns`] (the queried name only).
+fn dns_route(ctx: &RelayCtx, pid: u32, name: &str) -> (Route, MatchInfo) {
+    let program = {
+        let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
+        proxy_program(&ctx.rules.load(), &tree, &ctx.excluded.load(), pid)
+    };
+    if let Some(reason) = program {
+        tracing::debug!("dns name={name} pid={pid} via=direct (proxy program)");
+        return (
+            Route::Direct,
+            MatchInfo {
+                group_id: None,
+                reason,
+            },
+        );
+    }
+    if let Some(why) = bootstrap_direct(&ctx.cfg.load(), &ctx.proxy_servers.load(), name) {
+        tracing::debug!("dns name={name} pid={pid} via=direct ({why})");
         let info = MatchInfo {
             group_id: None,
             reason: MatchReason::ExcludedPid,
@@ -455,7 +490,7 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
         return;
     };
     let (name, qtype) = (q.name, q.qtype);
-    let (route, info) = dns_route(ctx, &name);
+    let (route, info) = dns_route(ctx, orig.pid, &name);
     let group = group_of(&info);
     let what = describe(&Decision::Final(route.clone(), info.clone()));
     let (exe, reason) = {
@@ -509,18 +544,19 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
         Route::Proxy(_) => "proxied to the resolver",
         _ => "direct",
     });
-    dns_pump(client, up, &first, &route, ctx, group, &bytes).await
+    let same_route = |n: &str| dns_route(ctx, orig.pid, n).0 == route;
+    dns_pump(client, up, &first, same_route, ctx, group, &bytes).await
 }
 
 /// [`pump`] for DNS over TCP: relays whole length-prefixed messages. Each
-/// client query is parsed and its route checked against `route` before it
-/// is sent (a query that does not parse or decides differently ends the
+/// client query is parsed and its name checked with `same_route` (decides
+/// the first query's route) before it is sent (a query that does not parse or decides differently ends the
 /// connection); each answer feeds `ctx.domains` on its way back.
 async fn dns_pump(
     client: TcpStream,
     upstream: TcpStream,
     first: &[u8],
-    route: &Route,
+    same_route: impl Fn(&str) -> bool,
     ctx: &RelayCtx,
     group: &str,
     bytes: &ConnBytes,
@@ -538,7 +574,7 @@ async fn dns_pump(
     let max = usize::from(u16::MAX);
     let up = async {
         while let Some(m) = read_dns_msg(&mut cr, max).await? {
-            let same = parse_query(&m[2..]).is_some_and(|q| dns_route(ctx, &q.name).0 == *route);
+            let same = parse_query(&m[2..]).is_some_and(|q| same_route(&q.name));
             if !same {
                 tracing::debug!(
                     "tcp dns: a later query is malformed or routed differently; closing"

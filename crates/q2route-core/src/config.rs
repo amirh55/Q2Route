@@ -162,6 +162,11 @@ pub struct DnsSettings {
     /// Block DoH (known hosts on TCP 443) and DoT/DoQ (port 853) for proxied flows.
     #[serde(default = "yes")]
     pub block_doh: bool,
+    /// Names always resolved directly (rule-domain syntax: `example.com`,
+    /// `*.example.com`, `keyword:x`), e.g. the VPN server the proxy
+    /// client connects to when it is not detected automatically.
+    #[serde(default)]
+    pub direct_names: Vec<String>,
 }
 
 impl Default for DnsSettings {
@@ -169,6 +174,7 @@ impl Default for DnsSettings {
         DnsSettings {
             proxy_resolver: default_resolver(),
             block_doh: true,
+            direct_names: Vec::new(),
         }
     }
 }
@@ -435,6 +441,11 @@ impl Config {
                     "DNS proxy resolver '{}' is not an address:port",
                     d.proxy_resolver
                 )));
+            }
+            for n in &d.direct_names {
+                DomainPattern::parse(n).map_err(|_| {
+                    ConfigError::Invalid(format!("DNS direct name '{n}' is not a valid domain"))
+                })?;
             }
             c.settings.dns = d;
             Ok(())

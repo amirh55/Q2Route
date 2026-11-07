@@ -74,6 +74,7 @@ pub fn ctx(cfg: Config) -> Arc<RelayCtx> {
         idle_timeout: Duration::from_secs(7200),
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
+        proxy_servers: ArcSwap::from_pointee(vec![]),
     })
 }
 
