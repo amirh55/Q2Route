@@ -105,6 +105,17 @@ pub fn parse_inbound(p: &[u8]) -> (SocketAddrV4, SocketAddrV4, Vec<u8>) {
 pub async fn echo() -> (SocketAddrV4, mpsc::UnboundedReceiver<Vec<u8>>) {
     let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = v4(s.local_addr().unwrap());
+    (addr, serve_echo(s))
+}
+
+/// Like [`echo`] on `[::1]`; `None` if IPv6 loopback cannot be bound.
+pub async fn echo6() -> Option<(SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>)> {
+    let s = UdpSocket::bind("[::1]:0").await.ok()?;
+    let addr = s.local_addr().unwrap();
+    Some((addr, serve_echo(s)))
+}
+
+fn serve_echo(s: UdpSocket) -> mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -113,7 +124,7 @@ pub async fn echo() -> (SocketAddrV4, mpsc::UnboundedReceiver<Vec<u8>>) {
             let _ = s.send_to(&buf[..n], from).await;
         }
     });
-    (addr, rx)
+    rx
 }
 
 #[derive(Default)]
@@ -151,6 +162,8 @@ pub async fn try_mock(opts: MockOpts) -> Option<Mock> {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
     let outer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    // IPv6 targets are reached from [::1] (absent without IPv6 loopback).
+    let outer6 = UdpSocket::bind("[::1]:0").await.ok().map(Arc::new);
     let relay_port = relay.local_addr().unwrap().port();
     let outer_addr = outer.local_addr().unwrap();
     let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
@@ -158,7 +171,7 @@ pub async fn try_mock(opts: MockOpts) -> Option<Mock> {
     let close_control = Arc::new(Notify::new());
 
     // Client -> target.
-    let (r, o, c) = (relay.clone(), outer.clone(), client.clone());
+    let (r, o, o6, c) = (relay.clone(), outer.clone(), outer6.clone(), client.clone());
     let unsolicited = opts.unsolicited;
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -168,7 +181,14 @@ pub async fn try_mock(opts: MockOpts) -> Option<Mock> {
             let Some((dst, payload)) = decode_udp(&buf[..n]) else {
                 continue;
             };
-            let _ = o.send_to(payload, dst).await;
+            match (dst, &o6) {
+                (SocketAddr::V6(_), Some(o6)) => {
+                    let _ = o6.send_to(payload, dst).await;
+                }
+                _ => {
+                    let _ = o.send_to(payload, dst).await;
+                }
+            }
             if first {
                 first = false;
                 if let Some(u) = unsolicited {
@@ -179,16 +199,18 @@ pub async fn try_mock(opts: MockOpts) -> Option<Mock> {
         }
     });
     // Target -> client.
-    let (r, o, c) = (relay.clone(), outer, client);
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok((n, from)) = o.recv_from(&mut buf).await {
-            let to = *c.lock().unwrap();
-            if let Some(to) = to {
-                let _ = r.send_to(&encode_udp(from, &buf[..n]), to).await;
+    for o in std::iter::once(outer).chain(outer6) {
+        let (r, c) = (relay.clone(), client.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, from)) = o.recv_from(&mut buf).await {
+                let to = *c.lock().unwrap();
+                if let Some(to) = to {
+                    let _ = r.send_to(&encode_udp(from, &buf[..n]), to).await;
+                }
             }
-        }
-    });
+        });
+    }
     // Control connections.
     let (a, cc) = (attempts.clone(), close_control.clone());
     let (delay, rep, v6) = (opts.delay, opts.rep, opts.v6);

@@ -6,9 +6,10 @@
 //! * Network layer: every outbound, non-loopback TCP/UDP packet. Relay
 //!   replies (`A:relay_port -> D:pa`) are restored to the app; everything else
 //!   goes through [`classify`], which only ever passes Direct flows.
-//!   Outbound ICMPv4 destination-unreachable is captured too: one quoting a
-//!   UDP packet to a port the UDP relay serves (the stack answering an
-//!   injected reply from the real IP) is dropped; any other passes as before.
+//!   Outbound ICMPv4 / ICMPv6 destination-unreachable is captured too: one
+//!   quoting a UDP packet to a port the UDP relay serves for that family (the
+//!   stack answering an injected reply from the real IP) is dropped; any
+//!   other is sent unchanged.
 //!   UDP/53 queries are routed by the queried name ([`dns_verdict`]):
 //!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped; a
 //!   UDP/53 payload that is not a DNS query is an ordinary UDP flow.
@@ -20,7 +21,7 @@
 //!   domain rules decide flows without a peek.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,8 +56,8 @@ use crate::windivert::{
 
 pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event == CLOSE)) \
      or (udp and event == BIND) or (tcp and event == ACCEPT)";
-pub const NETWORK_FILTER: &str =
-    "outbound and !loopback and ((tcp or udp) or (icmp and icmp.Type == 3))";
+pub const NETWORK_FILTER: &str = "outbound and !loopback and ((tcp or udp) \
+     or (icmp and icmp.Type == 3) or (icmpv6 and icmpv6.Type == 1))";
 /// Sniff-only handle: DNS answers arriving from the network.
 pub const DNS_SNIFF_FILTER: &str = "inbound and !loopback and udp.SrcPort == 53";
 /// Threads receiving from the Network-layer handle.
@@ -235,22 +236,6 @@ impl InboundSink for NetworkSink {
     }
 }
 
-/// A Socket-layer local address as the UDP relay keys it: IPv4 or
-/// v4-mapped as is, the IPv6 wildcard as `0.0.0.0` (same port); `None` for
-/// other IPv6 (never relayed).
-fn relay_local(a: SocketAddr) -> Option<SocketAddrV4> {
-    match a {
-        SocketAddr::V4(a) => Some(a),
-        SocketAddr::V6(a) if a.ip().is_unspecified() => {
-            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, a.port()))
-        }
-        SocketAddr::V6(a) => a
-            .ip()
-            .to_ipv4_mapped()
-            .map(|ip| SocketAddrV4::new(ip, a.port())),
-    }
-}
-
 pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp: Arc<UdpRelay>) {
     loop {
         let addr = match h.recv(&mut []) {
@@ -280,10 +265,9 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp:
                     Protocol::Udp
                 };
                 conns.close_local(proto, s.local);
+                // IPv4 or IPv6; the relay matches it per family.
                 if s.protocol == PROTO_UDP {
-                    if let Some(l) = relay_local(s.local) {
-                        udp.close(l);
-                    }
+                    udp.close(s.local);
                 }
                 // A new socket reusing this local port must not inherit
                 // the old socket's decision.
@@ -375,11 +359,18 @@ fn route_packet(
     if !addr.outbound() {
         return Out::Send;
     }
-    // ICMPv4 (the filter captures only type 3): never a proxied flow; only
-    // the stack's answer to an injected relay reply is held back.
+    // ICMPv4 type 3 / ICMPv6 type 1 (all the filter captures of them):
+    // never a proxied flow; only the stack's answer to an injected relay
+    // reply is held back.
     if pkt.first().is_some_and(|b| b >> 4 == 4) && pkt.get(9) == Some(&PROTO_ICMP) {
         return match icmp_quoted_udp_dst_port(pkt) {
-            Some(port) if udp.serves_port(port) => Out::Drop,
+            Some(port) if udp.serves_port(Family::V4, port) => Out::Drop,
+            _ => Out::Send,
+        };
+    }
+    if pkt.first().is_some_and(|b| b >> 4 == 6) && pkt.get(6) == Some(&PROTO_ICMPV6) {
+        return match icmpv6_quoted_udp_dst_port(pkt) {
+            Some(port) if udp.serves_port(Family::V6, port) => Out::Drop,
             _ => Out::Send,
         };
     }
@@ -468,16 +459,15 @@ fn route_packet(
             profile,
             group_id,
         } => {
-            let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (f.local, f.remote) else {
-                return Out::Drop;
-            };
-            if let Some(payload) = udp4_payload(pkt) {
+            // IPv4 or IPv6 (no extension headers, consistent lengths);
+            // anything else is only dropped.
+            if let Some(payload) = udp_payload(pkt) {
                 udp.submit(Datagram {
                     pid,
                     profile,
                     group_id,
-                    local,
-                    remote,
+                    local: f.local,
+                    remote: f.remote,
                     payload: payload.to_vec(),
                     addr: *addr,
                 });
@@ -492,6 +482,7 @@ fn route_packet(
 }
 
 const PROTO_ICMP: u8 = 1;
+const PROTO_ICMPV6: u8 = 58;
 
 /// IPv6 TCP to port 53: always Direct in M4 (documented gap; there is no
 /// IPv6 relay to route it by name).
@@ -552,6 +543,27 @@ fn icmp_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
     be16(q, qihl + 2)
 }
 
+/// For an IPv6 ICMPv6 destination unreachable (type 1, directly after the
+/// fixed header) quoting an IPv6/UDP packet (UDP directly after its fixed
+/// header): the quoted UDP destination port. `None` for anything else or
+/// anything malformed / truncated.
+fn icmpv6_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
+    if p.len() < 40 || p[0] >> 4 != 6 || p[6] != PROTO_ICMPV6 {
+        return None;
+    }
+    let total = (40 + usize::from(u16::from_be_bytes([p[4], p[5]]))).min(p.len());
+    let icmp = p.get(40..total)?;
+    if *icmp.first()? != 1 {
+        return None;
+    }
+    // ICMPv6 header (8 bytes), then the quoted IPv6 header + UDP header.
+    let q = icmp.get(8..)?;
+    if q.len() < 40 || q[0] >> 4 != 6 || q[6] != PROTO_UDP {
+        return None;
+    }
+    Some(u16::from_be_bytes([*q.get(42)?, *q.get(43)?]))
+}
+
 /// UDP payload of an IPv4/UDP packet (bounded by the UDP and IP lengths);
 /// `None` if the lengths are inconsistent (e.g. a truncated fragment).
 fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
@@ -565,7 +577,8 @@ fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
 }
 
 /// UDP payload of an IPv4 or IPv6 UDP packet. IPv6 with extension headers
-/// is not parsed (`None`: treated as malformed by the DNS path).
+/// (fragments included) is not parsed (`None`: treated as malformed by the
+/// DNS path, dropped by the UDP relay path).
 fn udp_payload(p: &[u8]) -> Option<&[u8]> {
     match *p.first()? >> 4 {
         4 if p.get(9) == Some(&PROTO_UDP) => udp4_payload(p),
@@ -864,19 +877,6 @@ mod tests {
         assert_eq!(udp4_payload(&p[..25]), None, "truncated");
     }
 
-    #[test]
-    fn relay_local_maps_socket_addresses() {
-        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let v4 = |s: &str| Some(s.parse::<SocketAddrV4>().unwrap());
-        assert_eq!(relay_local(p("10.0.0.2:5000")), v4("10.0.0.2:5000"));
-        assert_eq!(
-            relay_local(p("[::ffff:10.0.0.2]:5000")),
-            v4("10.0.0.2:5000")
-        );
-        assert_eq!(relay_local(p("[::]:5000")), v4("0.0.0.0:5000"));
-        assert_eq!(relay_local(p("[2001:db8::1]:5000")), None);
-    }
-
     /// IPv4 ICMP `ty`/code 3 quoting the first 28 bytes of `quoted`.
     fn icmp4(ty: u8, quoted: &[u8]) -> Vec<u8> {
         let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 128, PROTO_ICMP, 0, 0];
@@ -913,6 +913,157 @@ mod tests {
         }
         // The outer packet itself is UDP, not ICMP.
         assert_eq!(icmp_quoted_udp_dst_port(&udp), None);
+    }
+
+    /// IPv6 ICMPv6 `ty`/code 4 quoting the first 48 bytes of `quoted`.
+    fn icmp6(ty: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, 0, 0, PROTO_ICMPV6, 64];
+        p.extend_from_slice(
+            &"2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        p.extend_from_slice(
+            &"2001:db8::99"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        p.extend_from_slice(&[ty, 4, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&quoted[..48.min(quoted.len())]);
+        let len = (p.len() - 40) as u16;
+        p[4..6].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn icmpv6_quoted_udp_dst_port_cases() {
+        // The triggering inbound packet: remote -> app's local port 5000.
+        let udp = crate::udp_packet::build_inbound_udp6(
+            "[2001:db8::99]:3478".parse().unwrap(),
+            "[2001:db8::2]:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        assert_eq!(icmpv6_quoted_udp_dst_port(&icmp6(1, &udp)), Some(5000));
+        let mut tcp = udp.clone();
+        tcp[6] = PROTO_TCP;
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(1, &tcp)),
+            None,
+            "quotes TCP"
+        );
+        let mut ext = udp.clone();
+        ext[6] = 0;
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(1, &ext)),
+            None,
+            "quoted extension header"
+        );
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(128, &udp)),
+            None,
+            "echo request"
+        );
+        let full = icmp6(1, &udp);
+        for n in [0, 6, 39, 40, 47, 48, 87, 90, 91] {
+            assert_eq!(
+                icmpv6_quoted_udp_dst_port(&full[..n]),
+                None,
+                "truncated to {n}"
+            );
+        }
+        // Payload length shorter than the quote: bounded by it.
+        let mut short = full.clone();
+        short[4..6].copy_from_slice(&50u16.to_be_bytes());
+        assert_eq!(icmpv6_quoted_udp_dst_port(&short), None, "short length");
+        // Not ICMPv6: the packet itself is UDP, or ICMPv4.
+        assert_eq!(icmpv6_quoted_udp_dst_port(&udp), None);
+        let v4 = crate::udp_packet::build_inbound_udp(
+            "8.8.4.4:3478".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        assert_eq!(icmpv6_quoted_udp_dst_port(&icmp4(3, &v4)), None);
+        assert_eq!(icmp_quoted_udp_dst_port(&full), None, "v4 parser");
+    }
+
+    /// An ICMPv6 destination unreachable for a port the relay does not
+    /// serve is sent byte-for-byte.
+    #[tokio::test]
+    async fn icmpv6_unreachable_not_served_passes_unchanged() {
+        let h = harness();
+        let udp = crate::udp_packet::build_inbound_udp6(
+            "[2001:db8::99]:3478".parse().unwrap(),
+            "[2001:db8::2]:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        let orig = icmp6(1, &udp);
+        let mut pkt = orig.clone();
+        let mut addr = Address::default();
+        addr.set_outbound(true);
+        let out = route_packet(&mut pkt, &mut addr, &h.shared, &h.run, &h.udp, &h.dns);
+        assert_eq!(out, Out::Send);
+        assert_eq!(pkt, orig);
+        h.cancel.cancel();
+    }
+
+    /// A proxied IPv6 UDP packet goes to the UDP relay (never sent); one
+    /// with an extension header is dropped too.
+    #[tokio::test]
+    async fn ipv6_udp_proxied_is_relayed_never_sent() {
+        let h = harness();
+        let (l, d) = ("[2001:db8::2]:47001", "[2606:4700::1]:3478");
+        let pkt =
+            crate::udp_packet::build_inbound_udp6(l.parse().unwrap(), d.parse().unwrap(), b"x")
+                .unwrap();
+        assert_eq!(h.route(BROWSER, PROTO_UDP, l, d, pkt.clone()), Out::Drop);
+        assert!(matches!(
+            h.cached(PROTO_UDP, l, d),
+            Some(Cached::UdpProxy(..))
+        ));
+        let mut ext = pkt[..40].to_vec();
+        ext[6] = 0;
+        let len = u16::from_be_bytes([pkt[4], pkt[5]]) + 8;
+        ext[4..6].copy_from_slice(&len.to_be_bytes());
+        ext.extend_from_slice(&[PROTO_UDP, 0, 1, 4, 0, 0, 0, 0]);
+        ext.extend_from_slice(&pkt[40..]);
+        assert_eq!(h.route(BROWSER, PROTO_UDP, l, d, ext), Out::Drop);
+        // The relay took it: its session serves IPv6 port 47001 (live, or
+        // within the guard once its association to the dead proxy failed).
+        tokio::time::timeout(crate::test_util::WAIT, async {
+            while !h.udp.serves_port(Family::V6, 47001) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("relay session on [..]:47001");
+        assert!(!h.udp.serves_port(Family::V4, 47001));
+        // The stack's ICMPv6 port unreachable for that port: held back; an
+        // ICMPv4 one for the same port number (IPv4 socket): sent.
+        let reply =
+            crate::udp_packet::build_inbound_udp6(d.parse().unwrap(), l.parse().unwrap(), b"r")
+                .unwrap();
+        let reply4 = crate::udp_packet::build_inbound_udp(
+            "203.0.113.9:3478".parse().unwrap(),
+            "10.0.0.2:47001".parse().unwrap(),
+            b"r",
+        )
+        .unwrap();
+        for (pkt, want) in [
+            (icmp6(1, &reply), Out::Drop),
+            (icmp4(3, &reply4), Out::Send),
+        ] {
+            let mut pkt = pkt;
+            let mut addr = Address::default();
+            addr.set_outbound(true);
+            let out = route_packet(&mut pkt, &mut addr, &h.shared, &h.run, &h.udp, &h.dns);
+            assert_eq!(out, want);
+        }
+        h.cancel.cancel();
     }
 
     fn seed_rules() -> RuleSet {
@@ -1629,7 +1780,13 @@ mod tests {
             Layer::Network,
         )
         .unwrap();
+        check_filter(
+            "outbound and !loopback and icmpv6 and icmpv6.Type == 1",
+            Layer::Network,
+        )
+        .unwrap();
         assert!(NETWORK_FILTER.contains("icmp and icmp.Type == 3"));
+        assert!(NETWORK_FILTER.contains("or (icmpv6 and icmpv6.Type == 1)"));
         assert!(check_filter("tcp and event == NOPE", Layer::Socket).is_err());
     }
 }

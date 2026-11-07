@@ -213,7 +213,7 @@ impl FlowCache {
 ///
 /// Invariant: `Pass` is only returned for a flow whose (cached or fresh)
 /// decision is Direct, or for the service's own sockets. A proxied UDP flow
-/// is never passed: it is `UdpProxy` (IPv4 only) or `Drop`.
+/// is never passed: it is `UdpProxy` (IPv4 or IPv6) or `Drop`.
 pub fn classify(
     m: &PktMeta,
     own_port: bool,
@@ -238,10 +238,9 @@ pub fn classify(
         } else {
             match d {
                 Decision::Final(Route::Direct, _) => Cached::Direct,
-                // Only IPv4 UDP is relayed; proxied TCP is `Other` here.
-                Decision::Final(Route::Proxy(p), info)
-                    if id.proto == PROTO_UDP && id.remote.is_ipv4() =>
-                {
+                // Proxied UDP (either family) is relayed; proxied TCP is
+                // `Other` here.
+                Decision::Final(Route::Proxy(p), info) if id.proto == PROTO_UDP => {
                     Cached::UdpProxy(p, info.group_id, pid)
                 }
                 _ => Cached::Other,
@@ -298,13 +297,11 @@ pub fn classify(
             };
             match cached {
                 Cached::Direct => Action::Pass,
-                Cached::UdpProxy(profile, group_id, pid) if id.remote.is_ipv4() => {
-                    Action::UdpProxy {
-                        pid,
-                        profile,
-                        group_id,
-                    }
-                }
+                Cached::UdpProxy(profile, group_id, pid) => Action::UdpProxy {
+                    pid,
+                    profile,
+                    group_id,
+                },
                 _ => Action::Drop,
             }
         }
@@ -805,11 +802,21 @@ mod tests {
     }
 
     #[test]
-    fn udp_ipv6_proxy_never_udp_proxy() {
+    fn ipv6_udp_proxy_returns_udp_proxy() {
         let (c, n) = (FlowCache::default(), Cell::new(0));
         let u6 = meta(PROTO_UDP, "[2001:db8::5]:5000", "[2001:db8::1]:3478", false);
-        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
-        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
+        let want = Action::UdpProxy {
+            pid: APP_PID,
+            profile: "v2ray".into(),
+            group_id: Some("g".into()),
+        };
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), want);
+        // A cache hit returns the same action.
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), want);
+        assert_eq!(n.get(), 1, "second packet from cache");
+        // Blocked IPv6 UDP is still dropped.
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        assert_eq!(run(&u6, &c, false, APP_PID, block(), &n), Action::Drop);
     }
 
     #[test]
