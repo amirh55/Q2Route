@@ -581,7 +581,8 @@ async fn refresh_processes(relay: &RelayCtx) {
 /// Resolves every proxy's `host:port` (always Direct) and finds the pid
 /// listening on it (excluded: always Direct), plus the service itself.
 /// Then refreshes the proxy server names from those listeners' configs
-/// ([`crate::proxy_servers`]; files are re-read only when changed).
+/// ([`crate::proxy_servers`]; files are re-read only when changed; the last
+/// list is kept while no config is found).
 async fn refresh_exclusions(shared: &Shared) {
     let proxies: Vec<(String, u16)> = shared
         .relay
@@ -625,7 +626,9 @@ async fn refresh_exclusions(shared: &Shared) {
         mutex(&cache).refresh(&proxy_servers::find_configs(&exes))
     })
     .await;
-    if let Ok(servers) = servers {
+    // `None`: no proxy client config right now (e.g. it is restarting):
+    // keep the last list, so its servers still resolve directly.
+    if let Ok(Some(servers)) = servers {
         if *shared.relay.proxy_servers.load_full() != servers {
             let names = if servers.is_empty() {
                 "none".to_string()

@@ -16,6 +16,11 @@ pub fn resolver_ok(s: &str) -> bool {
     s.trim().parse::<SocketAddr>().is_ok()
 }
 
+/// What the page does, shown above the fields.
+pub const EXPLANATION: &str = "Names that match a Direct group (e.g. *.ir) are resolved by your \
+     normal DNS server. Every other name is resolved through the proxy at the address below, so \
+     your internet provider doesn't see it.";
+
 /// Hint under the "Names always resolved directly" field, listing the
 /// proxy servers the service detected.
 pub fn direct_names_hint(detected: &[String]) -> String {
@@ -25,7 +30,8 @@ pub fn direct_names_hint(detected: &[String]) -> String {
         detected.join(", ")
     };
     format!(
-        "Your VPN server's address goes here if it isn't detected automatically.          Detected automatically from v2rayN/xray: {list}"
+        "Your VPN server's address goes here if it isn't detected automatically. \
+         Detected automatically from v2rayN/xray: {list}"
     )
 }
 
@@ -103,9 +109,7 @@ impl DnsView {
             .get_or_insert_with(|| Form::from_settings(current));
         ui.heading("DNS");
         ui.add_space(6.0);
-        ui.label(
-            "Names that match a Direct group (e.g. *.ir) are resolved by your normal DNS server.              Every other name is resolved through the proxy at the address below, so your              internet provider doesn't see it.",
-        );
+        ui.label(EXPLANATION);
         ui.add_space(8.0);
         let busy = matches!(self.pending, Pending::Waiting(..));
         ui.horizontal(|ui| {
@@ -194,16 +198,9 @@ mod tests {
             ..DnsSettings::default()
         };
         let mut f = Form::from_settings(&base);
-        assert_eq!(
-            f.direct_names,
-            "vpn.example.com
-*.cdn.example.org"
-        );
+        assert_eq!(f.direct_names, "vpn.example.com\n*.cdn.example.org");
         assert_eq!(f.to_settings(&base), base);
-        f.direct_names = " a.example.com, b.example.com
-
-"
-        .into();
+        f.direct_names = " a.example.com, b.example.com\n\n".into();
         f.proxy_resolver = " 9.9.9.9:53 ".into();
         let d = f.to_settings(&base);
         assert_eq!(d.direct_names, ["a.example.com", "b.example.com"]);
@@ -213,14 +210,27 @@ mod tests {
 
     #[test]
     fn hint_lists_detected_servers() {
-        assert!(direct_names_hint(&[]).ends_with("Detected automatically from v2rayN/xray: none"));
-        let h = direct_names_hint(&["a.example.com".into(), "b.example.com".into()]);
-        assert!(h.starts_with(
-            "Your VPN server's address goes here if it isn't detected automatically."
-        ));
-        assert!(
-            h.ends_with("from v2rayN/xray: a.example.com, b.example.com"),
-            "{h}"
+        assert_eq!(
+            direct_names_hint(&[]),
+            "Your VPN server's address goes here if it isn't detected automatically. \
+             Detected automatically from v2rayN/xray: none"
         );
+        assert_eq!(
+            direct_names_hint(&["a.example.com".into(), "b.example.com".into()]),
+            "Your VPN server's address goes here if it isn't detected automatically. \
+             Detected automatically from v2rayN/xray: a.example.com, b.example.com"
+        );
+        assert!(!direct_names_hint(&[]).contains("  "));
+    }
+
+    #[test]
+    fn explanation_text_exact() {
+        assert_eq!(
+            EXPLANATION,
+            "Names that match a Direct group (e.g. *.ir) are resolved by your normal DNS \
+             server. Every other name is resolved through the proxy at the address below, \
+             so your internet provider doesn't see it."
+        );
+        assert!(!EXPLANATION.contains("  "));
     }
 }

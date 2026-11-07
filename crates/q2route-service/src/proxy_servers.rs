@@ -104,7 +104,15 @@ impl ServerCache {
     /// The server names of `configs` (sorted, deduplicated). A file is read
     /// only when its mtime changed since the last call; a file that cannot
     /// be read keeps its last result; files no longer listed are forgotten.
-    pub fn refresh(&mut self, configs: &[PathBuf]) -> Vec<String> {
+    ///
+    /// `None` (keep the last detected list) when no config is listed, e.g.
+    /// while the proxy client restarts and nothing listens, or none of them
+    /// could be read: forgetting the servers then would send their lookups
+    /// through the proxy that is coming up.
+    pub fn refresh(&mut self, configs: &[PathBuf]) -> Option<Vec<String>> {
+        if configs.is_empty() {
+            return None;
+        }
         self.files.retain(|p, _| configs.contains(p));
         for path in configs {
             let Ok(meta) = std::fs::metadata(path) else {
@@ -126,10 +134,13 @@ impl ServerCache {
                 Err(e) => tracing::debug!("cannot read {}: {e}", path.display()),
             }
         }
+        if self.files.is_empty() {
+            return None;
+        }
         let mut all: Vec<String> = self.files.values().flat_map(|(_, n)| n.clone()).collect();
         all.sort();
         all.dedup();
-        all
+        Some(all)
     }
 }
 
@@ -256,20 +267,58 @@ mod tests {
         let t0 = std::fs::metadata(&p).unwrap().modified().unwrap();
         let mut c = ServerCache::default();
         let configs = vec![p.clone()];
-        assert_eq!(c.refresh(&configs), ["one.example.com"]);
+        let one = Some(vec!["one.example.com".to_string()]);
+        assert_eq!(c.refresh(&configs), one);
         // Same mtime: not re-read.
         std::fs::write(&p, cfg("two.example.com")).unwrap();
         set_mtime(t0);
-        assert_eq!(c.refresh(&configs), ["one.example.com"]);
+        assert_eq!(c.refresh(&configs), one);
         // New mtime: re-read.
         set_mtime(t0 + std::time::Duration::from_secs(10));
-        assert_eq!(c.refresh(&configs), ["two.example.com"]);
-        // Broken file: no names, no panic.
+        assert_eq!(
+            c.refresh(&configs),
+            Some(vec!["two.example.com".to_string()])
+        );
+        // Broken file: no names (a real replacement), no panic.
         std::fs::write(&p, "{broken").unwrap();
         set_mtime(t0 + std::time::Duration::from_secs(20));
-        assert!(c.refresh(&configs).is_empty());
-        // No longer listed: forgotten; missing files are skipped.
-        assert!(c.refresh(&[]).is_empty());
-        assert!(c.refresh(&[d.path().join("missing.json")]).is_empty());
+        assert_eq!(c.refresh(&configs), Some(vec![]));
+        // Nothing listed or nothing readable: keep the last list.
+        assert_eq!(c.refresh(&[]), None);
+        assert_eq!(c.refresh(&[d.path().join("missing.json")]), None);
+    }
+
+    /// The D7 scenario: the proxy client restarts (no listener for a while).
+    #[test]
+    fn cache_keeps_list_while_no_proxy_client_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("v2rayN");
+        let xray_dir = root.join("bin").join("xray");
+        std::fs::create_dir_all(&xray_dir).unwrap();
+        std::fs::create_dir_all(root.join("binConfigs")).unwrap();
+        let p = root.join("binConfigs").join("config.json");
+        let cfg =
+            |host: &str| format!(r#"{{"outbounds": [{{"settings": {{"address": "{host}"}}}}]}}"#);
+        std::fs::write(&p, cfg("vpn.example.com")).unwrap();
+        let t0 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        let xray = vec![xray_dir.join("xray.exe")];
+        let mut c = ServerCache::default();
+        // 1. A config: its names.
+        assert_eq!(
+            c.refresh(&find_configs(&xray)),
+            Some(vec!["vpn.example.com".to_string()])
+        );
+        // 2. No proxy client exe: the list is kept (no change).
+        assert_eq!(c.refresh(&find_configs(&[])), None);
+        // 3. The client is back with a changed config: the new names.
+        std::fs::write(&p, cfg("new.example.com")).unwrap();
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(t0 + std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(f);
+        assert_eq!(
+            c.refresh(&find_configs(&xray)),
+            Some(vec!["new.example.com".to_string()])
+        );
     }
 }
