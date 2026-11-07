@@ -939,16 +939,140 @@ async fn tcp_dns_blocked_name_closes() {
     r.cancel.cancel();
 }
 
+/// Echo server on `ip:53` (a non-DNS service on port 53): counts accepts.
+async fn echo_53(ip: &str) -> (SocketAddrV4, Arc<AtomicUsize>) {
+    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
+    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            c.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// Not DNS on TCP/53 from a Direct app (e.g. OpenVPN on port 53): relayed
+/// directly to the original destination, the bytes already read replayed.
 #[tokio::test]
-async fn tcp_dns_malformed_query_closes() {
-    let (orig, accepts, _) = dns_server("127.53.0.5").await;
+async fn tcp_53_non_dns_from_direct_app_is_relayed_directly() {
+    let (orig, accepts) = echo_53("127.53.0.5").await;
     let groups = vec![group("rest", Action::Direct, &[], true)];
     let c = ctx(config(vec![], groups));
     let r = start(orig, c.clone()).await;
+    // A complete frame that is not a query.
     let mut client = TcpStream::connect(r.addr).await.unwrap();
-    client.write_all(&framed(b"not a dns query")).await.unwrap();
+    let msg = framed(b"not a dns query");
+    client.write_all(&msg).await.unwrap();
+    let mut back = vec![0u8; msg.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut back))
+        .await
+        .expect("no echo")
+        .unwrap();
+    assert_eq!(back, msg, "bytes read by the relay were replayed");
+    client.write_all(b"more").await.unwrap();
+    let mut more = [0u8; 4];
+    client.read_exact(&mut more).await.unwrap();
+    assert_eq!(&more, b"more");
+    let row = wait_row(&c).await;
+    assert_eq!(row.route, q2route_core::decide::Route::Direct);
+    assert_eq!(row.domain, None);
+    // A frame longer than any query may be: not DNS either.
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let mut big = vec![0x20, 0x00];
+    big.extend_from_slice(b"0123456789");
+    client.write_all(&big).await.unwrap();
+    let mut back = vec![0u8; big.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut back))
+        .await
+        .expect("no echo")
+        .unwrap();
+    assert_eq!(back, big);
+    assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    r.cancel.cancel();
+}
+
+/// Not DNS on TCP/53 from a proxied app: through the proxy to the original
+/// destination, never direct.
+#[tokio::test]
+async fn tcp_53_non_dns_from_proxied_app_goes_via_proxy() {
+    let (orig, accepts) = echo_53("127.53.0.14").await;
+    let msg = framed(b"not a dns query");
+    let (sport, mut reqs) = mock_socks(msg.len()).await;
+    let c = ctx(config(vec![socks_profile(sport)], dns_groups()));
+    let r = start(orig, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(&msg).await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.atyp, 1);
+    assert_eq!(req.host, [127, 53, 0, 14]);
+    assert_eq!(req.port, 53);
+    assert_eq!(req.first, msg);
+    assert_eq!(
+        wait_row(&c).await.route,
+        q2route_core::decide::Route::Proxy("mock".into())
+    );
+    assert_eq!(accepts.load(Ordering::SeqCst), 0, "connected direct");
+    r.cancel.cancel();
+}
+
+/// A frame that could be a query but never completes: closed, never relayed.
+#[tokio::test]
+async fn tcp_dns_partial_frame_closes() {
+    let (orig, accepts) = echo_53("127.53.0.15").await;
+    let groups = vec![group("rest", Action::Direct, &[], true)];
+    let r = start(orig, ctx(config(vec![], groups))).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(&[0, 50, 1, 2, 3]).await.unwrap();
+    client.shutdown().await.unwrap();
     assert_closed(&mut client, Duration::from_secs(3)).await;
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    r.cancel.cancel();
+}
+
+/// Answers on a direct DNS-over-TCP connection are learned only for the
+/// queries forwarded on it (same id and name).
+#[tokio::test]
+async fn tcp_dns_answers_for_names_never_asked_are_not_learned() {
+    let addr: SocketAddrV4 = "127.53.0.16:53".parse().unwrap();
+    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut len = [0u8; 2];
+        s.read_exact(&mut len).await.unwrap();
+        let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+        s.read_exact(&mut q).await.unwrap();
+        let id = u16::from_be_bytes([q[0], q[1]]);
+        // An answer with an id never asked, one for another name with the
+        // asked id, then the real answer.
+        for m in [
+            dns_answer(&dns_query(id ^ 0xffff, "evil.ir")),
+            dns_answer(&dns_query(id, "other.ir")),
+            dns_answer(&q),
+        ] {
+            s.write_all(&framed(&m)).await.unwrap();
+        }
+        let mut sink = [0u8; 64];
+        while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+    });
+    let (pport, _, _) = mock_connect_dns().await;
+    let c = ctx(config(vec![http_profile(pport)], dns_groups()));
+    let r = start(addr, c.clone()).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x0101, "y.ir");
+    client.write_all(&framed(&q)).await.unwrap();
+    for _ in 0..3 {
+        read_frame(&mut client).await;
+    }
+    assert_eq!(names_of_nine(&c), vec!["y.ir".to_string()]);
     r.cancel.cancel();
 }
 

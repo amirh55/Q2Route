@@ -30,7 +30,8 @@ pub fn direct_names_hint(detected: &[String]) -> String {
         detected.join(", ")
     };
     format!(
-        "Your VPN server's address goes here if it isn't detected automatically. \
+        "Your VPN server's address goes here if it isn't detected automatically, \
+         and so can a subscription's host if updating the subscription fails. \
          Detected automatically from v2rayN/xray: {list}"
     )
 }
@@ -212,12 +213,14 @@ mod tests {
     fn hint_lists_detected_servers() {
         assert_eq!(
             direct_names_hint(&[]),
-            "Your VPN server's address goes here if it isn't detected automatically. \
+            "Your VPN server's address goes here if it isn't detected automatically, \
+             and so can a subscription's host if updating the subscription fails. \
              Detected automatically from v2rayN/xray: none"
         );
         assert_eq!(
             direct_names_hint(&["a.example.com".into(), "b.example.com".into()]),
-            "Your VPN server's address goes here if it isn't detected automatically. \
+            "Your VPN server's address goes here if it isn't detected automatically, \
+             and so can a subscription's host if updating the subscription fails. \
              Detected automatically from v2rayN/xray: a.example.com, b.example.com"
         );
         assert!(!direct_names_hint(&[]).contains("  "));

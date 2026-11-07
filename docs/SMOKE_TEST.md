@@ -115,6 +115,8 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | D5 | Chrome with Secure DNS on: browse proxied sites and a Direct `.ir` site. | Proxied browsing still works (DoH is blocked, Chrome falls back to system DNS); the Direct `.ir` site is unaffected. | |
 | D6 | DNS page: change the proxy resolver to `9.9.9.9:53`, Save, then repeat D1. | dnsleaktest shows Quad9. | |
 | D7 | With v2rayN using a server *hostname*, restart v2ray while Q2Route runs (and `ipconfig /flushdns`). | v2ray reconnects; the log shows `proxy servers resolved directly: <your server>`; the DNS page lists it as detected. | |
+| D8 | Switch v2rayN to a server with a different hostname. | It connects within ~15 s; the log shows the new name in `proxy servers resolved directly`. | |
+| D9 | Update a v2rayN subscription while the current server is unreachable; if it fails, add the subscription host to "Names always resolved directly" and retry. | The subscription updates. | |
 
 ## Leak checks
 

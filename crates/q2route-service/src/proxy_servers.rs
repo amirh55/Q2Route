@@ -21,15 +21,14 @@ const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 /// xray / sing-box JSON config, lowercased and deduplicated (first-seen
 /// order). Collected: string values of `address` / `server` keys anywhere
 /// inside each outbound's `settings`, and sing-box's top-level `server`;
-/// never SNI / host header values. Invalid JSON gives an empty list.
-pub fn server_hostnames(json: &str) -> Vec<String> {
+/// never SNI / host header values. `None`: not valid JSON (e.g. a file
+/// still being written), as opposed to `Some(empty)`: no host names.
+pub fn server_hostnames(json: &str) -> Option<Vec<String>> {
     let json = json.strip_prefix('\u{feff}').unwrap_or(json);
+    let v = serde_json::from_str::<Value>(json).ok()?;
     let mut out = Vec::new();
-    let Ok(v) = serde_json::from_str::<Value>(json) else {
-        return out;
-    };
     let Some(outbounds) = v.get("outbounds").and_then(Value::as_array) else {
-        return out;
+        return Some(out);
     };
     for ob in outbounds {
         if let Some(settings) = ob.get("settings") {
@@ -39,7 +38,7 @@ pub fn server_hostnames(json: &str) -> Vec<String> {
             push_host(s, &mut out);
         }
     }
-    out
+    Some(out)
 }
 
 fn collect(v: &Value, out: &mut Vec<String>, depth: usize) {
@@ -103,7 +102,8 @@ pub struct ServerCache {
 impl ServerCache {
     /// The server names of `configs` (sorted, deduplicated). A file is read
     /// only when its mtime changed since the last call; a file that cannot
-    /// be read keeps its last result; files no longer listed are forgotten.
+    /// be read or parsed keeps its last result and is read again next time
+    /// (it may be half written); files no longer listed are forgotten.
     ///
     /// `None` (keep the last detected list) when no config is listed, e.g.
     /// while the proxy client restarts and nothing listens, or none of them
@@ -126,11 +126,11 @@ impl ServerCache {
                 self.files.insert(path.clone(), (mtime, Vec::new()));
                 continue;
             }
-            match std::fs::read(path) {
-                Ok(bytes) => {
-                    let names = server_hostnames(&String::from_utf8_lossy(&bytes));
+            match std::fs::read(path).map(|b| server_hostnames(&String::from_utf8_lossy(&b))) {
+                Ok(Some(names)) => {
                     self.files.insert(path.clone(), (mtime, names));
                 }
+                Ok(None) => tracing::debug!("cannot parse {}; retried next time", path.display()),
                 Err(e) => tracing::debug!("cannot read {}: {e}", path.display()),
             }
         }
@@ -165,7 +165,7 @@ mod tests {
             {"tag": "block", "protocol": "blackhole", "settings": {}}
           ]
         }"#;
-        assert_eq!(server_hostnames(json), ["vpn.example.com"]);
+        assert_eq!(server_hostnames(json).unwrap(), ["vpn.example.com"]);
     }
 
     #[test]
@@ -175,7 +175,10 @@ mod tests {
             {"address": "b.example.com", "port": 443, "users": []},
             {"address": "a.example.com", "port": 8443, "users": []}
         ]}}]}"#;
-        assert_eq!(server_hostnames(json), ["a.example.com", "b.example.com"]);
+        assert_eq!(
+            server_hostnames(json).unwrap(),
+            ["a.example.com", "b.example.com"]
+        );
     }
 
     #[test]
@@ -184,7 +187,7 @@ mod tests {
             {"address": "ss.example.net", "port": 8388, "method": "aes-256-gcm"}
         ]}}, {"protocol": "socks", "settings": {"servers": [{"address": "socks.example.org"}]}}]}"#;
         assert_eq!(
-            server_hostnames(json),
+            server_hostnames(json).unwrap(),
             ["ss.example.net", "socks.example.org"]
         );
     }
@@ -196,7 +199,7 @@ mod tests {
              "tls": {"enabled": true, "server_name": "fake.sni.com"}},
             {"type": "direct", "tag": "direct"}
         ]}"#;
-        assert_eq!(server_hostnames(json), ["sb.example.org"]);
+        assert_eq!(server_hostnames(json).unwrap(), ["sb.example.org"]);
     }
 
     #[test]
@@ -206,18 +209,23 @@ mod tests {
             {"address": ""}, {"address": "localhost"}, {"address": 5}, {"server": null},
             {"address": "ok.example.com."}
         ]}, "server": "198.51.100.1"}]}"#;
-        assert_eq!(server_hostnames(json), ["ok.example.com"]);
+        assert_eq!(server_hostnames(json).unwrap(), ["ok.example.com"]);
     }
 
     #[test]
     fn bom_and_invalid_json() {
         let json = "\u{feff}{\"outbounds\": [{\"settings\": {\"address\": \"bom.example.com\"}}]}";
-        assert_eq!(server_hostnames(json), ["bom.example.com"]);
-        assert!(server_hostnames("\u{feff}{not json").is_empty());
-        assert!(server_hostnames("").is_empty());
-        assert!(server_hostnames(r#"{"outbounds": 5}"#).is_empty());
-        assert!(server_hostnames(r#"[1, 2]"#).is_empty());
-        assert!(server_hostnames(r#"{"outbounds": [{"settings": 7}, null, "x"]}"#).is_empty());
+        assert_eq!(server_hostnames(json).unwrap(), ["bom.example.com"]);
+        // Not JSON: None (distinct from "no host names").
+        assert_eq!(server_hostnames("\u{feff}{not json"), None);
+        assert_eq!(server_hostnames(""), None);
+        let none: Option<Vec<String>> = Some(vec![]);
+        assert_eq!(server_hostnames(r#"{"outbounds": 5}"#), none);
+        assert_eq!(server_hostnames(r#"[1, 2]"#), none);
+        assert_eq!(
+            server_hostnames(r#"{"outbounds": [{"settings": 7}, null, "x"]}"#),
+            none
+        );
     }
 
     #[test]
@@ -279,9 +287,21 @@ mod tests {
             c.refresh(&configs),
             Some(vec!["two.example.com".to_string()])
         );
-        // Broken file: no names (a real replacement), no panic.
+        // Half-written (unparsable) file: the last names are kept, and the
+        // file is read again next time even with the same mtime.
         std::fs::write(&p, "{broken").unwrap();
         set_mtime(t0 + std::time::Duration::from_secs(20));
+        let two = Some(vec!["two.example.com".to_string()]);
+        assert_eq!(c.refresh(&configs), two);
+        std::fs::write(&p, cfg("three.example.com")).unwrap();
+        set_mtime(t0 + std::time::Duration::from_secs(20));
+        assert_eq!(
+            c.refresh(&configs),
+            Some(vec!["three.example.com".to_string()])
+        );
+        // Valid JSON without servers: a real replacement (no names).
+        std::fs::write(&p, "{}").unwrap();
+        set_mtime(t0 + std::time::Duration::from_secs(30));
         assert_eq!(c.refresh(&configs), Some(vec![]));
         // Nothing listed or nothing readable: keep the last list.
         assert_eq!(c.refresh(&[]), None);

@@ -1,7 +1,7 @@
 //! Transparent TCP relay. Accepts connections redirected by the NAT, looks
 //! up their original destination, peeks the SNI / HTTP Host when the rules
 //! need a domain, decides a route and relays bytes. TCP/53 is routed by the
-//! queried DNS name instead (`handle_dns`).
+//! queried DNS name instead (`handle_dns`), unless it is not DNS at all.
 //!
 //! **Fail closed:** a flow routed to a proxy is only ever connected through
 //! that proxy. If the profile is unknown or the proxy fails, the client is
@@ -9,7 +9,7 @@
 //! when the proxy itself is unreachable or silent, and `Event::ProxyUp` on
 //! the first successful connect after that.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -23,7 +23,7 @@ use q2route_core::config::{Config, ProfileId, Protocol};
 use q2route_core::decide::{
     decide, decide_dns, decide_mapped_no_peek, Decision, FlowInfo, MatchInfo, MatchReason, Route,
 };
-use q2route_core::dns::{answers, parse_query};
+use q2route_core::dns::{answers, parse_query, response_id};
 use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
 use q2route_core::peek::{peek_host, PeekResult};
@@ -261,6 +261,20 @@ async fn handle(
             decide_flow(ctx, &orig, Some(&domain))
         };
     }
+    relay_flow(client, peer, &orig, ctx, &buf, domain, decision).await
+}
+
+/// Carries out `decision` for a relayed flow: `buf` (client bytes already
+/// read) is sent upstream first; `domain` (may be empty) is the peeked host.
+async fn relay_flow(
+    client: TcpStream,
+    peer: SocketAddr,
+    orig: &OriginalDst,
+    ctx: &RelayCtx,
+    buf: &[u8],
+    domain: String,
+    decision: Decision,
+) {
     let (route, info) = match decision {
         Decision::Final(route, info) => (route, info),
         Decision::NeedDomain => {
@@ -319,7 +333,7 @@ async fn handle(
             match connect_proxy(ctx, &id, &target).await {
                 Ok(up) => {
                     log(&format!("proxied via '{id}'"));
-                    pump(client, up, &buf, ctx, group, &bytes).await
+                    pump(client, up, buf, ctx, group, &bytes).await
                 }
                 // Fail closed: drop the client, never connect direct.
                 Err(e) => log(&format!("proxy failed: {e} (closed, no direct fallback)")),
@@ -328,7 +342,7 @@ async fn handle(
         Route::Direct => match connect_direct(ctx, orig.dst).await {
             Ok((up, _own)) => {
                 log("direct");
-                pump(client, up, &buf, ctx, group, &bytes).await
+                pump(client, up, buf, ctx, group, &bytes).await
             }
             Err(e) => log(&format!("direct connect failed: {e}")),
         },
@@ -412,29 +426,69 @@ pub fn proxy_program(
 /// queries ([`proxy_program`]) and bootstrap names ([`bootstrap_direct`])
 /// are Direct, anything else by [`decide_dns`] (the queried name only).
 fn dns_route(ctx: &RelayCtx, pid: u32, name: &str) -> (Route, MatchInfo) {
+    let bootstrap = MatchInfo {
+        group_id: None,
+        reason: MatchReason::BootstrapName,
+    };
     let program = {
         let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
-        proxy_program(&ctx.rules.load(), &tree, &ctx.excluded.load(), pid)
+        proxy_program(&ctx.rules.load(), &tree, &ctx.excluded.load(), pid).is_some()
     };
-    if let Some(reason) = program {
+    if program {
         tracing::debug!("dns name={name} pid={pid} via=direct (proxy program)");
-        return (
-            Route::Direct,
-            MatchInfo {
-                group_id: None,
-                reason,
-            },
-        );
+        return (Route::Direct, bootstrap);
     }
     if let Some(why) = bootstrap_direct(&ctx.cfg.load(), &ctx.proxy_servers.load(), name) {
         tracing::debug!("dns name={name} pid={pid} via=direct ({why})");
-        let info = MatchInfo {
-            group_id: None,
-            reason: MatchReason::ExcludedPid,
-        };
-        return (Route::Direct, info);
+        return (Route::Direct, bootstrap);
     }
     decide_dns(&ctx.rules.load(), name)
+}
+
+/// What the first bytes of a relayed TCP/53 connection turned out to be.
+enum FirstMsg {
+    /// One complete length-prefixed DNS query (with its prefix).
+    Query(Vec<u8>),
+    /// Not DNS (bytes read so far, possibly none): a frame longer than a
+    /// query may be, a complete frame that is not a query, or a client
+    /// that sent nothing within the limit (DNS clients speak first).
+    Other(Vec<u8>),
+    /// The client closed without sending anything, or a frame that could
+    /// be a query never completed: closed (fail closed).
+    Close,
+}
+
+/// Reads the first length-prefixed message of a TCP/53 connection, never
+/// past its end (later bytes stay in the socket).
+async fn read_first_msg(client: &mut TcpStream, max: usize, limit: Duration) -> FirstMsg {
+    let deadline = Instant::now() + limit;
+    let mut buf = Vec::new();
+    let mut need = 2;
+    let mut chunk = [0u8; 2048];
+    loop {
+        while buf.len() < need {
+            let room = (need - buf.len()).min(chunk.len());
+            match timeout_at(deadline, client.read(&mut chunk[..room])).await {
+                Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                // Silent client: not a DNS client.
+                Err(_) if buf.is_empty() => return FirstMsg::Other(buf),
+                // EOF / error / a partial frame: nothing safe to relay.
+                _ => return FirstMsg::Close,
+            }
+        }
+        if need > 2 {
+            return if parse_query(&buf[2..]).is_some() {
+                FirstMsg::Query(buf)
+            } else {
+                FirstMsg::Other(buf)
+            };
+        }
+        let n = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+        if n > max || n == 0 {
+            return FirstMsg::Other(buf);
+        }
+        need = 2 + n;
+    }
 }
 
 /// Reads one length-prefixed DNS message of at most `max` bytes and returns
@@ -459,11 +513,36 @@ async fn read_dns_msg<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result
     Ok(Some(m))
 }
 
-/// Feeds the IP -> name answers of one DNS response into the map.
-fn learn_answers(domains: &DomainMap, msg: &[u8]) {
+/// Queries forwarded on one DNS-over-TCP connection and not yet answered:
+/// id -> lowercase name. At most [`TCP_DNS_PENDING_MAX`]; a query beyond
+/// that is still forwarded, but its answer is not learned.
+const TCP_DNS_PENDING_MAX: usize = 256;
+
+type Asked = std::sync::Mutex<HashMap<u16, String>>;
+
+fn ask(asked: &Asked, msg: &[u8]) {
+    let Some(q) = parse_query(msg) else { return };
+    let mut a = asked.lock().unwrap_or_else(|e| e.into_inner());
+    if a.len() < TCP_DNS_PENDING_MAX || a.contains_key(&q.id) {
+        a.insert(q.id, q.name);
+    }
+}
+
+/// Feeds the IP -> name answers of one DNS response into the map, only if
+/// it answers a query forwarded on this connection (same id and name).
+fn learn_answers(domains: &DomainMap, asked: &Asked, msg: &[u8]) {
     let (Some(name), ips) = answers(msg) else {
         return;
     };
+    let Some(id) = response_id(msg) else { return };
+    {
+        let mut a = asked.lock().unwrap_or_else(|e| e.into_inner());
+        if a.get(&id) != Some(&name) {
+            tracing::debug!("tcp dns answer for {name} (id {id}) matches no query; not learned");
+            return;
+        }
+        a.remove(&id);
+    }
     let now = std::time::Instant::now();
     for (ip, ttl) in ips {
         domains.insert(ip, &name, ttl, now);
@@ -474,19 +553,26 @@ fn learn_answers(domains: &DomainMap, msg: &[u8]) {
 /// original server from an own port, Proxy to `proxy_resolver` through the
 /// profile (fail closed: any failure closes the client), Block closes.
 /// Later queries on the connection must decide the same route, else the
-/// connection is closed before that query is sent anywhere.
+/// connection is closed before that query is sent anywhere. A connection
+/// that is not DNS at all (a VPN on port 53) carries no name: it is relayed
+/// to its original destination by the ordinary flow decision.
 async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst, ctx: &RelayCtx) {
-    let first = timeout_at(
-        Instant::now() + DNS_FIRST_TIMEOUT,
-        read_dns_msg(&mut client, DNS_FIRST_MAX),
-    )
-    .await;
-    let Ok(Ok(Some(first))) = first else {
-        tracing::debug!("tcp dns {peer} -> {}: no query read; closing", orig.dst);
-        return;
+    let first = match read_first_msg(&mut client, DNS_FIRST_MAX, DNS_FIRST_TIMEOUT).await {
+        FirstMsg::Query(m) => m,
+        FirstMsg::Other(buf) => {
+            tracing::debug!(
+                "tcp {peer} -> {}: not DNS; relayed as an ordinary flow",
+                orig.dst
+            );
+            let decision = decide_flow(ctx, orig, None);
+            return relay_flow(client, peer, orig, ctx, &buf, String::new(), decision).await;
+        }
+        FirstMsg::Close => {
+            tracing::debug!("tcp dns {peer} -> {}: no query read; closing", orig.dst);
+            return;
+        }
     };
     let Some(q) = parse_query(&first[2..]) else {
-        tracing::debug!("tcp dns {peer} -> {}: malformed query; closing", orig.dst);
         return;
     };
     let (name, qtype) = (q.name, q.qtype);
@@ -565,6 +651,8 @@ async fn dns_pump(
     let _active = ctx.stats.open(group);
     let (mut cr, mut cw) = client.into_split();
     let (mut ur, mut uw) = upstream.into_split();
+    let asked = Asked::default();
+    ask(&asked, &first[2..]);
     if uw.write_all(first).await.is_err() {
         return;
     }
@@ -581,6 +669,7 @@ async fn dns_pump(
                 );
                 return Err(io::Error::other("dns query with another route"));
             }
+            ask(&asked, &m[2..]);
             uw.write_all(&m).await?;
             activity.touch();
             bytes.up.fetch_add(m.len() as u64, Ordering::Relaxed);
@@ -590,7 +679,7 @@ async fn dns_pump(
     };
     let down = async {
         while let Some(m) = read_dns_msg(&mut ur, max).await? {
-            learn_answers(&ctx.domains, &m[2..]);
+            learn_answers(&ctx.domains, &asked, &m[2..]);
             cw.write_all(&m).await?;
             activity.touch();
             bytes.down.fetch_add(m.len() as u64, Ordering::Relaxed);

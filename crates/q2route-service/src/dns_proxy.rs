@@ -276,6 +276,8 @@ struct Upstream {
 struct Pending {
     orig_id: u16,
     name: String,
+    /// The app's query as sent (REFUSED is built from it).
+    query: Vec<u8>,
     app: SocketAddr,
     server: SocketAddr,
     addr: Address,
@@ -321,7 +323,12 @@ async fn next_up(up: &mut Option<Upstream>, buf: &mut [u8], ctl: &mut [u8]) -> U
         },
         r = u.sock.recv(buf) => match r {
             Ok(n) => UpEvent::Reply(n),
-            Err(_) => UpEvent::Nothing,
+            // E.g. ICMP port unreachable from the proxy's relay port: the
+            // association is unusable (re-associated on the next query).
+            Err(e) => {
+                tracing::debug!("dns association recv failed: {e}");
+                UpEvent::Closed
+            }
         },
     }
 }
@@ -498,6 +505,7 @@ impl ProfileTask {
             Pending {
                 orig_id: u16::from_be_bytes([q.msg[0], q.msg[1]]),
                 name,
+                query: q.msg,
                 app: q.app,
                 server: q.server,
                 addr: q.addr,
@@ -544,6 +552,19 @@ impl ProfileTask {
                 }
             }
             None => {}
+        }
+        // A truncated answer makes the client retry over TCP; IPv6 TCP/53
+        // is not routed by name (M4 gap), so an IPv6 app gets REFUSED.
+        if p.app.is_ipv6() && msg.get(2).is_some_and(|b| b & 0x02 != 0) {
+            tracing::debug!(
+                "dns via '{}': TC answer for {} to an IPv6 app; REFUSED",
+                self.profile,
+                p.name
+            );
+            if let Some(r) = refused(&p.query) {
+                inject(&*self.sink, p.server, p.app, &p.addr, &r);
+            }
+            return;
         }
         inject(&*self.sink, p.server, p.app, &p.addr, &msg);
     }

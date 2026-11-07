@@ -53,6 +53,8 @@ fn id_of(m: &[u8]) -> u16 {
 
 enum Mode {
     Answer,
+    /// Answers with TC set (the client should retry over TCP).
+    Truncated,
     Silent,
     /// Answers at once with a wrong id, then after the delay with the right
     /// one (reported on `late`).
@@ -79,6 +81,11 @@ async fn resolver(mode: Mode) -> Resolver {
             match mode {
                 Mode::Answer => {
                     let _ = s.send_to(&answer_a(&q), from).await;
+                }
+                Mode::Truncated => {
+                    let mut a = answer_a(&q);
+                    a[2] |= 0x02;
+                    let _ = s.send_to(&a, from).await;
                 }
                 Mode::Silent => {}
                 Mode::WrongIdThenLate(delay) => {
@@ -206,6 +213,31 @@ async fn ipv6_query_answered_with_ipv6_packet() {
     assert_eq!(id_of(&payload), 0x4321);
     assert_eq!(rcode(&payload), 0);
     assert_eq!(answers(&payload).1.len(), 1);
+}
+
+/// A TC answer from the resolver reaches an IPv4 app as is (it retries
+/// over TCP, routed by name), but an IPv6 app gets REFUSED: its TCP retry
+/// would go direct (M4 gap).
+#[tokio::test]
+async fn tc_answer_refused_to_ipv6_apps() {
+    let m = mock(MockOpts::default()).await;
+    let r = resolver(Mode::Truncated).await;
+    let mut s = setup(
+        dns_config(ProxyKind::Socks5, m.port, r.addr),
+        DnsProxyConfig::default(),
+    );
+    s.dns.submit(q4(0x0404, "example.com"));
+    let (_, _, p) = parse_inbound(&recv(&mut s.injected).await);
+    assert_eq!(id_of(&p), 0x0404);
+    assert!(tc(&p), "IPv4 gets the TC answer");
+    s.dns.submit(q6(0x0606, "example.com"));
+    let (src, dst, p) = parse_inbound6(&recv(&mut s.injected).await);
+    assert_eq!(src, "[2001:db8::53]:53".parse().unwrap());
+    assert_eq!(dst, "[2001:db8::5]:50000".parse().unwrap());
+    assert_eq!(id_of(&p), 0x0606);
+    assert!(!tc(&p), "no TC to an IPv6 app");
+    assert_eq!(rcode(&p), 5, "IPv6 gets REFUSED");
+    quiet(&mut s.injected).await;
 }
 
 #[tokio::test]

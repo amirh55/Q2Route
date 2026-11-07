@@ -514,7 +514,12 @@ impl Inner {
                         mutex(&inner.proxy_up).insert(id, false);
                     }
                     Event::ProxyUp { id } => {
-                        mutex(&inner.proxy_up).insert(id, true);
+                        let was = mutex(&inner.proxy_up).insert(id, true);
+                        // Lookups failed while the proxy was down are cached
+                        // as failures: flush on the way back up.
+                        if was != Some(true) {
+                            tokio::task::spawn_blocking(winapi::flush_dns_cache);
+                        }
                     }
                     Event::Snapshot(_) => {}
                 }
@@ -637,6 +642,10 @@ async fn refresh_exclusions(shared: &Shared) {
             };
             tracing::info!("proxy servers resolved directly: {names}");
             shared.relay.proxy_servers.store(Arc::new(servers));
+            // A lookup of a new server name made before it was detected
+            // went through the (not yet connected) proxy and may have been
+            // cached as a failure: start over.
+            let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
         }
     }
 }
