@@ -665,3 +665,75 @@ fn direct_tcp443_without_domain_needs_no_peek() {
         )
     );
 }
+
+fn dm(pid: u32, dst: &str, names: &[&str], rs: &RuleSet) -> Decision {
+    let dst: SocketAddr = dst.parse().unwrap();
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    decide_mapped(
+        rs,
+        &tree(),
+        &HashSet::new(),
+        &FlowInfo {
+            proto: Protocol::Tcp,
+            pid,
+            dst,
+            domain: None,
+        },
+        &names,
+    )
+}
+
+#[test]
+fn mapped_single_name_direct() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn mapped_conflict_most_protective_or_peek() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    let names = ["x.ir", "example.com"];
+    assert!(matches!(
+        dm(40, "5.6.7.8:5222", &names, &rs),
+        Decision::Final(Route::Proxy(_), _)
+    ));
+    assert_eq!(dm(40, "5.6.7.8:443", &names, &rs), Decision::NeedDomain);
+}
+
+#[test]
+fn mapped_names_dont_override_app_rules() {
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "app-block".into(),
+            name: "App block".into(),
+            enabled: true,
+            action: Action::Block,
+            rules: vec![Rule {
+                apps: vec!["chrome.exe".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Block, Some("app-block"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn no_names_same_as_decide() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    for dst in ["5.6.7.8:443", "5.6.7.8:5222"] {
+        assert_eq!(
+            dm(40, dst, &[], &rs),
+            run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, None)
+        );
+    }
+}

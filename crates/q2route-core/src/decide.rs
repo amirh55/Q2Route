@@ -297,3 +297,53 @@ pub fn decide_dns(rs: &RuleSet, name: &str) -> (Route, MatchInfo) {
         ),
     }
 }
+
+/// Decide with names learned from DNS for `f.dst` (used when `f.domain` is
+/// None). No names -> `decide`. All names give the same Final route -> that
+/// decision with the first name's MatchInfo. Otherwise TCP 80/443 ->
+/// `NeedDomain` (peek); else the most protective route (Proxy > Block > Direct).
+pub fn decide_mapped(
+    rs: &RuleSet,
+    tree: &ProcessTree,
+    excluded_pids: &HashSet<u32>,
+    f: &FlowInfo,
+    names: &[String],
+) -> Decision {
+    if names.is_empty() {
+        return decide(rs, tree, excluded_pids, f);
+    }
+    let mut finals: Vec<(Route, MatchInfo)> = Vec::with_capacity(names.len());
+    let mut unresolved = false;
+    for n in names {
+        let fi = FlowInfo {
+            domain: Some(n),
+            ..f.clone()
+        };
+        match decide(rs, tree, excluded_pids, &fi) {
+            Decision::Final(r, i) => finals.push((r, i)),
+            Decision::NeedDomain => unresolved = true,
+        }
+    }
+    if !unresolved && finals.iter().all(|(r, _)| *r == finals[0].0) {
+        let (r, i) = finals.swap_remove(0);
+        return Decision::Final(r, i);
+    }
+    if f.proto == Protocol::Tcp && matches!(f.dst.port(), 80 | 443) {
+        return Decision::NeedDomain;
+    }
+    if unresolved {
+        // Defensive: cannot happen with a domain set; fall back to the
+        // domain-less decision rather than guess.
+        return decide(rs, tree, excluded_pids, f);
+    }
+    let rank = |r: &Route| match r {
+        Route::Proxy(_) => 2,
+        Route::Block => 1,
+        Route::Direct => 0,
+    };
+    let (r, i) = finals
+        .into_iter()
+        .reduce(|a, b| if rank(&b.0) > rank(&a.0) { b } else { a })
+        .expect("names non-empty");
+    Decision::Final(r, i)
+}

@@ -3,6 +3,7 @@
 pub mod config;
 pub mod decide;
 pub mod dns;
+pub mod domain_map;
 pub mod geoip;
 pub mod ipc;
 pub mod matchers;
