@@ -62,6 +62,7 @@ async fn server_msgs_roundtrip() {
             tcp_ok: true,
             latency_ms: Some(5),
             error: None,
+            udp_ok: Some(true),
         })),
         ServerMsg::Response(Response::Error("x".into())),
         ServerMsg::Event(Event::Snapshot(Box::new(snap))),
@@ -174,4 +175,11 @@ fn new_variants_round_trip() {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
     }
+}
+
+#[test]
+fn proxy_test_result_without_udp_ok_decodes() {
+    let r: ProxyTestResult =
+        serde_json::from_str(r#"{"tcp_ok":true,"latency_ms":5,"error":null}"#).unwrap();
+    assert_eq!(r.udp_ok, None);
 }

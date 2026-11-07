@@ -32,9 +32,14 @@ fn outcome(r: Response) -> TestState {
         Response::ProxyTest(t) if t.tcp_ok => (
             true,
             format!(
-                "TCP OK{}",
+                "TCP OK{} · {}",
                 t.latency_ms
-                    .map_or(String::new(), |ms| format!(", {ms} ms"))
+                    .map_or(String::new(), |ms| format!(", {ms} ms")),
+                match t.udp_ok {
+                    Some(true) => "UDP OK",
+                    Some(false) => "UDP not working (enable UDP in the proxy's SOCKS inbound)",
+                    None => "UDP not supported (SOCKS5 only)",
+                }
             ),
         ),
         Response::ProxyTest(t) => (
@@ -315,5 +320,30 @@ mod tests {
         assert_eq!(new_id(&cfg, "My Proxy #1"), "my-proxy-1");
         assert_eq!(new_id(&cfg, "V2Ray"), "v2ray-2");
         assert_eq!(new_id(&cfg, "!!!"), "proxy");
+    }
+
+    #[test]
+    fn outcome_shows_udp() {
+        let text = |udp_ok| {
+            let r = Response::ProxyTest(q2route_core::proxy::ProxyTestResult {
+                tcp_ok: true,
+                latency_ms: Some(42),
+                error: None,
+                udp_ok,
+            });
+            match outcome(r) {
+                TestState::Done { text, .. } => text,
+                TestState::Running(_) => unreachable!(),
+            }
+        };
+        assert_eq!(text(Some(true)), "TCP OK, 42 ms · UDP OK");
+        assert_eq!(
+            text(Some(false)),
+            "TCP OK, 42 ms · UDP not working (enable UDP in the proxy's SOCKS inbound)"
+        );
+        assert_eq!(
+            text(None),
+            "TCP OK, 42 ms · UDP not supported (SOCKS5 only)"
+        );
     }
 }

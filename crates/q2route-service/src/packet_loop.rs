@@ -6,9 +6,12 @@
 //! * Network layer: every outbound, non-loopback TCP/UDP packet. Relay
 //!   replies (`A:relay_port -> D:pa`) are restored to the app; everything else
 //!   goes through [`classify`], which only ever passes Direct flows.
+//!   Outbound ICMPv4 destination-unreachable is captured too: one quoting a
+//!   UDP packet to a port the UDP relay serves (the stack answering an
+//!   injected reply from the real IP) is dropped; any other passes as before.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +29,7 @@ use crate::conns::{ConnLog, NewConn};
 use crate::flows::{FlowKey, FlowTable};
 use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
 use crate::relay::{describe, exe_name, OrigDstLookup, RelayCtx};
+use crate::udp_relay::{Datagram, InboundSink, UdpRelay};
 use crate::winapi;
 use crate::windivert::{
     calc_checksums_addr, Address, Handle, EVENT_SOCKET_ACCEPT, EVENT_SOCKET_BIND,
@@ -34,7 +38,8 @@ use crate::windivert::{
 
 pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event == CLOSE)) \
      or (udp and event == BIND) or (tcp and event == ACCEPT)";
-pub const NETWORK_FILTER: &str = "outbound and !loopback and (tcp or udp)";
+pub const NETWORK_FILTER: &str =
+    "outbound and !loopback and ((tcp or udp) or (icmp and icmp.Type == 3))";
 /// Threads receiving from the Network-layer handle.
 pub const NETWORK_THREADS: usize = 4;
 /// Ancestors refreshed on demand for an unknown pid (Ruling R5).
@@ -102,7 +107,40 @@ fn keep_going(run: &RunState, layer: &str, e: &std::io::Error) -> bool {
     true
 }
 
-pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
+/// Injects the UDP relay's rebuilt reply packets toward apps through the
+/// Network-layer handle. A WinDivert send is a short non-blocking driver
+/// call (safe concurrently with the packet threads), so it runs directly on
+/// the calling tokio task.
+pub struct NetworkSink(pub Arc<Handle>);
+
+impl InboundSink for NetworkSink {
+    fn inject(&self, mut pkt: Vec<u8>, addr: &Address) {
+        let mut a = *addr;
+        a.set_outbound(false);
+        calc_checksums_addr(&mut pkt, &mut a);
+        if let Err(e) = self.0.send(&pkt, &a) {
+            tracing::debug!("udp reply inject failed: {e}");
+        }
+    }
+}
+
+/// A Socket-layer local address as the UDP relay keys it: IPv4 or
+/// v4-mapped as is, the IPv6 wildcard as `0.0.0.0` (same port); `None` for
+/// other IPv6 (never relayed).
+fn relay_local(a: SocketAddr) -> Option<SocketAddrV4> {
+    match a {
+        SocketAddr::V4(a) => Some(a),
+        SocketAddr::V6(a) if a.ip().is_unspecified() => {
+            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, a.port()))
+        }
+        SocketAddr::V6(a) => a
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddrV4::new(ip, a.port())),
+    }
+}
+
+pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp: Arc<UdpRelay>) {
     loop {
         let addr = match h.recv(&mut []) {
             Ok((_, addr)) => addr,
@@ -131,6 +169,11 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
                     Protocol::Udp
                 };
                 conns.close_local(proto, s.local);
+                if s.protocol == PROTO_UDP {
+                    if let Some(l) = relay_local(s.local) {
+                        udp.close(l);
+                    }
+                }
                 // A new socket reusing this local port must not inherit
                 // the old socket's decision.
                 run.cache.on_socket_closed(s.protocol, s.local);
@@ -140,7 +183,7 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>) {
     }
 }
 
-pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>) {
+pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>, udp: Arc<UdpRelay>) {
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
         let (n, mut addr) = match h.recv(&mut buf) {
@@ -149,7 +192,7 @@ pub fn network_loop(h: Arc<Handle>, shared: Arc<Shared>, run: Arc<RunState>) {
             Err(_) => return,
         };
         let pkt = &mut buf[..n];
-        match route_packet(pkt, &mut addr, &shared, &run) {
+        match route_packet(pkt, &mut addr, &shared, &run, &udp) {
             Out::Send => {
                 if let Err(e) = h.send(pkt, &addr) {
                     tracing::debug!("reinject failed: {e}");
@@ -197,9 +240,23 @@ impl From<bool> for Out {
 /// from: an inbound packet (never captured by the filter), a restored relay
 /// reply, a NAT-rewritten packet, or `classify` returning `Pass` (Direct
 /// flow / own socket). `ResetApp` never sends the packet itself.
-fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunState) -> Out {
+fn route_packet(
+    pkt: &mut [u8],
+    addr: &mut Address,
+    shared: &Shared,
+    run: &RunState,
+    udp: &UdpRelay,
+) -> Out {
     if !addr.outbound() {
         return Out::Send;
+    }
+    // ICMPv4 (the filter captures only type 3): never a proxied flow; only
+    // the stack's answer to an injected relay reply is held back.
+    if pkt.first().is_some_and(|b| b >> 4 == 4) && pkt.get(9) == Some(&PROTO_ICMP) {
+        return match icmp_quoted_udp_dst_port(pkt) {
+            Some(port) if udp.serves_port(port) => Out::Drop,
+            _ => Out::Send,
+        };
     }
     // Captured but not understood (e.g. odd IPv6 extension headers): drop
     // rather than risk passing a non-Direct flow.
@@ -239,10 +296,78 @@ fn route_packet(pkt: &mut [u8], addr: &mut Address, shared: &Shared, run: &RunSt
             run.nat.insert(f.local.port(), OriginalDst { dst, pid });
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
+        // Handed to the UDP relay; the packet itself never leaves.
+        Action::UdpProxy {
+            pid,
+            profile,
+            group_id,
+        } => {
+            let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (f.local, f.remote) else {
+                return Out::Drop;
+            };
+            if let Some(payload) = udp4_payload(pkt) {
+                udp.submit(Datagram {
+                    pid,
+                    profile,
+                    group_id,
+                    local,
+                    remote,
+                    payload: payload.to_vec(),
+                    addr: *addr,
+                });
+            }
+            Out::Drop
+        }
         Action::Redirect => {
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
     }
+}
+
+const PROTO_ICMP: u8 = 1;
+
+/// For an IPv4 ICMP destination unreachable (type 3) quoting an IPv4/UDP
+/// packet: the quoted UDP destination port (the local port the triggering
+/// inbound packet was addressed to). `None` for anything else or anything
+/// malformed / truncated.
+fn icmp_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
+    let be16 = |b: &[u8], at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]))
+    };
+    if p.len() < 20 || p[0] >> 4 != 4 || p[9] != PROTO_ICMP || be16(p, 6)? & 0x1fff != 0 {
+        return None;
+    }
+    let ihl = usize::from(p[0] & 0x0f) * 4;
+    let total = usize::from(be16(p, 2)?).min(p.len());
+    if ihl < 20 {
+        return None;
+    }
+    let icmp = p.get(ihl..total)?;
+    if *icmp.first()? != 3 {
+        return None;
+    }
+    // ICMP header (8 bytes), then the quoted IP header + 8 bytes.
+    let q = icmp.get(8..)?;
+    if q.len() < 20 || q[0] >> 4 != 4 || q[9] != PROTO_UDP || be16(q, 6)? & 0x1fff != 0 {
+        return None;
+    }
+    let qihl = usize::from(q[0] & 0x0f) * 4;
+    if qihl < 20 {
+        return None;
+    }
+    be16(q, qihl + 2)
+}
+
+/// UDP payload of an IPv4/UDP packet (bounded by the UDP and IP lengths);
+/// `None` if the lengths are inconsistent (e.g. a truncated fragment).
+fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
+    let ihl = usize::from(*p.first()? & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([*p.get(2)?, *p.get(3)?]));
+    let udp_len = usize::from(u16::from_be_bytes([*p.get(ihl + 4)?, *p.get(ihl + 5)?]));
+    if udp_len < 8 || ihl + udp_len > total.min(p.len()) {
+        return None;
+    }
+    p.get(ihl + 8..ihl + udp_len)
 }
 
 /// Ruling R14: FlowTable by (local, remote) -> by local -> OS socket table
@@ -363,9 +488,78 @@ mod tests {
     use crate::windivert::{check_filter, Layer};
 
     #[test]
+    fn udp4_payload_slices_after_header() {
+        let src = "10.0.0.2:5000".parse().unwrap();
+        let dst = "8.8.4.4:3478".parse().unwrap();
+        let p = crate::udp_packet::build_inbound_udp(src, dst, b"hello").unwrap();
+        assert_eq!(udp4_payload(&p), Some(&b"hello"[..]));
+        let mut bad = p.clone();
+        bad[24..26].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(udp4_payload(&bad), None, "UDP length past the packet");
+        assert_eq!(udp4_payload(&p[..25]), None, "truncated");
+    }
+
+    #[test]
+    fn relay_local_maps_socket_addresses() {
+        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let v4 = |s: &str| Some(s.parse::<SocketAddrV4>().unwrap());
+        assert_eq!(relay_local(p("10.0.0.2:5000")), v4("10.0.0.2:5000"));
+        assert_eq!(
+            relay_local(p("[::ffff:10.0.0.2]:5000")),
+            v4("10.0.0.2:5000")
+        );
+        assert_eq!(relay_local(p("[::]:5000")), v4("0.0.0.0:5000"));
+        assert_eq!(relay_local(p("[2001:db8::1]:5000")), None);
+    }
+
+    /// IPv4 ICMP `ty`/code 3 quoting the first 28 bytes of `quoted`.
+    fn icmp4(ty: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 128, PROTO_ICMP, 0, 0];
+        p.extend_from_slice(&[10, 0, 0, 2, 8, 8, 4, 4]);
+        p.extend_from_slice(&[ty, 3, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&quoted[..28.min(quoted.len())]);
+        let len = p.len() as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn icmp_quoted_udp_dst_port_parses_port_unreachable() {
+        // The triggering inbound packet: remote -> app's local port 5000.
+        let src = "8.8.4.4:3478".parse().unwrap();
+        let dst = "10.0.0.2:5000".parse().unwrap();
+        let udp = crate::udp_packet::build_inbound_udp(src, dst, b"reply").unwrap();
+        assert_eq!(icmp_quoted_udp_dst_port(&icmp4(3, &udp)), Some(5000));
+        let mut tcp = udp.clone();
+        tcp[9] = PROTO_TCP;
+        assert_eq!(
+            icmp_quoted_udp_dst_port(&icmp4(3, &tcp)),
+            None,
+            "quotes TCP"
+        );
+        assert_eq!(icmp_quoted_udp_dst_port(&icmp4(8, &udp)), None, "echo");
+        let full = icmp4(3, &udp);
+        for n in [0, 10, 20, 27, 36, 48, 51] {
+            assert_eq!(
+                icmp_quoted_udp_dst_port(&full[..n]),
+                None,
+                "truncated to {n}"
+            );
+        }
+        // The outer packet itself is UDP, not ICMP.
+        assert_eq!(icmp_quoted_udp_dst_port(&udp), None);
+    }
+
+    #[test]
     fn filters_compile() {
         check_filter(SOCKET_FILTER, Layer::Socket).unwrap();
         check_filter(NETWORK_FILTER, Layer::Network).unwrap();
+        check_filter(
+            "outbound and !loopback and icmp and icmp.Type == 3",
+            Layer::Network,
+        )
+        .unwrap();
+        assert!(NETWORK_FILTER.contains("icmp and icmp.Type == 3"));
         assert!(check_filter("tcp and event == NOPE", Layer::Socket).is_err());
     }
 }

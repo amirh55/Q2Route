@@ -11,5 +11,7 @@ pub mod nat;
 pub mod packet_loop;
 pub mod relay;
 pub mod stats;
+pub mod udp_packet;
+pub mod udp_relay;
 pub mod winapi;
 pub mod windivert;

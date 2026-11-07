@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 /// Result of a proxy connectivity test.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -19,6 +19,9 @@ pub struct ProxyTestResult {
     pub tcp_ok: bool,
     pub latency_ms: Option<u32>,
     pub error: Option<String>,
+    /// UDP ASSOCIATE check (SOCKS5 only, and only when `tcp_ok`); `None` = not tested.
+    #[serde(default)]
+    pub udp_ok: Option<bool>,
 }
 
 /// Where the proxy should connect to.
@@ -122,16 +125,97 @@ pub async fn connect_via(
         Ok(s)
     })
     .await
-    .map_err(|_| {
-        if got.load(Ordering::Relaxed) {
-            ProxyError::TargetTimeout
-        } else {
-            ProxyError::Timeout
-        }
-    })?
+    .map_err(|_| timeout_error(&got))?
 }
 
-async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
+fn timeout_error(got: &AtomicBool) -> ProxyError {
+    if got.load(Ordering::Relaxed) {
+        ProxyError::TargetTimeout
+    } else {
+        ProxyError::Timeout
+    }
+}
+
+/// A live SOCKS5 UDP association. Dropping `control` ends it (RFC 1928 section 7).
+pub struct UdpAssociation {
+    pub control: TcpStream,
+    pub relay: SocketAddr,
+}
+
+/// Open a UDP association through a SOCKS5 profile (user/pass supported).
+/// Bounded by `timeout`, with the same error mapping as [`connect_via`]. A
+/// BND.ADDR of 0.0.0.0 / :: is replaced by the proxy's own host IP.
+pub async fn udp_associate(
+    p: &ProxyProfile,
+    timeout: Duration,
+) -> Result<UdpAssociation, ProxyError> {
+    if p.kind != ProxyKind::Socks5 {
+        return Err(ProxyError::Protocol("UDP needs a SOCKS5 proxy".into()));
+    }
+    let got = AtomicBool::new(false);
+    tokio::time::timeout(timeout, async {
+        let mut s = TcpStream::connect((p.host.as_str(), p.port))
+            .await
+            .map_err(|_| ProxyError::Unreachable)?;
+        let peer = s.peer_addr()?;
+        let mut w = Seen {
+            s: &mut s,
+            got: &got,
+        };
+        socks5_negotiate(&mut w, p).await?;
+        // DST.ADDR/PORT 0.0.0.0:0: the client's UDP source is not known yet.
+        w.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        let mut relay = socks5_reply(&mut w).await?;
+        if relay.ip().is_unspecified() {
+            relay.set_ip(peer.ip());
+        }
+        Ok(UdpAssociation { control: s, relay })
+    })
+    .await
+    .map_err(|_| timeout_error(&got))?
+}
+
+/// SOCKS5 UDP request header (RSV=0, FRAG=0, ATYP IPv4/IPv6) + payload.
+pub fn encode_udp(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut o = vec![0, 0, 0];
+    match dst {
+        SocketAddr::V4(a) => {
+            o.push(1);
+            o.extend_from_slice(&a.ip().octets());
+        }
+        SocketAddr::V6(a) => {
+            o.push(4);
+            o.extend_from_slice(&a.ip().octets());
+        }
+    }
+    o.extend_from_slice(&dst.port().to_be_bytes());
+    o.extend_from_slice(payload);
+    o
+}
+
+/// Parses a SOCKS5 UDP datagram; `None` if too short, FRAG != 0, or ATYP is a domain.
+pub fn decode_udp(d: &[u8]) -> Option<(SocketAddr, &[u8])> {
+    if d.len() < 4 || d[2] != 0 {
+        return None;
+    }
+    let (ip, rest): (IpAddr, &[u8]) = match d[3] {
+        1 => (
+            IpAddr::from(<[u8; 4]>::try_from(d.get(4..8)?).ok()?),
+            &d[8..],
+        ),
+        4 => (
+            IpAddr::from(<[u8; 16]>::try_from(d.get(4..20)?).ok()?),
+            &d[20..],
+        ),
+        _ => return None,
+    };
+    let port = u16::from_be_bytes(rest.get(..2)?.try_into().ok()?);
+    Some((SocketAddr::new(ip, port), &rest[2..]))
+}
+
+/// SOCKS5 greeting plus optional user/pass sub-negotiation (shared by CONNECT
+/// and UDP ASSOCIATE).
+async fn socks5_negotiate(s: &mut Seen<'_>, p: &ProxyProfile) -> Result<(), ProxyError> {
     let creds = p
         .username
         .as_ref()
@@ -166,7 +250,11 @@ async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), Pr
         (0xFF, _) => return Err(ProxyError::Auth),
         (x, _) => return Err(ProxyError::Protocol(format!("unexpected auth method {x}"))),
     }
+    Ok(())
+}
 
+async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
+    socks5_negotiate(s, p).await?;
     let mut req = vec![5, 1, 0];
     match t {
         Target::Ip(SocketAddr::V4(a)) => {
@@ -190,6 +278,12 @@ async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), Pr
         }
     }
     s.write_all(&req).await?;
+    socks5_reply(s).await?;
+    Ok(())
+}
+
+/// Reads a SOCKS5 reply and returns BND.ADDR:PORT (a domain BND yields 0.0.0.0).
+async fn socks5_reply(s: &mut Seen<'_>) -> Result<SocketAddr, ProxyError> {
     let mut r = [0u8; 4];
     s.read_exact(&mut r).await?;
     if r[0] != 5 {
@@ -198,19 +292,29 @@ async fn socks5(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), Pr
     if r[1] != 0 {
         return Err(ProxyError::Refused);
     }
-    let addr_len = match r[3] {
-        1 => 4,
-        4 => 16,
+    let ip = match r[3] {
+        1 => {
+            let mut b = [0u8; 4];
+            s.read_exact(&mut b).await?;
+            IpAddr::from(b)
+        }
+        4 => {
+            let mut b = [0u8; 16];
+            s.read_exact(&mut b).await?;
+            IpAddr::from(b)
+        }
         3 => {
             let mut n = [0u8; 1];
             s.read_exact(&mut n).await?;
-            n[0] as usize
+            let mut sink = vec![0u8; n[0] as usize];
+            s.read_exact(&mut sink).await?;
+            IpAddr::from([0u8; 4])
         }
         _ => return Err(ProxyError::Protocol("bad reply ATYP".into())),
     };
-    let mut sink = vec![0u8; addr_len + 2];
-    s.read_exact(&mut sink).await?;
-    Ok(())
+    let mut port = [0u8; 2];
+    s.read_exact(&mut port).await?;
+    Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
 }
 
 async fn socks4(s: &mut Seen<'_>, t: &Target) -> Result<(), ProxyError> {
@@ -313,7 +417,44 @@ fn base64(d: &[u8]) -> String {
     o
 }
 
-/// CONNECT to 1.1.1.1:443 through the profile and time it (5 s limit).
+/// Minimal DNS A query for example.com (id 0x5132).
+const DNS_QUERY: &[u8] =
+    b"\x51\x32\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+
+/// Open a UDP association and get any decodable reply to a DNS query for
+/// example.com via 1.1.1.1:53 within 2 s.
+async fn udp_check(p: &ProxyProfile) -> bool {
+    let Ok(assoc) = udp_associate(p, Duration::from_secs(5)).await else {
+        return false;
+    };
+    let bind = if assoc.relay.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let Ok(sock) = UdpSocket::bind(bind).await else {
+        return false;
+    };
+    // Connected like the service's relay socket: only replies from the
+    // relay address count, so "UDP OK" means the relay path works.
+    if sock.connect(assoc.relay).await.is_err() {
+        return false;
+    }
+    let dst = SocketAddr::new(IpAddr::from([1, 1, 1, 1]), 53);
+    if sock.send(&encode_udp(dst, DNS_QUERY)).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 2048];
+    let ok = matches!(
+        tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await,
+        Ok(Ok(n)) if decode_udp(&buf[..n]).is_some()
+    );
+    drop(assoc.control); // the association must live until here
+    ok
+}
+
+/// CONNECT to 1.1.1.1:443 through the profile and time it (5 s limit); for a
+/// working SOCKS5 profile, also check UDP ASSOCIATE with a DNS query.
 pub async fn test_proxy(p: &ProxyProfile) -> ProxyTestResult {
     let t = Target::Ip(SocketAddr::new(IpAddr::from([1, 1, 1, 1]), 443));
     let start = Instant::now();
@@ -322,11 +463,17 @@ pub async fn test_proxy(p: &ProxyProfile) -> ProxyTestResult {
             tcp_ok: true,
             latency_ms: Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32),
             error: None,
+            udp_ok: if p.kind == ProxyKind::Socks5 {
+                Some(udp_check(p).await)
+            } else {
+                None
+            },
         },
         Err(e) => ProxyTestResult {
             tcp_ok: false,
             latency_ms: None,
             error: Some(e.to_string()),
+            udp_ok: None,
         },
     }
 }

@@ -29,11 +29,12 @@ use crate::conns::ConnLog;
 use crate::geo::GeoCache;
 use crate::ipc_server::{BoxFuture, Control};
 use crate::packet_loop::{
-    network_loop, socket_loop, NatLookup, RunState, Shared, NETWORK_FILTER, NETWORK_THREADS,
-    SOCKET_FILTER,
+    network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared, NETWORK_FILTER,
+    NETWORK_THREADS, SOCKET_FILTER,
 };
 use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
+use crate::udp_relay::UdpRelay;
 use crate::winapi;
 use crate::windivert::{Handle, Layer, FLAG_RECV_ONLY, FLAG_SNIFF};
 
@@ -72,6 +73,7 @@ struct Running {
     net: Arc<Handle>,
     threads: Vec<std::thread::JoinHandle<()>>,
     relay: JoinHandle<std::io::Result<()>>,
+    udp: Arc<UdpRelay>,
 }
 
 impl Engine {
@@ -190,22 +192,33 @@ impl Inner {
         })
         .await??;
 
+        let cancel = CancellationToken::new();
+        let udp = UdpRelay::new(
+            self.relay().clone(),
+            Arc::new(NetworkSink(net.clone())),
+            cancel.clone(),
+        );
         let mut threads = Vec::new();
         let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
             std::thread::Builder::new().name(name).spawn(f)
         };
-        let (h, s, conns) = (sock.clone(), state.clone(), self.relay().conns.clone());
+        let (h, s, conns, u) = (
+            sock.clone(),
+            state.clone(),
+            self.relay().conns.clone(),
+            udp.clone(),
+        );
         let mut spawned = spawn(
             "q2r-socket".into(),
-            Box::new(move || socket_loop(h, s, conns)),
+            Box::new(move || socket_loop(h, s, conns, u)),
         )
         .map(|t| threads.push(t));
         for i in 0..NETWORK_THREADS {
-            let (h, sh, s) = (net.clone(), self.shared.clone(), state.clone());
+            let (h, sh, s, u) = (net.clone(), self.shared.clone(), state.clone(), udp.clone());
             spawned = spawned.and_then(|()| {
                 spawn(
                     format!("q2r-net-{i}"),
-                    Box::new(move || network_loop(h, sh, s)),
+                    Box::new(move || network_loop(h, sh, s, u)),
                 )
                 .map(|t| threads.push(t))
             });
@@ -213,6 +226,8 @@ impl Inner {
         if let Err(e) = spawned {
             // Unwind: the threads already running exit once the handles shut down.
             state.stopping.store(true, Ordering::SeqCst);
+            cancel.cancel();
+            udp.wait().await;
             net.shutdown();
             sock.shutdown();
             return Err(e.into());
@@ -220,7 +235,6 @@ impl Inner {
 
         let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
 
-        let cancel = CancellationToken::new();
         let relay = tokio::spawn(run_relay(
             listener,
             Arc::new(NatLookup(state.nat.clone())),
@@ -237,6 +251,7 @@ impl Inner {
             net,
             threads,
             relay,
+            udp,
         });
         self.running.store(true, Ordering::SeqCst);
         tracing::info!("routing started (relay port {relay_port})");
@@ -247,13 +262,15 @@ impl Inner {
         let mut run = self.run.lock().await;
         let Some(r) = run.take() else { return Ok(()) };
         // 1. Close every proxied connection (the relay's FIN/RST is still
-        //    restored to the apps while capture is up).
+        //    restored to the apps while capture is up) and every UDP
+        //    session (control connections closed).
         r.cancel.cancel();
         match r.relay.await {
             Ok(Err(e)) => tracing::warn!("relay ended with error: {e}"),
             Err(e) => tracing::warn!("relay task failed: {e}"),
             Ok(Ok(())) => {}
         }
+        r.udp.wait().await;
         tokio::time::sleep(STOP_DRAIN).await;
         // 2. Close capture: from here on everything is direct.
         r.state.stopping.store(true, Ordering::SeqCst);

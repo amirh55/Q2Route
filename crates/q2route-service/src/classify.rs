@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use q2route_core::config::{GroupId, ProfileId};
 use q2route_core::decide::{Decision, Route};
 
 pub const PROTO_TCP: u8 = 6;
@@ -44,7 +45,7 @@ pub struct PktMeta {
     pub syn_ack: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Reinject unchanged (Direct).
     Pass,
@@ -58,16 +59,33 @@ pub enum Action {
     Redirect,
     /// Insert a NAT entry for this new flow owned by `pid`, then redirect.
     NewRedirect { pid: u32 },
+    /// IPv4 UDP of a proxied flow: relay it through the SOCKS5 profile.
+    /// `pid` is the owning pid (from the decision, also on a cache hit).
+    UdpProxy {
+        pid: u32,
+        profile: ProfileId,
+        group_id: Option<GroupId>,
+    },
+}
+
+/// A cached per-flow routing decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cached {
+    Direct,
+    /// Block, or a proxied TCP flow (handled by the TCP relay).
+    Other,
+    /// Proxied UDP flow: profile, group, owning pid.
+    UdpProxy(ProfileId, Option<GroupId>, u32),
 }
 
 struct CacheEntry {
-    direct: bool,
+    cached: Cached,
     last_seen: Instant,
     /// Rules generation the decision was made under.
     generation: u64,
 }
 
-/// Per-flow route cache: `true` = Direct. Thread-safe.
+/// Per-flow route cache. Thread-safe.
 #[derive(Default)]
 pub struct FlowCache {
     map: Mutex<HashMap<FlowId, CacheEntry>>,
@@ -86,32 +104,32 @@ impl FlowCache {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Cached decision (`true` = Direct); refreshes the entry's idle timer.
+    /// Cached decision; refreshes the entry's idle timer.
     /// A decision made under older rules counts as uncached, except a
     /// non-Direct TCP one (such a flow must never continue direct).
-    pub fn get(&self, id: &FlowId) -> Option<bool> {
+    pub fn get(&self, id: &FlowId) -> Option<Cached> {
         let current = self.generation();
         let mut g = self.lock();
         let e = g.get_mut(id)?;
-        if e.generation != current && (id.proto != PROTO_TCP || e.direct) {
+        if e.generation != current && (id.proto != PROTO_TCP || e.cached == Cached::Direct) {
             g.remove(id);
             return None;
         }
         e.last_seen = Instant::now();
-        Some(e.direct)
+        Some(e.cached.clone())
     }
 
     /// Stores a decision made under the current rules generation.
-    pub fn put(&self, id: FlowId, direct: bool) {
-        self.put_at(id, direct, self.generation());
+    pub fn put(&self, id: FlowId, cached: Cached) {
+        self.put_at(id, cached, self.generation());
     }
 
     /// Stores a decision made under rules generation `generation`.
-    pub fn put_at(&self, id: FlowId, direct: bool, generation: u64) {
+    pub fn put_at(&self, id: FlowId, cached: Cached, generation: u64) {
         self.lock().insert(
             id,
             CacheEntry {
-                direct,
+                cached,
                 last_seen: Instant::now(),
                 generation,
             },
@@ -128,7 +146,9 @@ impl FlowCache {
             l.port() == local.port() && (local.ip().is_unspecified() || l.ip() == local.ip())
         };
         self.lock().retain(|id, e| {
-            !(id.proto == proto && same_local(&id.local) && (proto != PROTO_TCP || e.direct))
+            !(id.proto == proto
+                && same_local(&id.local)
+                && (proto != PROTO_TCP || e.cached == Cached::Direct))
         });
     }
 
@@ -142,7 +162,7 @@ impl FlowCache {
             local,
             remote,
         };
-        self.put(id, true);
+        self.put(id, Cached::Direct);
     }
 
     /// Drops entries idle past [`TCP_CACHE_IDLE`] / [`UDP_CACHE_IDLE`].
@@ -167,7 +187,7 @@ impl FlowCache {
         // stored with the old generation and so ignored by `get`.
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.lock()
-            .retain(|id, e| id.proto == PROTO_TCP && !e.direct);
+            .retain(|id, e| id.proto == PROTO_TCP && e.cached != Cached::Direct);
     }
 
     pub fn len(&self) -> usize {
@@ -190,7 +210,8 @@ impl FlowCache {
 ///   when the cache cannot answer.
 ///
 /// Invariant: `Pass` is only returned for a flow whose (cached or fresh)
-/// decision is Direct, or for the service's own sockets.
+/// decision is Direct, or for the service's own sockets. A proxied UDP flow
+/// is never passed: it is `UdpProxy` (IPv4 only) or `Drop`.
 pub fn classify(
     m: &PktMeta,
     own_port: bool,
@@ -206,12 +227,25 @@ pub fn classify(
     // Read before `decide` loads the rules (the engine swaps rules, then
     // bumps the generation), so an old-rules decision is never trusted.
     let generation = cache.generation();
-    // Decides now and remembers the outcome; returns (pid, is_direct).
-    let decide_now = |decide: &mut dyn FnMut() -> (u32, Decision)| -> (u32, bool) {
+    // Decides now and remembers the outcome; returns (pid, decision).
+    let decide_now = |decide: &mut dyn FnMut() -> (u32, Decision)| -> (u32, Cached) {
         let (pid, d) = decide();
-        let direct = pid == own_pid || matches!(d, Decision::Final(Route::Direct, _));
-        cache.put_at(id, direct, generation);
-        (pid, direct)
+        let cached = if pid == own_pid {
+            Cached::Direct
+        } else {
+            match d {
+                Decision::Final(Route::Direct, _) => Cached::Direct,
+                // Only IPv4 UDP is relayed; proxied TCP is `Other` here.
+                Decision::Final(Route::Proxy(p), info)
+                    if id.proto == PROTO_UDP && id.remote.is_ipv4() =>
+                {
+                    Cached::UdpProxy(p, info.group_id, pid)
+                }
+                _ => Cached::Other,
+            }
+        };
+        cache.put_at(id, cached.clone(), generation);
+        (pid, cached)
     };
     // Every path below calls `decide` at most once.
     let mut decide = Some(decide);
@@ -219,8 +253,8 @@ pub fn classify(
     match id.proto {
         PROTO_TCP if m.syn => {
             // A connection attempt is always (re)decided.
-            let (pid, direct) = decide_now(&mut call);
-            if direct {
+            let (pid, cached) = decide_now(&mut call);
+            if cached == Cached::Direct {
                 Action::Pass
             } else if id.remote.is_ipv4() {
                 Action::NewRedirect { pid }
@@ -240,29 +274,35 @@ pub fn classify(
                 Action::Reset
             };
             match cache.get(&id) {
-                Some(true) => Action::Pass,
-                Some(false) if nat_has => Action::Redirect,
-                Some(false) => stop,
+                Some(Cached::Direct) => Action::Pass,
+                Some(_) if nat_has => Action::Redirect,
+                Some(_) => stop,
                 None if nat_has => {
-                    cache.put(id, false);
+                    cache.put(id, Cached::Other);
                     Action::Redirect
                 }
                 // A flow that predates Q2Route: only a Direct flow may continue.
                 None => match decide_now(&mut call) {
-                    (_, true) => Action::Pass,
-                    (_, false) => stop,
+                    (_, Cached::Direct) => Action::Pass,
+                    (_, _) => stop,
                 },
             }
         }
         PROTO_UDP => {
-            let direct = match cache.get(&id) {
-                Some(d) => d,
+            let cached = match cache.get(&id) {
+                Some(c) => c,
                 None => decide_now(&mut call).1,
             };
-            if direct {
-                Action::Pass
-            } else {
-                Action::Drop
+            match cached {
+                Cached::Direct => Action::Pass,
+                Cached::UdpProxy(profile, group_id, pid) if id.remote.is_ipv4() => {
+                    Action::UdpProxy {
+                        pid,
+                        profile,
+                        group_id,
+                    }
+                }
+                _ => Action::Drop,
             }
         }
         _ => Action::Drop,
@@ -654,9 +694,75 @@ mod tests {
         assert_eq!(run(&u, &c, false, APP_PID, direct(), &n), Action::Drop);
         assert_eq!(n.get(), 1);
         let c = FlowCache::default();
-        assert_eq!(run(&u, &c, false, APP_PID, proxy(), &n), Action::Drop);
         let u6 = meta(PROTO_UDP, "[2001:db8::5]:5000", "[2001:db8::1]:443", false);
         assert_eq!(run(&u6, &c, false, APP_PID, block(), &n), Action::Drop);
+    }
+
+    fn udp_stun() -> PktMeta {
+        meta(PROTO_UDP, "10.0.0.2:5000", "8.8.4.4:3478", false)
+    }
+
+    #[test]
+    fn udp_proxy_decision_returns_udp_proxy() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let want = Action::UdpProxy {
+            pid: APP_PID,
+            profile: "v2ray".into(),
+            group_id: Some("g".into()),
+        };
+        assert_eq!(run(&udp_stun(), &c, false, APP_PID, proxy(), &n), want);
+        // A cache hit returns the same action, pid included.
+        assert_eq!(run(&udp_stun(), &c, false, APP_PID, proxy(), &n), want);
+        assert_eq!(n.get(), 1, "second packet from cache");
+    }
+
+    #[test]
+    fn udp_block_still_drops() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        assert_eq!(
+            run(&udp_stun(), &c, false, APP_PID, block(), &n),
+            Action::Drop
+        );
+        assert_eq!(
+            run(&udp_stun(), &c, false, APP_PID, direct(), &n),
+            Action::Drop
+        );
+        assert_eq!(n.get(), 1);
+    }
+
+    #[test]
+    fn udp_direct_still_passes() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        assert_eq!(
+            run(&udp_stun(), &c, false, APP_PID, direct(), &n),
+            Action::Pass
+        );
+        assert_eq!(
+            run(&udp_stun(), &c, false, APP_PID, block(), &n),
+            Action::Pass
+        );
+        assert_eq!(n.get(), 1);
+    }
+
+    #[test]
+    fn udp_ipv6_proxy_never_udp_proxy() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let u6 = meta(PROTO_UDP, "[2001:db8::5]:5000", "[2001:db8::1]:3478", false);
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
+    }
+
+    #[test]
+    fn rules_change_redecides_udp_proxy() {
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        let is_proxy = |a: &Action| matches!(a, Action::UdpProxy { .. });
+        assert!(is_proxy(&run(&udp_stun(), &c, false, APP_PID, proxy(), &n)));
+        c.on_rules_changed();
+        assert_eq!(
+            run(&udp_stun(), &c, false, APP_PID, block(), &n),
+            Action::Drop
+        );
+        assert_eq!(n.get(), 2, "decided again under the new rules");
     }
 
     #[test]
@@ -695,7 +801,7 @@ mod tests {
         assert_eq!(run(&u, &c, false, APP_PID + 1, block(), &n), Action::Drop);
         // A wildcard-bound close also matches the concrete local address.
         assert_eq!(run(&u, &c, false, APP_PID, block(), &n), Action::Drop);
-        c.put(u.flow, true);
+        c.put(u.flow, Cached::Direct);
         c.on_socket_closed(PROTO_UDP, "0.0.0.0:5000".parse().unwrap());
         assert!(c.is_empty());
     }
@@ -777,10 +883,10 @@ mod tests {
     #[test]
     fn cache_sweep_expires_idle_entries() {
         let c = FlowCache::default();
-        c.put(tcp(true).flow, false);
+        c.put(tcp(true).flow, Cached::Other);
         c.put(
             meta(PROTO_UDP, "10.0.0.2:5000", "8.8.4.4:443", false).flow,
-            true,
+            Cached::Direct,
         );
         c.sweep(Instant::now());
         assert_eq!(c.len(), 2);
