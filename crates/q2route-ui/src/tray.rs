@@ -250,6 +250,7 @@ mod tests {
             proxy_up: Default::default(),
             total_up_bps: 120_000,
             total_down_bps: 2_400_000,
+            proxy_servers: vec![],
         }
     }
 

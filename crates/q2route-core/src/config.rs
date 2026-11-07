@@ -149,6 +149,36 @@ pub struct Group {
     pub catch_all: bool,
 }
 
+fn default_resolver() -> String {
+    "1.1.1.1:53".into()
+}
+
+/// DNS routing settings: DNS is routed by the queried name; names that
+/// resolve through the proxy go to `proxy_resolver` over the proxy.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DnsSettings {
+    #[serde(default = "default_resolver")]
+    pub proxy_resolver: String,
+    /// Block DoH (known hosts on TCP 443) and DoT/DoQ (port 853) for proxied flows.
+    #[serde(default = "yes")]
+    pub block_doh: bool,
+    /// Names always resolved directly (rule-domain syntax: `example.com`,
+    /// `*.example.com`, `keyword:x`), e.g. the VPN server the proxy
+    /// client connects to when it is not detected automatically.
+    #[serde(default)]
+    pub direct_names: Vec<String>,
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        DnsSettings {
+            proxy_resolver: default_resolver(),
+            block_doh: true,
+            direct_names: Vec::new(),
+        }
+    }
+}
+
 fn default_peek() -> u64 {
     300
 }
@@ -166,6 +196,8 @@ pub struct Settings {
     /// Whether routing was running when the service last stopped (restored on start).
     #[serde(default = "yes")]
     pub last_running: bool,
+    #[serde(default)]
+    pub dns: DnsSettings,
 }
 
 impl Default for Settings {
@@ -176,6 +208,7 @@ impl Default for Settings {
             tray_traffic_icon: false,
             peek_timeout_ms: 300,
             last_running: true,
+            dns: DnsSettings::default(),
         }
     }
 }
@@ -373,6 +406,20 @@ impl Config {
                 return bad(format!("catch-all group '{}' must be last", g.id));
             }
         }
+        let dns = &self.settings.dns;
+        if dns.proxy_resolver.parse::<std::net::SocketAddr>().is_err() {
+            return bad(format!(
+                "DNS proxy resolver '{}' is not an address:port",
+                dns.proxy_resolver
+            ));
+        }
+        if let Some(n) = dns
+            .direct_names
+            .iter()
+            .find(|n| DomainPattern::parse(n).is_err())
+        {
+            return bad(format!("DNS direct name '{n}' is not a valid domain"));
+        }
         // Ruling R18: an enabled catch-all must always exist, so unmatched
         // traffic is never silently routed some other way.
         match self.groups.last() {
@@ -399,6 +446,14 @@ impl Config {
             .iter_mut()
             .find(|g| g.id == id)
             .ok_or_else(|| ConfigError::Invalid(format!("unknown group '{id}'")))
+    }
+
+    pub fn set_dns(&mut self, d: DnsSettings) -> Result<(), ConfigError> {
+        // Checked by `validate` (resolver address, direct name patterns).
+        self.mutate(|c| {
+            c.settings.dns = d;
+            Ok(())
+        })
     }
 
     pub fn set_group_action(&mut self, id: &str, a: Action) -> Result<(), ConfigError> {

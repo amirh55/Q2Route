@@ -1,7 +1,8 @@
-//! Builds the inbound IPv4/UDP packets the UDP relay injects toward apps.
+//! Builds the inbound IPv4/IPv6 UDP packets the UDP relay and the DNS proxy
+//! inject toward apps.
 
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// Largest UDP payload over IPv4 (65535 - 20 - 8).
@@ -70,6 +71,41 @@ pub fn build_inbound_udp(
     Ok(p)
 }
 
+/// IPv6 + UDP packet from `src` to `dst` carrying `payload`, hop limit 64,
+/// no extension headers, UDP checksum filled (mandatory over IPv6). Err if
+/// the UDP length would not fit 16 bits (payload > 65527).
+pub fn build_inbound_udp6(
+    src: SocketAddrV6,
+    dst: SocketAddrV6,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let udp_len = u16::try_from(8 + payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "UDP payload too large"))?;
+    let mut p = Vec::with_capacity(40 + usize::from(udp_len));
+    p.extend_from_slice(&[0x60, 0, 0, 0]);
+    p.extend_from_slice(&udp_len.to_be_bytes());
+    p.extend_from_slice(&[17, 64]);
+    p.extend_from_slice(&src.ip().octets());
+    p.extend_from_slice(&dst.ip().octets());
+    p.extend_from_slice(&src.port().to_be_bytes());
+    p.extend_from_slice(&dst.port().to_be_bytes());
+    p.extend_from_slice(&udp_len.to_be_bytes());
+    p.extend_from_slice(&[0, 0]);
+    p.extend_from_slice(payload);
+    // Pseudo-header: src, dst, upper-layer length (32 bits), 3 zero bytes,
+    // next header.
+    let mut pseudo = [0u8; 40];
+    pseudo[..32].copy_from_slice(&p[8..40]);
+    pseudo[34..36].copy_from_slice(&udp_len.to_be_bytes());
+    pseudo[39] = 17;
+    let mut udp_sum = checksum(&[&pseudo, &p[40..]]);
+    if udp_sum == 0 {
+        udp_sum = 0xffff;
+    }
+    p[46..48].copy_from_slice(&udp_sum.to_be_bytes());
+    Ok(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +143,36 @@ mod tests {
             .calc_checksum_ipv4(&h.to_header(), u.payload())
             .unwrap();
         assert_eq!(u.checksum(), want, "udp checksum");
+    }
+
+    #[test]
+    fn inbound_udp6_roundtrip() {
+        let src: SocketAddrV6 = "[2001:db8::53]:53".parse().unwrap();
+        let dst: SocketAddrV6 = "[2001:db8::5]:50000".parse().unwrap();
+        for len in [0usize, 3, 512, 1400] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let pkt = build_inbound_udp6(src, dst, &payload).unwrap();
+            assert_eq!(pkt.len(), 40 + 8 + len);
+            assert_eq!(pkt[7], 64, "hop limit");
+            let s = SlicedPacket::from_ip(&pkt).unwrap();
+            let (Some(NetSlice::Ipv6(ip)), Some(TransportSlice::Udp(u))) = (s.net, s.transport)
+            else {
+                panic!("not ipv6/udp")
+            };
+            let h = ip.header().to_header();
+            assert_eq!(h.source, src.ip().octets());
+            assert_eq!(h.destination, dst.ip().octets());
+            assert_eq!(usize::from(h.payload_length), 8 + len);
+            assert_eq!(u.source_port(), 53);
+            assert_eq!(u.destination_port(), 50000);
+            assert_eq!(u.payload(), &payload[..]);
+            assert_ne!(u.checksum(), 0, "checksum is mandatory over IPv6");
+            let want = u.to_header().calc_checksum_ipv6(&h, u.payload()).unwrap();
+            assert_eq!(u.checksum(), want, "udp checksum (len {len})");
+        }
+        let a: SocketAddrV6 = "[::1]:1".parse().unwrap();
+        assert!(build_inbound_udp6(a, a, &vec![0; 65528]).is_err());
+        assert!(build_inbound_udp6(a, a, &vec![0; 65527]).is_ok());
     }
 
     #[test]

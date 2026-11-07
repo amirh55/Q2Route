@@ -127,10 +127,18 @@ fn unknown_domain_other_port_no_peek() {
 fn server_first_no_domain() {
     let mut c = cfg();
     c.groups.remove(0);
+    c.settings.dns.block_doh = false;
     let rs = RuleSet::compile(&c).unwrap();
     assert_eq!(
         run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // with DoH blocking on, a proxied 443 flow peeks the SNI first
+    c.settings.dns.block_doh = true;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
+        Decision::NeedDomain
     );
 }
 
@@ -261,11 +269,112 @@ fn lan_rule_off() {
 }
 
 #[test]
-fn dns_ntp_direct_m1() {
+fn ntp_still_always_direct() {
     let direct = fin(Route::Direct, None, MatchReason::AlwaysDirectDst);
-    assert_eq!(d(Protocol::Udp, 60, "8.8.8.8:53", None), direct);
     assert_eq!(d(Protocol::Udp, 60, "1.2.3.4:123", None), direct);
-    assert_eq!(d(Protocol::Tcp, 60, "8.8.8.8:53", None), direct);
+    assert_eq!(d(Protocol::Udp, 60, "192.168.1.1:80", None), direct);
+}
+
+#[test]
+fn lan_resolver_still_routed_by_name() {
+    let direct = fin(Route::Direct, None, MatchReason::AlwaysDirectDst);
+    assert_ne!(d(Protocol::Udp, 60, "192.168.1.1:53", None), direct);
+    assert_ne!(d(Protocol::Tcp, 60, "127.0.0.1:53", None), direct);
+    assert_ne!(d(Protocol::Udp, 60, "8.8.8.8:53", None), direct);
+}
+
+#[test]
+fn dns_by_name() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    assert_eq!(
+        decide_dns(&rs, "foo.ir"),
+        (
+            Route::Direct,
+            MatchInfo {
+                group_id: Some("iranian-sites".into()),
+                reason: MatchReason::Own
+            }
+        )
+    );
+    assert_eq!(
+        decide_dns(&rs, "example.com"),
+        (
+            proxy(),
+            MatchInfo {
+                group_id: Some("everything-else".into()),
+                reason: MatchReason::CatchAll
+            }
+        )
+    );
+}
+
+#[test]
+fn dns_ignores_app_rules() {
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "appdom".into(),
+            name: "x".into(),
+            enabled: true,
+            action: Action::Direct,
+            rules: vec![Rule {
+                apps: vec!["x.exe".into()],
+                domains: vec!["example.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    let (r, i) = decide_dns(&rs, "example.com");
+    assert_eq!(r, proxy());
+    assert_eq!(i.reason, MatchReason::CatchAll);
+}
+
+#[test]
+fn doh_blocked_only_when_proxied() {
+    let blocked = fin(
+        Route::Block,
+        Some("everything-else"),
+        MatchReason::DohBlocked,
+    );
+    assert_eq!(
+        d(Protocol::Tcp, 40, "8.8.8.8:443", Some("dns.google")),
+        blocked
+    );
+    assert_eq!(d(Protocol::Udp, 40, "8.8.8.8:853", None), blocked);
+    assert_eq!(d(Protocol::Tcp, 40, "8.8.8.8:853", None), blocked);
+    // not a DoH host
+    assert_eq!(
+        d(Protocol::Tcp, 40, "8.8.8.8:443", Some("example.com")),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // disabled
+    let mut c = cfg();
+    c.settings.dns.block_doh = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "8.8.8.8:443",
+            Some("dns.google")
+        ),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // a direct-matched flow to 853 stays Direct
+    assert_eq!(
+        d(Protocol::Tcp, 40, "5.6.7.8:853", Some("foo.ir")),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn dns_settings_defaults() {
+    assert_eq!(Config::seed().settings.dns, DnsSettings::default());
 }
 
 #[test]
@@ -419,6 +528,7 @@ fn proxied_domain_group_with_proxied_fallback_skips_peek() {
     // Both outcomes are the same proxy: no peek needed.
     let mut c = cfg();
     c.groups[0].action = Action::Proxy("v2ray".into());
+    c.settings.dns.block_doh = false;
     let rs = RuleSet::compile(&c).unwrap();
     assert_eq!(
         run(&rs, &HashSet::new(), Protocol::Tcp, 40, "1.2.3.4:443", None),
@@ -481,4 +591,241 @@ fn geoip_ir_foreign_ip_still_proxied() {
         ),
         fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
     );
+}
+
+#[test]
+fn doh_unknown_domain_peeks_when_proxied() {
+    // catch-all Proxy, TCP 443, no domain yet -> peek
+    let mut c = cfg();
+    c.groups.remove(0);
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
+    // block_doh off -> no peek
+    c.settings.dns.block_doh = false;
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    // port 80 and UDP are unaffected
+    c.settings.dns.block_doh = true;
+    let rs = RuleSet::compile(&c).unwrap();
+    let r = |p, dst| run(&rs, &HashSet::new(), p, 40, dst, None);
+    assert_eq!(
+        r(Protocol::Tcp, "8.8.8.8:80"),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        r(Protocol::Udp, "8.8.8.8:443"),
+        fin(Route::Block, Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn doh_peek_covers_proxy_proxy_shortcut() {
+    // domain rule -> Proxy, rest -> Proxy: eval_from would skip the peek
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "dom".into(),
+            name: "d".into(),
+            enabled: true,
+            action: Action::Proxy("v2ray".into()),
+            rules: vec![Rule {
+                domains: vec!["example.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
+}
+
+#[test]
+fn direct_tcp443_without_domain_needs_no_peek() {
+    let mut c = cfg();
+    c.set_group_action("everything-else", Action::Direct)
+        .unwrap();
+    let rs = RuleSet::compile(&c).unwrap();
+    // *.ir rule may still need the domain, but Direct/Direct shortcut applies
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 40, "8.8.8.8:443", None),
+        fin(
+            Route::Direct,
+            Some("everything-else"),
+            MatchReason::CatchAll
+        )
+    );
+}
+
+fn dm(pid: u32, dst: &str, names: &[&str], rs: &RuleSet) -> Decision {
+    let dst: SocketAddr = dst.parse().unwrap();
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    decide_mapped(
+        rs,
+        &tree(),
+        &HashSet::new(),
+        &FlowInfo {
+            proto: Protocol::Tcp,
+            pid,
+            dst,
+            domain: None,
+        },
+        &names,
+    )
+}
+
+#[test]
+fn mapped_single_name_direct() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn mapped_conflict_most_protective_or_peek() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    let names = ["x.ir", "example.com"];
+    assert!(matches!(
+        dm(40, "5.6.7.8:5222", &names, &rs),
+        Decision::Final(Route::Proxy(_), _)
+    ));
+    assert_eq!(dm(40, "5.6.7.8:443", &names, &rs), Decision::NeedDomain);
+}
+
+#[test]
+fn mapped_names_dont_override_app_rules() {
+    let mut c = cfg();
+    c.groups.insert(
+        0,
+        Group {
+            id: "app-block".into(),
+            name: "App block".into(),
+            enabled: true,
+            action: Action::Block,
+            rules: vec![Rule {
+                apps: vec!["chrome.exe".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Block, Some("app-block"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn no_names_same_as_decide() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    for dst in ["5.6.7.8:443", "5.6.7.8:5222"] {
+        assert_eq!(
+            dm(40, dst, &[], &rs),
+            run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, None)
+        );
+    }
+}
+
+fn dm_no_peek(dst: &str, names: &[&str], rs: &RuleSet) -> Decision {
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    decide_mapped_no_peek(
+        rs,
+        &tree(),
+        &HashSet::new(),
+        &FlowInfo {
+            proto: Protocol::Tcp,
+            pid: 40,
+            dst: dst.parse().unwrap(),
+            domain: None,
+        },
+        &names,
+    )
+}
+
+#[test]
+fn mapped_no_peek_most_protective_on_443() {
+    let mut c = cfg();
+    c.set_group_action("everything-else", Action::Direct)
+        .unwrap();
+    c.groups.insert(
+        0,
+        Group {
+            id: "blocked".into(),
+            name: "Blocked".into(),
+            enabled: true,
+            action: Action::Proxy("v2ray".into()),
+            rules: vec![Rule {
+                domains: vec!["blocked.com".into()],
+                ..Rule::default()
+            }],
+            catch_all: false,
+        },
+    );
+    let rs = RuleSet::compile(&c).unwrap();
+    let names = ["x.ir", "blocked.com"];
+    assert_eq!(dm(40, "5.6.7.8:443", &names, &rs), Decision::NeedDomain);
+    assert_eq!(
+        dm_no_peek("5.6.7.8:443", &names, &rs),
+        fin(
+            Route::Proxy("v2ray".into()),
+            Some("blocked"),
+            MatchReason::Own
+        )
+    );
+    // Agreeing names: that route, first name's info.
+    assert_eq!(
+        dm_no_peek("5.6.7.8:443", &["x.ir", "y.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn mapped_no_peek_without_names_is_empty_domain() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    for dst in ["5.6.7.8:443", "5.6.7.8:5222"] {
+        assert_eq!(
+            dm_no_peek(dst, &[], &rs),
+            run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, Some(""))
+        );
+        assert_ne!(dm_no_peek(dst, &[], &rs), Decision::NeedDomain);
+    }
+}
+
+/// Names from (forgeable) DNS answers alone never skip the peek on a web
+/// port for a flow that is not Direct without a domain.
+#[test]
+fn mapped_direct_name_on_web_port_still_peeks() {
+    let rs = RuleSet::compile(&cfg()).unwrap();
+    // Proxied app (chrome, catch-all Proxy), IP mapped only to x.ir.
+    for dst in ["5.6.7.8:443", "5.6.7.8:80"] {
+        assert_eq!(dm(40, dst, &["x.ir"], &rs), Decision::NeedDomain, "{dst}");
+        assert_eq!(dm(40, dst, &["x.ir", "y.ir"], &rs), Decision::NeedDomain);
+    }
+    // Not a web port: the mapped name decides, as before.
+    assert_eq!(
+        dm(40, "5.6.7.8:5222", &["x.ir"], &rs),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+    // A Direct app (steam child): Direct without a peek.
+    assert!(matches!(
+        dm(20, "5.6.7.8:443", &["x.ir"], &rs),
+        Decision::Final(Route::Direct, _)
+    ));
+    // Proxy from names alone stays final on 443 (no peek needed to protect).
+    assert!(matches!(
+        dm(40, "5.6.7.8:443", &["example.com"], &rs),
+        Decision::Final(Route::Proxy(_), _)
+    ));
 }

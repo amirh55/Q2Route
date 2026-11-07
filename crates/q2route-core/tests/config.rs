@@ -410,3 +410,68 @@ fn move_group_huge_index_is_rejected() {
     assert!(c.move_group("games", usize::MAX).is_err());
     assert_eq!(c, before);
 }
+
+#[test]
+fn dns_settings_defaults_and_validation() {
+    let mut c = Config::seed();
+    assert_eq!(c.settings.dns.proxy_resolver, "1.1.1.1:53");
+    assert!(c.settings.dns.block_doh);
+    assert!(c.settings.dns.direct_names.is_empty());
+    let bad = DnsSettings {
+        proxy_resolver: "1.1.1.1".into(),
+        block_doh: true,
+        direct_names: vec![],
+    };
+    let e = c.set_dns(bad).unwrap_err().to_string();
+    assert!(e.contains("1.1.1.1"));
+    assert_eq!(c.settings.dns.proxy_resolver, "1.1.1.1:53");
+    c.set_dns(DnsSettings {
+        proxy_resolver: "9.9.9.9:53".into(),
+        block_doh: false,
+        direct_names: vec![],
+    })
+    .unwrap();
+    assert_eq!(c.settings.dns.proxy_resolver, "9.9.9.9:53");
+    assert!(!c.settings.dns.block_doh);
+}
+
+#[test]
+fn dns_direct_names_validated() {
+    let mut c = Config::seed();
+    let before = c.clone();
+    let mut d = c.settings.dns.clone();
+    d.direct_names = vec!["vpn.example.com".into(), "*.".into()];
+    let e = c.set_dns(d.clone()).unwrap_err().to_string();
+    assert!(e.contains("'*.'"), "{e}");
+    assert_eq!(c, before);
+    d.direct_names = vec![
+        "vpn.example.com".into(),
+        "*.cdn.example.org".into(),
+        "keyword:myvpn".into(),
+    ];
+    c.set_dns(d.clone()).unwrap();
+    assert_eq!(c.settings.dns.direct_names, d.direct_names);
+    // Old configs without the field still load.
+    let json = r#"{"proxy_resolver":"1.1.1.1:53","block_doh":true}"#;
+    let old: DnsSettings = serde_json::from_str(json).unwrap();
+    assert!(old.direct_names.is_empty());
+}
+
+#[test]
+fn hand_edited_bad_dns_settings_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut c = Config::seed();
+    c.settings.dns.proxy_resolver = "not-an-address".into();
+    c.save(&path).unwrap();
+    let e = Config::load(&path).unwrap_err().to_string();
+    assert!(e.contains("not-an-address"), "{e}");
+    let mut c = Config::seed();
+    c.settings.dns.direct_names = vec!["ok.example.com".into(), "*.".into()];
+    c.save(&path).unwrap();
+    let e = Config::load(&path).unwrap_err().to_string();
+    assert!(e.contains("'*.'"), "{e}");
+    c.settings.dns.direct_names = vec!["ok.example.com".into()];
+    c.save(&path).unwrap();
+    assert_eq!(Config::load(&path).unwrap(), c);
+}

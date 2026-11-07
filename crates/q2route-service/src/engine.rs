@@ -17,6 +17,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ConfigError, ProfileId};
+use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::{Event, ProcEntry, Request, Response, StateSnapshot};
 use q2route_core::process_tree::ProcessTree;
 use q2route_core::proxy::test_proxy;
@@ -26,12 +27,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::conns::ConnLog;
+use crate::dns_proxy::{DnsProxy, DnsProxyConfig};
 use crate::geo::GeoCache;
 use crate::ipc_server::{BoxFuture, Control};
 use crate::packet_loop::{
-    network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared, NETWORK_FILTER,
-    NETWORK_THREADS, SOCKET_FILTER,
+    dns_sniff_loop, network_loop, socket_loop, NatLookup, NetworkSink, RunState, Shared,
+    DNS_SNIFF_FILTER, NETWORK_FILTER, NETWORK_THREADS, SOCKET_FILTER,
 };
+use crate::proxy_servers::{self, ServerCache};
 use crate::relay::{run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
 use crate::udp_relay::UdpRelay;
@@ -74,6 +77,9 @@ struct Running {
     threads: Vec<std::thread::JoinHandle<()>>,
     relay: JoinHandle<std::io::Result<()>>,
     udp: Arc<UdpRelay>,
+    dns: Arc<DnsProxy>,
+    /// Sniff-only DNS answer handle.
+    sniff: Arc<Handle>,
 }
 
 impl Engine {
@@ -97,11 +103,14 @@ impl Engine {
             events,
             idle_timeout: RELAY_IDLE_TIMEOUT,
             proxy_down: DashSet::new(),
+            domains: Arc::new(DomainMap::new()),
+            proxy_servers: ArcSwap::from_pointee(Vec::new()),
         });
         let shared = Arc::new(Shared {
             relay,
             proxy_endpoints: ArcSwap::from_pointee(HashSet::new()),
             own_pid: std::process::id(),
+            server_cache: Arc::new(Mutex::new(ServerCache::default())),
         });
         Ok(Engine {
             inner: Arc::new(Inner {
@@ -184,19 +193,29 @@ impl Inner {
         let relay_port = listener.local_addr()?.port();
         let state = Arc::new(RunState::new(relay_port));
 
-        // Socket layer first so the flow tables fill before packets are held.
-        let (sock, net) = tokio::task::spawn_blocking(|| -> std::io::Result<_> {
+        // Socket layer first so the flow tables fill before packets are held;
+        // the DNS answer sniffer after the Network layer.
+        let (sock, net, sniff) = tokio::task::spawn_blocking(|| -> std::io::Result<_> {
             let sock = Handle::open(SOCKET_FILTER, Layer::Socket, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?;
             let net = Handle::open(NETWORK_FILTER, Layer::Network, 0, 0)?;
-            Ok((Arc::new(sock), Arc::new(net)))
+            let sniff = Handle::open(
+                DNS_SNIFF_FILTER,
+                Layer::Network,
+                0,
+                FLAG_SNIFF | FLAG_RECV_ONLY,
+            )?;
+            Ok((Arc::new(sock), Arc::new(net), Arc::new(sniff)))
         })
         .await??;
 
         let cancel = CancellationToken::new();
-        let udp = UdpRelay::new(
+        let sink = Arc::new(NetworkSink(net.clone()));
+        let udp = UdpRelay::new(self.relay().clone(), sink.clone(), cancel.clone());
+        let dns = DnsProxy::new(
             self.relay().clone(),
-            Arc::new(NetworkSink(net.clone())),
+            sink,
             cancel.clone(),
+            DnsProxyConfig::default(),
         );
         let mut threads = Vec::new();
         let spawn = |name: String, f: Box<dyn FnOnce() + Send>| {
@@ -214,20 +233,36 @@ impl Inner {
         )
         .map(|t| threads.push(t));
         for i in 0..NETWORK_THREADS {
-            let (h, sh, s, u) = (net.clone(), self.shared.clone(), state.clone(), udp.clone());
+            let (h, sh, s, u, d) = (
+                net.clone(),
+                self.shared.clone(),
+                state.clone(),
+                udp.clone(),
+                dns.clone(),
+            );
             spawned = spawned.and_then(|()| {
                 spawn(
                     format!("q2r-net-{i}"),
-                    Box::new(move || network_loop(h, sh, s, u)),
+                    Box::new(move || network_loop(h, sh, s, u, d)),
                 )
                 .map(|t| threads.push(t))
             });
         }
+        let (h, m, s) = (sniff.clone(), self.relay().domains.clone(), state.clone());
+        spawned = spawned.and_then(|()| {
+            spawn(
+                "q2r-dns-sniff".into(),
+                Box::new(move || dns_sniff_loop(h, m, s)),
+            )
+            .map(|t| threads.push(t))
+        });
         if let Err(e) = spawned {
             // Unwind: the threads already running exit once the handles shut down.
             state.stopping.store(true, Ordering::SeqCst);
             cancel.cancel();
             udp.wait().await;
+            dns.wait().await;
+            sniff.shutdown();
             net.shutdown();
             sock.shutdown();
             return Err(e.into());
@@ -252,6 +287,8 @@ impl Inner {
             threads,
             relay,
             udp,
+            dns,
+            sniff,
         });
         self.running.store(true, Ordering::SeqCst);
         tracing::info!("routing started (relay port {relay_port})");
@@ -263,7 +300,7 @@ impl Inner {
         let Some(r) = run.take() else { return Ok(()) };
         // 1. Close every proxied connection (the relay's FIN/RST is still
         //    restored to the apps while capture is up) and every UDP
-        //    session (control connections closed).
+        //    session and DNS association (control connections closed).
         r.cancel.cancel();
         match r.relay.await {
             Ok(Err(e)) => tracing::warn!("relay ended with error: {e}"),
@@ -271,9 +308,11 @@ impl Inner {
             Ok(Ok(())) => {}
         }
         r.udp.wait().await;
+        r.dns.wait().await;
         tokio::time::sleep(STOP_DRAIN).await;
         // 2. Close capture: from here on everything is direct.
         r.state.stopping.store(true, Ordering::SeqCst);
+        r.sniff.shutdown();
         r.net.shutdown();
         r.sock.shutdown();
         let threads = r.threads;
@@ -283,7 +322,7 @@ impl Inner {
             }
         });
         let _ = joined.await;
-        drop((r.net, r.sock));
+        drop((r.sniff, r.net, r.sock));
         *mutex(&self.current) = None;
         let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
         self.running.store(false, Ordering::SeqCst);
@@ -346,6 +385,7 @@ impl Inner {
             proxy_up: mutex(&self.proxy_up).clone(),
             total_up_bps,
             total_down_bps,
+            proxy_servers: Vec::clone(&self.relay().proxy_servers.load()),
         }
     }
 
@@ -433,6 +473,18 @@ impl Inner {
                 let _ = self.relay().events.send(ev);
                 Response::ProxyTest(res)
             }
+            Request::SetDns(d) => {
+                let r = self.apply(|c| c.set_dns(d)).await;
+                if matches!(r, Response::Ok) {
+                    // Cached answers came from the old resolver setup.
+                    let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
+                }
+                r
+            }
+            Request::FlushDns => {
+                let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
+                Response::Ok
+            }
             // The pipe server answers Subscribe itself (via `subscribe`).
             Request::Subscribe => Response::Ok,
         }
@@ -462,7 +514,12 @@ impl Inner {
                         mutex(&inner.proxy_up).insert(id, false);
                     }
                     Event::ProxyUp { id } => {
-                        mutex(&inner.proxy_up).insert(id, true);
+                        let was = mutex(&inner.proxy_up).insert(id, true);
+                        // Lookups failed while the proxy was down are cached
+                        // as failures: flush on the way back up.
+                        if was != Some(true) {
+                            tokio::task::spawn_blocking(winapi::flush_dns_cache);
+                        }
                     }
                     Event::Snapshot(_) => {}
                 }
@@ -528,6 +585,9 @@ async fn refresh_processes(relay: &RelayCtx) {
 
 /// Resolves every proxy's `host:port` (always Direct) and finds the pid
 /// listening on it (excluded: always Direct), plus the service itself.
+/// Then refreshes the proxy server names from those listeners' configs
+/// ([`crate::proxy_servers`]; files are re-read only when changed; the last
+/// list is kept while no config is found).
 async fn refresh_exclusions(shared: &Shared) {
     let proxies: Vec<(String, u16)> = shared
         .relay
@@ -556,8 +616,38 @@ async fn refresh_exclusions(shared: &Shared) {
     })
     .await
     .unwrap_or_else(|_| HashSet::from([own]));
+    let exes: Vec<PathBuf> = {
+        let tree = shared.relay.tree.read().unwrap_or_else(|e| e.into_inner());
+        excluded
+            .iter()
+            .filter(|&&pid| pid != own)
+            .filter_map(|&pid| tree.get(pid).map(|p| p.exe.clone()))
+            .collect()
+    };
     shared.relay.excluded.store(Arc::new(excluded));
     shared.proxy_endpoints.store(Arc::new(endpoints));
+    let cache = shared.server_cache.clone();
+    let servers = tokio::task::spawn_blocking(move || {
+        mutex(&cache).refresh(&proxy_servers::find_configs(&exes))
+    })
+    .await;
+    // `None`: no proxy client config right now (e.g. it is restarting):
+    // keep the last list, so its servers still resolve directly.
+    if let Ok(Some(servers)) = servers {
+        if *shared.relay.proxy_servers.load_full() != servers {
+            let names = if servers.is_empty() {
+                "none".to_string()
+            } else {
+                servers.join(", ")
+            };
+            tracing::info!("proxy servers resolved directly: {names}");
+            shared.relay.proxy_servers.store(Arc::new(servers));
+            // A lookup of a new server name made before it was detected
+            // went through the (not yet connected) proxy and may have been
+            // cached as a failure: start over.
+            let _ = tokio::task::spawn_blocking(winapi::flush_dns_cache).await;
+        }
+    }
 }
 
 /// Per-run upkeep: process tree (1 s), exclusions (5 s), NAT and flow-cache

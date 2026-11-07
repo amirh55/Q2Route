@@ -102,6 +102,22 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | U5 | Use a Direct game (e.g. in "Games"). | Unaffected: still direct, ping unchanged. | |
 | U6 | Re-run L4 (browserleaks WebRTC). | The srflx candidate shows the v2ray exit IP, never the real IP. | |
 
+## M4: DNS through the proxy
+
+Install this update with `dist\Q2Route-update\Update.cmd`.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| D1 | Browser: `https://www.dnsleaktest.com` (extended test). | Only resolvers of the proxy's network (e.g. Cloudflare), no ISP resolver. (Replaces the M1 L6 gap.) | |
+| D2 | `nslookup example.com` (Windows' resolver). | It resolves; the log (enable debug) or the Connections page shows the query routed via the proxy (check the TCP row if a TC fallback happened). | |
+| D3 | `nslookup digikala.ir`. | It resolves through the normal (ISP) resolver; `.ir` sites still load with v2ray stopped. | |
+| D4 | Stop v2ray, then `nslookup example.com`. | It fails (no fallback to the ISP). | |
+| D5 | Chrome with Secure DNS on: browse proxied sites and a Direct `.ir` site. | Proxied browsing still works (DoH is blocked, Chrome falls back to system DNS); the Direct `.ir` site is unaffected. | |
+| D6 | DNS page: change the proxy resolver to `9.9.9.9:53`, Save, then repeat D1. | dnsleaktest shows Quad9. | |
+| D7 | With v2rayN using a server *hostname*, restart v2ray while Q2Route runs (and `ipconfig /flushdns`). | v2ray reconnects; the log shows `proxy servers resolved directly: <your server>`; the DNS page lists it as detected. | |
+| D8 | Switch v2rayN to a server with a different hostname. | It connects within ~15 s; the log shows the new name in `proxy servers resolved directly`. | |
+| D9 | Update a v2rayN subscription while the current server is unreachable; if it fails, add the subscription host to "Names always resolved directly" and retry. | The subscription updates. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
@@ -111,7 +127,7 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | L3 | Browser: `https://browserleaks.com/ip` | Only the v2ray exit IP; no real IPv4/IPv6. | pass |
 | L4 | Browser: `https://browserleaks.com/webrtc` | No real public IP in the WebRTC candidates (local/LAN addresses are fine). | pass |
 | L5 | Browser: `https://cloudflare-quic.com` | Page reports HTTP/2 (`h2`), not HTTP/3 (`h3`): proxied UDP/QUIC is blocked. | pass (h2) |
-| L6 | Browser: `https://www.dnsleaktest.com` (extended test) | Shows the ISP resolver: **known M1 gap** (Ruling R3, DNS is always direct until the M2 DNS relay). Record what it shows. | German and Belgian resolvers, no Iranian ISP resolver (Chrome secure DNS goes through the proxy). Other apps still use the ISP resolver directly (R3). |
+| L6 | Browser: `https://www.dnsleaktest.com` (extended test) | Shows the ISP resolver: **known M1 gap**, closed by M4 (see D1). Record what it shows. | German and Belgian resolvers, no Iranian ISP resolver (Chrome secure DNS goes through the proxy). Other apps still use the ISP resolver directly (R3). |
 
 ```powershell
 curl.exe -6 https://ifconfig.co
