@@ -408,7 +408,12 @@ fn route_packet(
     // Without an IPv6 relay listener a non-Direct IPv6 one is dropped
     // (classify): fail closed, never passed to the original server.
     let tcp_dns = tcp && f.remote.port() == 53;
-    let relay_v6 = run.relay_v6;
+    // With "Proxy IPv6 traffic" off, a non-Direct IPv6 SYN (other than
+    // TCP/53, which the relay answers by name over IPv4) is dropped at once,
+    // so the app falls back to IPv4 (Happy Eyeballs) instead of connecting
+    // to the relay and being closed. Relay replies above stay on `run.relay_v6`.
+    let relay_v6 = run.relay_v6
+        && (fam == Family::V4 || tcp_dns || shared.relay.rules.load().proxy_ipv6);
     let action = classify(
         &m,
         own_port,
@@ -444,7 +449,7 @@ fn route_packet(
         }
         Action::NewRedirect { pid } => {
             // IPv6 only when the relay listens on IPv6 (classify ensures it).
-            if fam == Family::V6 && !run.relay_v6 {
+            if fam == Family::V6 && !relay_v6 {
                 return Out::Drop;
             }
             let dst = f.remote;
@@ -1622,6 +1627,60 @@ mod tests {
             Out::Send
         );
         assert_eq!(h.cached(PROTO_TCP, l, d), Some(Cached::Direct));
+        h.cancel.cancel();
+    }
+
+    /// Turns "Proxy IPv6 traffic" off in the harness's live rules.
+    fn proxy_ipv6_off(h: &Harness) {
+        let mut cfg = (**h.shared.relay.cfg.load()).clone();
+        cfg.settings.proxy_ipv6 = false;
+        h.shared
+            .relay
+            .rules
+            .store(Arc::new(q2route_core::ruleset::RuleSet::compile(&cfg).unwrap()));
+    }
+
+    /// "Proxy IPv6 traffic" off: a proxied IPv6 SYN whose name is unknown
+    /// (NeedDomain) is dropped at the SYN, never accepted by the IPv6 relay,
+    /// so the app falls back to IPv4. IPv4 is still redirected.
+    #[tokio::test]
+    async fn ipv6_need_domain_syn_dropped_when_proxy_ipv6_off() {
+        let h = harness();
+        proxy_ipv6_off(&h);
+        let (l6, d6) = ("[2001:db8::2]:47001", "[2606:4700::1]:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, d6, tcp_syn(l6, d6)),
+            Out::Drop
+        );
+        assert!(h.run.nat.get(Family::V6, 47001).is_none(), "not redirected");
+        let (l4, d4) = ("10.0.0.2:47002", "1.1.1.1:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l4, d4, tcp_syn(l4, d4)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V4, 47002).is_some(), "v4 redirected");
+        h.cancel.cancel();
+    }
+
+    /// The same IPv6 TCP/443 SYN with no known name is redirected while the
+    /// setting is on (the default), and IPv6 TCP/53 still goes to the relay
+    /// when it is off (answered by name).
+    #[tokio::test]
+    async fn ipv6_syn_redirect_follows_proxy_ipv6() {
+        let h = harness();
+        let (l6, d6) = ("[2001:db8::2]:47003", "[2606:4700::1]:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, d6, tcp_syn(l6, d6)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V6, 47003).is_some(), "on: redirected");
+        proxy_ipv6_off(&h);
+        let (l, d) = ("[2001:db8::2]:47004", "[2606:4700::1111]:53");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l, d, tcp_syn(l, d)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V6, 47004).is_some(), "TCP/53 relayed");
         h.cancel.cancel();
     }
 
