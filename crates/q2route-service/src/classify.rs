@@ -206,18 +206,21 @@ impl FlowCache {
 /// * `own_pid`: the service's pid; its flows are always Direct (Ruling R13).
 /// * `nat_has`: a NAT entry exists for this flow (same local port and
 ///   destination).
+/// * `relay_v6`: the relay has an IPv6 listener. Without one, a non-Direct
+///   IPv6 TCP SYN is dropped (never redirected, never passed).
 /// * `decide`: looks up the owning pid and decides the flow; only called
 ///   when the cache cannot answer.
 ///
 /// Invariant: `Pass` is only returned for a flow whose (cached or fresh)
 /// decision is Direct, or for the service's own sockets. A proxied UDP flow
-/// is never passed: it is `UdpProxy` (IPv4 only) or `Drop`.
+/// is never passed: it is `UdpProxy` (IPv4 or IPv6) or `Drop`.
 pub fn classify(
     m: &PktMeta,
     own_port: bool,
     own_pid: u32,
     cache: &FlowCache,
     nat_has: bool,
+    relay_v6: bool,
     decide: impl FnOnce() -> (u32, Decision),
 ) -> Action {
     if own_port {
@@ -235,10 +238,9 @@ pub fn classify(
         } else {
             match d {
                 Decision::Final(Route::Direct, _) => Cached::Direct,
-                // Only IPv4 UDP is relayed; proxied TCP is `Other` here.
-                Decision::Final(Route::Proxy(p), info)
-                    if id.proto == PROTO_UDP && id.remote.is_ipv4() =>
-                {
+                // Proxied UDP (either family) is relayed; proxied TCP is
+                // `Other` here.
+                Decision::Final(Route::Proxy(p), info) if id.proto == PROTO_UDP => {
                     Cached::UdpProxy(p, info.group_id, pid)
                 }
                 _ => Cached::Other,
@@ -256,10 +258,10 @@ pub fn classify(
             let (pid, cached) = decide_now(&mut call);
             if cached == Cached::Direct {
                 Action::Pass
-            } else if id.remote.is_ipv4() {
+            } else if id.remote.is_ipv4() || relay_v6 {
                 Action::NewRedirect { pid }
             } else {
-                // No IPv6 relay in M1: never let a non-Direct IPv6 flow out.
+                // No IPv6 relay listener: never let a non-Direct IPv6 flow out.
                 Action::Drop
             }
         }
@@ -295,13 +297,11 @@ pub fn classify(
             };
             match cached {
                 Cached::Direct => Action::Pass,
-                Cached::UdpProxy(profile, group_id, pid) if id.remote.is_ipv4() => {
-                    Action::UdpProxy {
-                        pid,
-                        profile,
-                        group_id,
-                    }
-                }
+                Cached::UdpProxy(profile, group_id, pid) => Action::UdpProxy {
+                    pid,
+                    profile,
+                    group_id,
+                },
                 _ => Action::Drop,
             }
         }
@@ -501,7 +501,7 @@ mod tests {
         d: Decision,
         calls: &Cell<u32>,
     ) -> Action {
-        classify(m, false, OWN_PID, cache, nat_has, || {
+        classify(m, false, OWN_PID, cache, nat_has, false, || {
             calls.set(calls.get() + 1);
             (pid, d)
         })
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn own_port_passes_without_deciding() {
         let (c, n) = (FlowCache::default(), Cell::new(0));
-        let a = classify(&tcp(true), true, OWN_PID, &c, false, || {
+        let a = classify(&tcp(true), true, OWN_PID, &c, false, false, || {
             n.set(1);
             (APP_PID, proxy())
         });
@@ -673,7 +673,8 @@ mod tests {
         let (c, n) = (FlowCache::default(), Cell::new(0));
         let syn = meta(PROTO_TCP, "[2001:db8::5]:50000", "[2001:db8::1]:443", true);
         let ack = PktMeta { syn: false, ..syn };
-        // decide() maps proxied IPv6 to Block; even a Proxy answer must not pass.
+        // Without an IPv6 relay listener (`relay_v6` false, as in `run`),
+        // a non-Direct IPv6 flow must never pass.
         assert_eq!(run(&syn, &c, false, APP_PID, proxy(), &n), Action::Drop);
         assert_eq!(run(&ack, &c, false, APP_PID, direct(), &n), Action::Reset);
         assert_eq!(run(&syn, &c, false, APP_PID, block(), &n), Action::Drop);
@@ -684,6 +685,62 @@ mod tests {
         );
         assert_eq!(run(&syn, &c, false, APP_PID, direct(), &n), Action::Pass);
         assert_eq!(run(&ack, &c, false, APP_PID, proxy(), &n), Action::Pass);
+    }
+
+    #[test]
+    fn ipv6_tcp_syn_redirects_when_relay_v6() {
+        let c = FlowCache::default();
+        let syn = meta(PROTO_TCP, "[2001:db8::5]:50000", "[2606:4700::1]:443", true);
+        let ack = PktMeta { syn: false, ..syn };
+        let v6 = |m: &PktMeta, nat_has: bool, d: Decision| {
+            classify(m, false, OWN_PID, &c, nat_has, true, || (APP_PID, d))
+        };
+        assert_eq!(
+            v6(&syn, false, proxy()),
+            Action::NewRedirect { pid: APP_PID }
+        );
+        assert_eq!(v6(&ack, true, direct()), Action::Redirect);
+        // Non-SYN rules are unchanged: no NAT entry -> never sent.
+        assert_eq!(v6(&ack, false, direct()), Action::Reset);
+        assert_eq!(
+            v6(&syn, false, Decision::NeedDomain),
+            Action::NewRedirect { pid: APP_PID }
+        );
+        assert_eq!(
+            v6(&syn, false, block()),
+            Action::NewRedirect { pid: APP_PID }
+        );
+        let c = FlowCache::default();
+        assert_eq!(
+            classify(&syn, false, OWN_PID, &c, false, true, || (
+                APP_PID,
+                direct()
+            )),
+            Action::Pass
+        );
+    }
+
+    #[test]
+    fn ipv6_tcp_syn_dropped_without_relay_v6() {
+        let c = FlowCache::default();
+        let syn = meta(PROTO_TCP, "[2001:db8::5]:50000", "[2606:4700::1]:443", true);
+        let ack = PktMeta { syn: false, ..syn };
+        let no_v6 = |m: &PktMeta, d: Decision| {
+            classify(m, false, OWN_PID, &c, false, false, || (APP_PID, d))
+        };
+        for d in [proxy(), block(), Decision::NeedDomain] {
+            assert_eq!(no_v6(&syn, d), Action::Drop);
+        }
+        assert_eq!(no_v6(&ack, direct()), Action::Reset);
+        // IPv4 is unaffected by relay_v6.
+        let c4 = FlowCache::default();
+        assert_eq!(
+            classify(&tcp(true), false, OWN_PID, &c4, false, false, || (
+                APP_PID,
+                proxy()
+            )),
+            Action::NewRedirect { pid: APP_PID }
+        );
     }
 
     #[test]
@@ -745,11 +802,21 @@ mod tests {
     }
 
     #[test]
-    fn udp_ipv6_proxy_never_udp_proxy() {
+    fn ipv6_udp_proxy_returns_udp_proxy() {
         let (c, n) = (FlowCache::default(), Cell::new(0));
         let u6 = meta(PROTO_UDP, "[2001:db8::5]:5000", "[2001:db8::1]:3478", false);
-        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
-        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), Action::Drop);
+        let want = Action::UdpProxy {
+            pid: APP_PID,
+            profile: "v2ray".into(),
+            group_id: Some("g".into()),
+        };
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), want);
+        // A cache hit returns the same action.
+        assert_eq!(run(&u6, &c, false, APP_PID, proxy(), &n), want);
+        assert_eq!(n.get(), 1, "second packet from cache");
+        // Blocked IPv6 UDP is still dropped.
+        let (c, n) = (FlowCache::default(), Cell::new(0));
+        assert_eq!(run(&u6, &c, false, APP_PID, block(), &n), Action::Drop);
     }
 
     #[test]
@@ -828,7 +895,7 @@ mod tests {
         let u = meta(PROTO_UDP, "10.0.0.2:5000", "8.8.4.4:443", false);
         // A packet thread is mid-decision (old rules: Direct) while the
         // rules are swapped and the cache is invalidated.
-        let a = classify(&u, false, OWN_PID, &c, false, || {
+        let a = classify(&u, false, OWN_PID, &c, false, false, || {
             c.on_rules_changed();
             (APP_PID, direct())
         });

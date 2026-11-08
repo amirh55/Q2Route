@@ -355,7 +355,11 @@ async fn socks4(s: &mut Seen<'_>, t: &Target) -> Result<(), ProxyError> {
 
 async fn http(s: &mut Seen<'_>, p: &ProxyProfile, t: &Target) -> Result<(), ProxyError> {
     let hp = match t {
-        Target::Ip(a) => a.to_string(), // IPv6 is bracketed already
+        // IPv6 bracketed (`[addr]:port`), without any scope id.
+        Target::Ip(a) => match a {
+            SocketAddr::V4(a) => a.to_string(),
+            SocketAddr::V6(a) => format!("[{}]:{}", a.ip(), a.port()),
+        },
         Target::Domain(d, port) => {
             if d.is_empty() || d.bytes().any(|b| b <= b' ') {
                 return Err(ProxyError::Protocol("invalid domain".into()));

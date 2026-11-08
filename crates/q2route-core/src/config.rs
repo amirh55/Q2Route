@@ -198,6 +198,11 @@ pub struct Settings {
     pub last_running: bool,
     #[serde(default)]
     pub dns: DnsSettings,
+    /// Proxy IPv6 traffic of proxied apps. Off: their IPv6 is blocked (not
+    /// proxied, never direct), so apps fall back to IPv4 (for a proxy whose
+    /// server has no IPv6).
+    #[serde(default = "yes")]
+    pub proxy_ipv6: bool,
 }
 
 impl Default for Settings {
@@ -209,6 +214,7 @@ impl Default for Settings {
             peek_timeout_ms: 300,
             last_running: true,
             dns: DnsSettings::default(),
+            proxy_ipv6: true,
         }
     }
 }

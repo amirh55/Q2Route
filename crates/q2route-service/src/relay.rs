@@ -8,11 +8,16 @@
 //! closed; there is no direct fallback. `Event::ProxyDown` is emitted only
 //! when the proxy itself is unreachable or silent, and `Event::ProxyUp` on
 //! the first successful connect after that.
+//!
+//! **IPv6 exposure:** IPv6 has no NAT in front of the machine, and the
+//! firewall rule for the service is program-scoped, so the IPv6 relay port
+//! can be reached from the internet. A connection with no NAT entry (no
+//! original destination) is closed immediately, so nothing is exposed.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -40,7 +45,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::conns::{ConnBytes, ConnLog, NewConn};
 use crate::dns_proxy::bootstrap_direct;
-use crate::nat::OriginalDst;
+use crate::nat::{Family, OriginalDst};
 use crate::stats::Stats;
 
 /// Maximum client bytes buffered while looking for a domain.
@@ -93,8 +98,10 @@ pub struct RelayCtx {
     pub excluded: ArcSwap<HashSet<u32>>,
     pub stats: Arc<Stats>,
     pub conns: Arc<ConnLog>,
-    /// Local ports of the relay's direct upstream sockets; capture skips them.
-    pub own_ports: Arc<DashSet<u16>>,
+    /// (family, local port) of the relay's direct upstream sockets; capture
+    /// skips them. Keyed by family: an IPv4 and an IPv6 socket may share a
+    /// port number.
+    pub own_ports: Arc<DashSet<(Family, u16)>>,
     pub events: broadcast::Sender<Event>,
     /// A relayed connection with no bytes in either direction for this long
     /// is closed ([`RELAY_IDLE_TIMEOUT`] in production).
@@ -108,7 +115,14 @@ pub struct RelayCtx {
     /// Server names detected from the running proxy client's config
     /// (refreshed by the engine): their DNS queries are resolved directly.
     pub proxy_servers: ArcSwap<Vec<String>>,
+    /// Test hook: maps an original destination to the address a direct
+    /// connect actually dials (mock servers on 127.0.0.1). `None` in
+    /// production.
+    pub direct_dial_override: Option<DialOverride>,
 }
+
+/// See [`RelayCtx::direct_dial_override`].
+pub type DialOverride = Arc<dyn Fn(SocketAddr) -> SocketAddr + Send + Sync>;
 
 /// Production idle timeout of a relayed connection.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -127,15 +141,113 @@ fn set_keepalive(s: &TcpStream) {
     }
 }
 
-/// Accepts until `cancel` fires, then closes every in-flight connection and
-/// returns once they are all gone.
+/// Times the relay tries to bind its IPv4 + IPv6 listener pair on one port.
+pub const RELAY_BIND_ATTEMPTS: usize = 10;
+
+/// The relay's listeners: IPv4, plus IPv6 on the same port when available.
+pub struct RelayListeners {
+    pub v4: TcpListener,
+    pub v6: Option<TcpListener>,
+}
+
+impl RelayListeners {
+    pub fn port(&self) -> u16 {
+        self.v4.local_addr().map_or(0, |a| a.port())
+    }
+
+    pub fn into_vec(self) -> Vec<TcpListener> {
+        std::iter::once(self.v4).chain(self.v6).collect()
+    }
+}
+
+/// Binds the relay listeners: IPv4 on `v4:0`, then IPv6 on `[v6]:<same
+/// port>` with `IPV6_V6ONLY`. Must run inside a tokio runtime.
+pub fn bind_relay(v4: Ipv4Addr, v6: Ipv6Addr) -> io::Result<RelayListeners> {
+    bind_relay_with(v4, |port| bind_v6_only(SocketAddrV6::new(v6, port, 0, 0)))
+}
+
+/// [`bind_relay`] with the IPv6 bind supplied by the caller (tests inject
+/// failures). The pair is retried up to [`RELAY_BIND_ATTEMPTS`] times (the
+/// IPv6 port may be taken); if IPv6 never binds, the relay runs IPv4 only
+/// (and proxied IPv6 TCP stays blocked). An IPv4 bind error is returned.
+pub fn bind_relay_with(
+    v4: Ipv4Addr,
+    mut bind_v6: impl FnMut(u16) -> io::Result<TcpListener>,
+) -> io::Result<RelayListeners> {
+    let mut last = None;
+    for _ in 0..RELAY_BIND_ATTEMPTS {
+        let l4 = bind_v4(SocketAddrV4::new(v4, 0))?;
+        let port = l4.local_addr()?.port();
+        match bind_v6(port) {
+            Ok(l6) => {
+                return Ok(RelayListeners {
+                    v4: l4,
+                    v6: Some(l6),
+                })
+            }
+            Err(e) => {
+                tracing::debug!("relay IPv6 bind on port {port} failed: {e}");
+                last = Some(l4);
+            }
+        }
+    }
+    let v4 = last.expect("RELAY_BIND_ATTEMPTS > 0");
+    Ok(RelayListeners { v4, v6: None })
+}
+
+/// An IPv4 listener on `addr` (backlog 1024, as tokio's `bind`).
+fn bind_v4(addr: SocketAddrV4) -> io::Result<TcpListener> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    s.bind(&SocketAddr::V4(addr).into())?;
+    s.listen(1024)?;
+    s.set_nonblocking(true)?;
+    TcpListener::from_std(s.into())
+}
+
+/// An IPv6-only (`IPV6_V6ONLY`) listener on `addr`.
+fn bind_v6_only(addr: SocketAddrV6) -> io::Result<TcpListener> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    s.set_only_v6(true)?;
+    s.bind(&SocketAddr::V6(addr).into())?;
+    s.listen(1024)?;
+    s.set_nonblocking(true)?;
+    TcpListener::from_std(s.into())
+}
+
+/// Accepts on every listener until `cancel` fires, then closes every
+/// in-flight connection and returns once they are all gone.
 pub async fn run_relay(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     lookup: Arc<dyn OrigDstLookup>,
     ctx: Arc<RelayCtx>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let tracker = TaskTracker::new();
+    for l in listeners {
+        let (lookup, ctx, cancel) = (lookup.clone(), ctx.clone(), cancel.clone());
+        tracker.spawn(accept_loop(l, lookup, ctx, cancel, tracker.clone()));
+    }
+    tracker.close();
+    tracker.wait().await;
+    Ok(())
+}
+
+/// One listener's accept loop; each connection runs on `tracker`.
+async fn accept_loop(
+    listener: TcpListener,
+    lookup: Arc<dyn OrigDstLookup>,
+    ctx: Arc<RelayCtx>,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
+) {
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -159,9 +271,6 @@ pub async fn run_relay(
             }
         }
     }
-    tracker.close();
-    tracker.wait().await;
-    Ok(())
 }
 
 /// `::ffff:a.b.c.d` (dual-stack listener) becomes `a.b.c.d`.
@@ -181,7 +290,7 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
     let f = FlowInfo {
         proto: Protocol::Tcp,
         pid: orig.pid,
-        dst: SocketAddr::V4(orig.dst),
+        dst: orig.dst,
         domain,
     };
     let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
@@ -193,15 +302,13 @@ fn decide_flow(ctx: &RelayCtx, orig: &OriginalDst, domain: Option<&str>) -> Deci
 /// (Proxy > Block > Direct). No names: a domain-less flow (`Some("")`), as
 /// before the DNS map existed.
 fn decide_after_empty_peek(ctx: &RelayCtx, orig: &OriginalDst) -> Decision {
-    let names = ctx
-        .domains
-        .names(IpAddr::V4(*orig.dst.ip()), std::time::Instant::now());
+    let names = ctx.domains.names(orig.dst.ip(), std::time::Instant::now());
     let rules = ctx.rules.load();
     let excluded = ctx.excluded.load();
     let f = FlowInfo {
         proto: Protocol::Tcp,
         pid: orig.pid,
-        dst: SocketAddr::V4(orig.dst),
+        dst: orig.dst,
         domain: None,
     };
     let tree = ctx.tree.read().unwrap_or_else(|e| e.into_inner());
@@ -298,7 +405,7 @@ async fn relay_flow(
                 pid: orig.pid,
                 exe: exe.clone(),
                 local: peer,
-                dst: SocketAddr::V4(orig.dst),
+                dst: orig.dst,
                 domain: (!domain.is_empty()).then(|| domain.clone()),
                 route: route.clone(),
                 group_id: info.group_id.clone(),
@@ -325,11 +432,7 @@ async fn relay_flow(
     match route {
         Route::Block => log("blocked"),
         Route::Proxy(id) => {
-            let target = if domain.is_empty() {
-                Target::Ip(SocketAddr::V4(orig.dst))
-            } else {
-                Target::Domain(domain, orig.dst.port())
-            };
+            let target = proxy_target(ctx, orig.dst, domain);
             match connect_proxy(ctx, &id, &target).await {
                 Ok(up) => {
                     log(&format!("proxied via '{id}'"));
@@ -347,6 +450,23 @@ async fn relay_flow(
             Err(e) => log(&format!("direct connect failed: {e}")),
         },
     }
+}
+
+/// What a proxied flow asks the proxy for: the peeked `domain` when there
+/// is one. An IPv6 destination without one goes by the most recent name DNS
+/// answered for it, so a proxy whose exit has no IPv6 can still reach the
+/// site over IPv4; otherwise (and always for IPv4) the original address.
+fn proxy_target(ctx: &RelayCtx, dst: SocketAddr, domain: String) -> Target {
+    if !domain.is_empty() {
+        return Target::Domain(domain, dst.port());
+    }
+    if dst.is_ipv6() {
+        let names = ctx.domains.names(dst.ip(), std::time::Instant::now());
+        if let Some(name) = names.into_iter().next() {
+            return Target::Domain(name, dst.port());
+        }
+    }
+    Target::Ip(dst)
 }
 
 /// Connects to `target` through profile `id`. Emits `Event::ProxyDown` when
@@ -384,20 +504,32 @@ async fn connect_proxy(
     }
 }
 
-/// Connects directly to `dst` from a port registered in `own_ports` (so
-/// capture skips it) for as long as the returned guard lives.
-async fn connect_direct(ctx: &RelayCtx, dst: SocketAddrV4) -> io::Result<(TcpStream, OwnPort<'_>)> {
-    let sock = TcpSocket::new_v4()?;
+/// Connects directly to `dst` (IPv4 or IPv6) from a `(family, port)`
+/// registered in `own_ports` (so capture skips it) for as long as the
+/// returned guard lives. Only ever called for a Direct route: the relay
+/// never connects to a destination directly otherwise.
+async fn connect_direct(ctx: &RelayCtx, dst: SocketAddr) -> io::Result<(TcpStream, OwnPort<'_>)> {
+    let dst = ctx.direct_dial_override.as_ref().map_or(dst, |f| f(dst));
+    let (sock, any) = match dst {
+        SocketAddr::V4(_) => (
+            TcpSocket::new_v4()?,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        ),
+        SocketAddr::V6(_) => (
+            TcpSocket::new_v6()?,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        ),
+    };
     // Bind first so the local port is known (and skipped by capture) before
     // the SYN leaves.
-    sock.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    let port = sock.local_addr()?.port();
-    ctx.own_ports.insert(port);
+    sock.bind(any)?;
+    let key = (Family::of(&dst), sock.local_addr()?.port());
+    ctx.own_ports.insert(key);
     let own = OwnPort {
         ports: &ctx.own_ports,
-        port,
+        key,
     };
-    let up = sock.connect(SocketAddr::V4(dst)).await?;
+    let up = sock.connect(dst).await?;
     Ok((up, own))
 }
 
@@ -549,9 +681,10 @@ fn learn_answers(domains: &DomainMap, asked: &Asked, msg: &[u8]) {
     }
 }
 
-/// IPv4 TCP/53: routed by the first query's name only. Direct goes to the
-/// original server from an own port, Proxy to `proxy_resolver` through the
-/// profile (fail closed: any failure closes the client), Block closes.
+/// TCP/53 (either family): routed by the first query's name only. Direct
+/// goes to the original server from an own port, Proxy to `proxy_resolver`
+/// through the profile (fail closed: any failure closes the client), Block
+/// closes.
 /// Later queries on the connection must decide the same route, else the
 /// connection is closed before that query is sent anywhere. A connection
 /// that is not DNS at all (a VPN on port 53) carries no name: it is relayed
@@ -592,7 +725,7 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
                 pid: orig.pid,
                 exe: exe.clone(),
                 local: peer,
-                dst: SocketAddr::V4(orig.dst),
+                dst: orig.dst,
                 domain: Some(name.clone()),
                 route: route.clone(),
                 group_id: info.group_id.clone(),
@@ -636,8 +769,9 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
 
 /// [`pump`] for DNS over TCP: relays whole length-prefixed messages. Each
 /// client query is parsed and its name checked with `same_route` (decides
-/// the first query's route) before it is sent (a query that does not parse or decides differently ends the
-/// connection); each answer feeds `ctx.domains` on its way back.
+/// the first query's route) before it is sent (a query that does not parse
+/// or decides differently ends the connection); each answer feeds
+/// `ctx.domains` on its way back.
 async fn dns_pump(
     client: TcpStream,
     upstream: TcpStream,
@@ -718,15 +852,16 @@ pub(crate) fn exe_name(tree: &ProcessTree, pid: u32) -> String {
         .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned())
 }
 
-/// Removes a port from `own_ports` when the direct upstream is gone.
+/// Removes a `(family, port)` from `own_ports` when the direct upstream is
+/// gone.
 struct OwnPort<'a> {
-    ports: &'a DashSet<u16>,
-    port: u16,
+    ports: &'a DashSet<(Family, u16)>,
+    key: (Family, u16),
 }
 
 impl Drop for OwnPort<'_> {
     fn drop(&mut self) {
-        self.ports.remove(&self.port);
+        self.ports.remove(&self.key);
     }
 }
 

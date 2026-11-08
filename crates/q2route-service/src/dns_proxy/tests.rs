@@ -215,11 +215,10 @@ async fn ipv6_query_answered_with_ipv6_packet() {
     assert_eq!(answers(&payload).1.len(), 1);
 }
 
-/// A TC answer from the resolver reaches an IPv4 app as is (it retries
-/// over TCP, routed by name), but an IPv6 app gets REFUSED: its TCP retry
-/// would go direct (M4 gap).
+/// A TC answer from the resolver reaches IPv4 and IPv6 apps as is: both
+/// retry over TCP, which is routed by name (IPv6 TCP/53 too since M6).
 #[tokio::test]
-async fn tc_answer_refused_to_ipv6_apps() {
+async fn ipv6_resolver_tc_passed_through() {
     let m = mock(MockOpts::default()).await;
     let r = resolver(Mode::Truncated).await;
     let mut s = setup(
@@ -235,13 +234,13 @@ async fn tc_answer_refused_to_ipv6_apps() {
     assert_eq!(src, "[2001:db8::53]:53".parse().unwrap());
     assert_eq!(dst, "[2001:db8::5]:50000".parse().unwrap());
     assert_eq!(id_of(&p), 0x0606);
-    assert!(!tc(&p), "no TC to an IPv6 app");
-    assert_eq!(rcode(&p), 5, "IPv6 gets REFUSED");
+    assert!(tc(&p), "IPv6 gets the TC answer");
+    assert_eq!(rcode(&p), 0);
     quiet(&mut s.injected).await;
 }
 
 #[tokio::test]
-async fn udp_unavailable_answers_tc_ipv4_refused_ipv6() {
+async fn ipv6_unavailable_answers_tc() {
     let r = resolver(Mode::Answer).await;
     // HTTP profile: no UDP at all.
     let http = mock(MockOpts::default()).await;
@@ -271,8 +270,8 @@ async fn udp_unavailable_answers_tc_ipv4_refused_ipv6() {
         s.dns.submit(q6(8, "example.com"));
         let (_, _, p) = parse_inbound6(&recv(&mut s.injected).await);
         assert_eq!(id_of(&p), 8);
-        assert!(!tc(&p));
-        assert_eq!(rcode(&p), 5, "{kind:?}: IPv6 gets REFUSED");
+        assert!(tc(&p), "{kind:?}: IPv6 gets TC");
+        assert_eq!(rcode(&p), 0);
     }
     assert_eq!(
         http.attempts.load(std::sync::atomic::Ordering::SeqCst),

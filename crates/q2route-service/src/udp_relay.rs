@@ -1,10 +1,13 @@
-//! UDP relay: proxied IPv4 UDP flows go through a SOCKS5 UDP ASSOCIATE.
+//! UDP relay: proxied IPv4 and IPv6 UDP flows go through a SOCKS5 UDP
+//! ASSOCIATE.
 //!
 //! Packet threads [`UdpRelay::submit`] captured datagrams (never blocking:
 //! bounded channel, full = drop). One manager task owns the session map, one
 //! session per app socket (local address). A session associates through its
 //! profile, then relays app datagrams to the proxy's UDP relay and injects
-//! the proxy's replies back to the app as inbound packets.
+//! the proxy's replies back to the app as inbound packets (IPv4 or IPv6, as
+//! the app's socket). An IPv4 and an IPv6 socket on the same port number are
+//! separate sessions; port state is keyed by `(Family, port)`.
 //!
 //! **Fail closed:** nothing here ever sends an app datagram direct. A missing
 //! or non-SOCKS5 profile, or a failed association, drops the datagrams (for
@@ -12,8 +15,9 @@
 //!
 //! **ICMP guard:** replies are injected toward the app's socket; one arriving
 //! after that socket closed makes Windows answer with an ICMP port
-//! unreachable from the real IP. [`UdpRelay::serves_port`] (live sessions
-//! plus [`ICMP_GUARD`] after they end) lets the packet loop drop those.
+//! (or ICMPv6 destination unreachable) from the real IP.
+//! [`UdpRelay::serves_port`] (live sessions plus [`ICMP_GUARD`] after they
+//! end) lets the packet loop drop those.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -35,8 +39,9 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 
 use crate::conns::{ConnBytes, NewConn};
+use crate::nat::Family;
 use crate::relay::{exe_name, RelayCtx, NO_GROUP};
-use crate::udp_packet::build_inbound_udp;
+use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
 use crate::windivert::Address;
 
 /// A session with no datagram in either direction for this long ends.
@@ -69,8 +74,9 @@ pub struct Datagram {
     pub pid: u32,
     pub profile: ProfileId,
     pub group_id: Option<GroupId>,
-    pub local: SocketAddrV4,
-    pub remote: SocketAddrV4,
+    /// The app's socket; `remote` is of the same family.
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
     pub payload: Vec<u8>,
     pub addr: Address,
 }
@@ -99,17 +105,18 @@ struct PortState {
     ended: std::time::Instant,
 }
 
-type Ports = Arc<DashMap<u16, PortState>>;
+type PortKey = (Family, u16);
+type Ports = Arc<DashMap<PortKey, PortState>>;
 
 /// Counts a session on its local port while alive (dropped when the
 /// session task ends, also on cancel).
 struct PortGuard {
     ports: Ports,
-    port: u16,
+    port: PortKey,
 }
 
 impl PortGuard {
-    fn new(ports: &Ports, port: u16) -> PortGuard {
+    fn new(ports: &Ports, port: PortKey) -> PortGuard {
         ports
             .entry(port)
             .and_modify(|e| e.live += 1)
@@ -136,9 +143,9 @@ impl Drop for PortGuard {
 /// Session -> manager.
 enum Report {
     /// Association failed / unusable profile: back off this key.
-    Failed(SocketAddrV4, ProfileId),
+    Failed(SocketAddr, ProfileId),
     /// Associated: the key works again.
-    Associated(SocketAddrV4, ProfileId),
+    Associated(SocketAddr, ProfileId),
 }
 
 pub struct UdpRelay {
@@ -146,7 +153,7 @@ pub struct UdpRelay {
     tx: mpsc::Sender<(u64, Datagram)>,
     /// Socket closes: unbounded (OS-rate-limited Socket-layer events), so a
     /// close is never dropped while the manager runs.
-    close_tx: mpsc::UnboundedSender<(u64, SocketAddrV4)>,
+    close_tx: mpsc::UnboundedSender<(u64, SocketAddr)>,
     /// Orders datagrams against closes across the two channels.
     seq: AtomicU64,
     ports: Ports,
@@ -211,22 +218,24 @@ impl UdpRelay {
         }
     }
 
-    /// App socket closed: end its session now (an unspecified ip ends every
-    /// session on that port). Never blocks and is never dropped while the
-    /// manager runs; datagrams captured before it never start a session.
-    pub fn close(&self, local: SocketAddrV4) {
+    /// App socket closed: end its session now. An unspecified ip ends every
+    /// session of its family on that port (`[::]`, a dual-stack socket, also
+    /// the IPv4 ones); a v4-mapped IPv6 address is its IPv4 address. Never
+    /// blocks and is never dropped while the manager runs; datagrams captured
+    /// before it never start a session.
+    pub fn close(&self, local: SocketAddr) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         if self.close_tx.send((seq, local)).is_err() {
             tracing::debug!("udp relay stopped; close for {local} ignored");
         }
     }
 
-    /// Whether a relay session serves local `port` now or did within the
-    /// ICMP guard. Lock-light (one DashMap shard read), no allocation: safe
-    /// per packet from packet threads.
-    pub fn serves_port(&self, port: u16) -> bool {
+    /// Whether a relay session of family `fam` serves local `port` now or
+    /// did within the ICMP guard. Lock-light (one DashMap shard read), no
+    /// allocation: safe per packet from packet threads.
+    pub fn serves_port(&self, fam: Family, port: u16) -> bool {
         self.ports
-            .get(&port)
+            .get(&(fam, port))
             .is_some_and(|e| e.live > 0 || e.ended.elapsed() < self.icmp_guard)
     }
 
@@ -250,29 +259,55 @@ struct Manager {
     cancel: CancellationToken,
     cfg: UdpRelayConfig,
     tracker: TaskTracker,
-    sessions: HashMap<SocketAddrV4, SessionHandle>,
+    sessions: HashMap<SocketAddr, SessionHandle>,
     ports: Ports,
     report_tx: mpsc::UnboundedSender<Report>,
     /// Keys whose last attempt failed -> end of their backoff. Kept after
     /// the backoff (later failures log at debug) until the key associates
     /// or its socket closes.
-    failed: HashMap<(SocketAddrV4, ProfileId), Instant>,
-    /// Local port -> seq of its latest close; datagrams with a lower seq
-    /// are from the closed socket. Cleared whenever the datagram queue is
-    /// empty (nothing older can still be queued).
-    closed: HashMap<u16, u64>,
+    failed: HashMap<(SocketAddr, ProfileId), Instant>,
+    /// (Family, local port) -> seq of its latest close; datagrams with a
+    /// lower seq are from the closed socket. Cleared whenever the datagram
+    /// queue is empty (nothing older can still be queued).
+    closed: HashMap<PortKey, u64>,
 }
 
-/// Same port, and `close` is unspecified or the same ip.
-fn same_local(entry: &SocketAddrV4, close: SocketAddrV4) -> bool {
-    entry.port() == close.port() && (close.ip().is_unspecified() || entry.ip() == close.ip())
+/// A v4-mapped IPv6 address as its IPv4 address; anything else unchanged.
+fn unmap(a: SocketAddr) -> SocketAddr {
+    match a {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, v6.port())),
+            None => a,
+        },
+        a => a,
+    }
+}
+
+/// The session families a CLOSE of `close` ends: its own, and for the IPv6
+/// wildcard (a dual-stack socket) IPv4 too.
+fn close_families(close: SocketAddr) -> &'static [Family] {
+    match unmap(close) {
+        SocketAddr::V4(_) => &[Family::V4],
+        SocketAddr::V6(a) if a.ip().is_unspecified() => &[Family::V4, Family::V6],
+        SocketAddr::V6(_) => &[Family::V6],
+    }
+}
+
+/// Whether a CLOSE of `close` ends the session on `entry`: same port, and
+/// `close` is the same ip or an unspecified ip of the entry's family (`[::]`
+/// also covers IPv4, see [`close_families`]); v4-mapped is IPv4.
+fn same_local(entry: &SocketAddr, close: SocketAddr) -> bool {
+    let close = unmap(close);
+    entry.port() == close.port()
+        && close_families(close).contains(&Family::of(entry))
+        && (close.ip().is_unspecified() || entry.ip() == close.ip())
 }
 
 impl Manager {
     async fn run(
         mut self,
         mut rx: mpsc::Receiver<(u64, Datagram)>,
-        mut close_rx: mpsc::UnboundedReceiver<(u64, SocketAddrV4)>,
+        mut close_rx: mpsc::UnboundedReceiver<(u64, SocketAddr)>,
         mut report_rx: mpsc::UnboundedReceiver<Report>,
     ) {
         loop {
@@ -322,16 +357,19 @@ impl Manager {
         }
     }
 
-    fn close(&mut self, seq: u64, local: SocketAddrV4) {
-        let c = self.closed.entry(local.port()).or_insert(seq);
-        *c = (*c).max(seq);
+    fn close(&mut self, seq: u64, local: SocketAddr) {
+        for &fam in close_families(local) {
+            let c = self.closed.entry((fam, local.port())).or_insert(seq);
+            *c = (*c).max(seq);
+        }
         self.sessions.retain(|l, _| !same_local(l, local));
         self.failed.retain(|(l, _), _| !same_local(l, local));
     }
 
     fn data(&mut self, seq: u64, d: Datagram) {
         // Captured before its socket's close: never (re)starts a session.
-        if self.closed.get(&d.local.port()).is_some_and(|&c| seq < c) {
+        let port_key = (Family::of(&d.local), d.local.port());
+        if self.closed.get(&port_key).is_some_and(|&c| seq < c) {
             return;
         }
         let d = match self.sessions.get(&d.local) {
@@ -377,7 +415,7 @@ impl Manager {
         // Fresh channel with room: cannot fail.
         let _ = tx.try_send(d);
         let st = stop.clone();
-        let port_guard = PortGuard::new(&self.ports, local.port());
+        let port_guard = PortGuard::new(&self.ports, port_key);
         self.tracker.spawn(async move {
             let _port_guard = port_guard;
             tokio::select! {
@@ -399,7 +437,7 @@ impl Manager {
 /// Ends the session's ConnLog entries when the session ends (also on cancel).
 struct Entries<'a> {
     ctx: &'a RelayCtx,
-    by_remote: HashMap<SocketAddrV4, (u64, Arc<ConnBytes>)>,
+    by_remote: HashMap<SocketAddr, (u64, Arc<ConnBytes>)>,
 }
 
 impl Drop for Entries<'_> {
@@ -420,8 +458,8 @@ struct Session {
     pid: u32,
     profile: ProfileId,
     group: Option<GroupId>,
-    local: SocketAddrV4,
-    first_remote: SocketAddrV4,
+    local: SocketAddr,
+    first_remote: SocketAddr,
     /// Address of the first outbound packet (interface for injection).
     addr: Address,
 }
@@ -465,7 +503,7 @@ impl Session {
 
     /// ConnLog entry (with live bytes) for `remote`, opened on its first
     /// datagram; `None` once the session has [`MAX_REMOTE_ROWS`] rows.
-    fn entry<'e>(&self, e: &'e mut Entries<'_>, remote: SocketAddrV4) -> Option<&'e ConnBytes> {
+    fn entry<'e>(&self, e: &'e mut Entries<'_>, remote: SocketAddr) -> Option<&'e ConnBytes> {
         if !e.by_remote.contains_key(&remote) && e.by_remote.len() >= MAX_REMOTE_ROWS {
             return None;
         }
@@ -479,8 +517,8 @@ impl Session {
                             proto: Protocol::Udp,
                             pid: self.pid,
                             exe: self.exe(),
-                            local: SocketAddr::V4(self.local),
-                            dst: SocketAddr::V4(remote),
+                            local: self.local,
+                            dst: remote,
                             domain: None,
                             route: Route::Proxy(self.profile.clone()),
                             group_id: self.group.clone(),
@@ -578,7 +616,7 @@ impl Session {
                     let Some(d) = d else { return };
                     let n = d.payload.len() as u64;
                     let bytes = self.entry(entries, d.remote);
-                    match sock.send(&encode_udp(SocketAddr::V4(d.remote), &d.payload)).await {
+                    match sock.send(&encode_udp(d.remote, &d.payload)).await {
                         Ok(_) => {
                             if let Some(b) = bytes {
                                 b.up.fetch_add(n, Ordering::Relaxed);
@@ -591,10 +629,10 @@ impl Session {
                 }
                 r = sock.recv(&mut buf) => {
                     let Ok(n) = r else { continue };
-                    let Some((SocketAddr::V4(src), payload)) = decode_udp(&buf[..n]) else {
+                    let Some((src, payload)) = decode_udp(&buf[..n]) else {
                         continue;
                     };
-                    let Ok(pkt) = build_inbound_udp(src, self.local, payload) else {
+                    let Some(pkt) = inbound_packet(src, self.local, payload) else {
                         continue;
                     };
                     let len = payload.len() as u64;
@@ -607,6 +645,18 @@ impl Session {
                 }
             }
         }
+    }
+}
+
+/// The inbound packet carrying a reply from `src` to the app socket `local`
+/// (IPv4 or IPv6, as `local`); a v4-mapped `src` counts as IPv4. `None` for
+/// a reply of the other family (it cannot reach that socket) or one too
+/// large.
+fn inbound_packet(src: SocketAddr, local: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    match (unmap(src), local) {
+        (SocketAddr::V4(s), SocketAddr::V4(l)) => build_inbound_udp(s, l, payload).ok(),
+        (SocketAddr::V6(s), SocketAddr::V6(l)) => build_inbound_udp6(s, l, payload).ok(),
+        _ => None,
     }
 }
 

@@ -21,6 +21,10 @@ fn kind_label(k: ProxyKind) -> &'static str {
     KINDS.iter().find(|(x, _)| *x == k).map_or("?", |(_, l)| l)
 }
 
+/// Hint under the "Proxy IPv6 traffic" checkbox.
+pub const PROXY_IPV6_HINT: &str =
+    "Turn off if your VPN server has no IPv6 — apps then fall back to IPv4.";
+
 enum TestState {
     Running(oneshot::Receiver<Response>),
     Done { ok: bool, text: String },
@@ -151,6 +155,8 @@ pub struct ProxiesView {
     form: Option<Form>,
     form_error: Option<&'static str>,
     tests: HashMap<ProfileId, TestState>,
+    /// A SetProxyIpv6 request awaiting its reply.
+    ipv6_pending: Option<oneshot::Receiver<Response>>,
 }
 
 impl ProxiesView {
@@ -173,6 +179,16 @@ impl ProxiesView {
                 }
             }
         }
+        if let Some(rx) = self.ipv6_pending.as_mut() {
+            match rx.try_recv() {
+                Ok(Response::Error(e)) => {
+                    req.last_error = Some(e);
+                    self.ipv6_pending = None;
+                }
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => self.ipv6_pending = None,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
         ui.horizontal(|ui| {
             ui.heading("Proxies");
             if ui.button("Add proxy").clicked() {
@@ -191,6 +207,17 @@ impl ProxiesView {
                     ui.end_row();
                 }
             });
+        ui.add_space(8.0);
+        // State comes from the live snapshot; the click is sent at once.
+        let mut v6 = s.config.settings.proxy_ipv6;
+        let busy = self.ipv6_pending.is_some();
+        let clicked = ui
+            .add_enabled(!busy, egui::Checkbox::new(&mut v6, "Proxy IPv6 traffic"))
+            .changed();
+        ui.weak(PROXY_IPV6_HINT);
+        if clicked && !busy {
+            self.ipv6_pending = Some(client.send(Request::SetProxyIpv6 { enabled: v6 }));
+        }
         if let Some(form) = self.form.as_mut() {
             ui.add_space(12.0);
             ui.separator();
@@ -320,6 +347,14 @@ mod tests {
         assert_eq!(new_id(&cfg, "My Proxy #1"), "my-proxy-1");
         assert_eq!(new_id(&cfg, "V2Ray"), "v2ray-2");
         assert_eq!(new_id(&cfg, "!!!"), "proxy");
+    }
+
+    #[test]
+    fn proxy_ipv6_hint_text() {
+        assert_eq!(
+            PROXY_IPV6_HINT,
+            "Turn off if your VPN server has no IPv6 — apps then fall back to IPv4."
+        );
     }
 
     #[test]

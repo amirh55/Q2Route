@@ -1,10 +1,10 @@
 //! Relay tests: localhost mocks, with `RuleSet::lan_direct = false` so that
 //! loopback destinations are routed by the rules under test.
 
-use std::collections::HashSet;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -14,8 +14,10 @@ use q2route_core::domain_map::DomainMap;
 use q2route_core::ipc::Event;
 use q2route_core::process_tree::{ProcInfo, ProcessTree};
 use q2route_core::ruleset::RuleSet;
-use q2route_service::nat::OriginalDst;
-use q2route_service::relay::{run_relay, OrigDstLookup, RelayCtx};
+use q2route_service::nat::{Family, OriginalDst};
+use q2route_service::relay::{
+    bind_relay, bind_relay_with, run_relay, OrigDstLookup, RelayCtx, RELAY_BIND_ATTEMPTS,
+};
 use q2route_service::stats::Stats;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,7 +31,7 @@ impl OrigDstLookup for FixedLookup {
     fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
         Some((
             OriginalDst {
-                dst: self.0,
+                dst: self.0.into(),
                 pid: 4242,
             },
             1,
@@ -45,7 +47,7 @@ impl OrigDstLookup for RecordingLookup {
     fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
         Some((
             OriginalDst {
-                dst: self.0,
+                dst: self.0.into(),
                 pid: 4242,
             },
             77,
@@ -111,6 +113,28 @@ fn config(proxies: Vec<ProxyProfile>, groups: Vec<Group>) -> Config {
     }
 }
 
+/// Original destination -> the mock server's real address. The relay's
+/// direct connects (in every test `ctx`) dial through this map, so a NAT
+/// entry can name e.g. `127.53.0.2:53` (keeping the port-53 DNS branch)
+/// while the mock listens on `127.0.0.1:<ephemeral>`: connects to loopback
+/// addresses other than 127.0.0.1 are not reliable on every machine.
+static DIALS: LazyLock<Mutex<HashMap<SocketAddr, SocketAddr>>> = LazyLock::new(Default::default);
+
+/// Binds a mock server on 127.0.0.1 standing in for `orig` (`ip:53`).
+async fn bind_as(ip: &str) -> (SocketAddrV4, TcpListener) {
+    let orig: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    DIALS
+        .lock()
+        .unwrap()
+        .insert(orig.into(), l.local_addr().unwrap());
+    (orig, l)
+}
+
+fn dial(dst: SocketAddr) -> SocketAddr {
+    DIALS.lock().unwrap().get(&dst).copied().unwrap_or(dst)
+}
+
 fn ctx(cfg: Config) -> Arc<RelayCtx> {
     let mut rules = RuleSet::compile(&cfg).unwrap();
     rules.lan_direct = false;
@@ -128,6 +152,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
         proxy_servers: ArcSwap::from_pointee(vec![]),
+        direct_dial_override: Some(Arc::new(dial)),
     })
 }
 
@@ -141,7 +166,12 @@ async fn start(dst: SocketAddrV4, c: Arc<RelayCtx>) -> Relay {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_relay(l, Arc::new(FixedLookup(dst)), c, cancel.clone()));
+    let task = tokio::spawn(run_relay(
+        vec![l],
+        Arc::new(FixedLookup(dst)),
+        c,
+        cancel.clone(),
+    ));
     Relay { addr, cancel, task }
 }
 
@@ -178,6 +208,11 @@ async fn mock_socks(want: usize) -> (u16, mpsc::Receiver<SocksReq>) {
                 let mut n = [0u8; 1];
                 s.read_exact(&mut n).await.unwrap();
                 let mut a = vec![0u8; n[0] as usize];
+                s.read_exact(&mut a).await.unwrap();
+                a
+            }
+            4 => {
+                let mut a = vec![0u8; 16];
                 s.read_exact(&mut a).await.unwrap();
                 a
             }
@@ -278,12 +313,12 @@ async fn direct_records_own_port() {
     assert_eq!(&b, b"ping");
     let upstream_port = peers.recv().await.unwrap();
     assert!(
-        c.own_ports.contains(&upstream_port),
+        c.own_ports.contains(&(Family::V4, upstream_port)),
         "own_ports missing upstream port"
     );
     drop(client);
     let deadline = Instant::now() + Duration::from_secs(3);
-    while c.own_ports.contains(&upstream_port) {
+    while c.own_ports.contains(&(Family::V4, upstream_port)) {
         assert!(
             Instant::now() < deadline,
             "own_ports not cleared after close"
@@ -403,7 +438,7 @@ async fn connection_end_releases_nat_entry() {
     let (tx, mut released) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(run_relay(
-        l,
+        vec![l],
         Arc::new(RecordingLookup(v4(origin), tx)),
         ctx(cfg),
         cancel.clone(),
@@ -431,7 +466,7 @@ async fn blocked_connection_releases_nat_entry() {
     let (tx, mut released) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(run_relay(
-        l,
+        vec![l],
         Arc::new(RecordingLookup("5.5.5.5:8000".parse().unwrap(), tx)),
         ctx(cfg),
         cancel.clone(),
@@ -465,6 +500,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         proxy_down: DashSet::new(),
         domains: Arc::new(DomainMap::new()),
         proxy_servers: ArcSwap::from_pointee(vec![]),
+        direct_dial_override: c.direct_dial_override.clone(),
     });
     let r = start(v4(origin), c).await;
     let mut client = TcpStream::connect(r.addr).await.unwrap();
@@ -776,11 +812,10 @@ type DnsServer = (
     mpsc::UnboundedReceiver<Vec<u8>>,
 );
 
-/// Mock DNS-over-TCP server on `ip:53` (a distinct loopback ip per test):
-/// counts accepts, reports queries.
+/// Mock DNS-over-TCP server standing in for `ip:53` (a distinct ip per
+/// test, see [`bind_as`]): counts accepts, reports queries.
 async fn dns_server(ip: &str) -> DnsServer {
-    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as(ip).await;
     let count = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::unbounded_channel();
     let c = count.clone();
@@ -939,10 +974,10 @@ async fn tcp_dns_blocked_name_closes() {
     r.cancel.cancel();
 }
 
-/// Echo server on `ip:53` (a non-DNS service on port 53): counts accepts.
+/// Echo server standing in for `ip:53` (a non-DNS service on port 53):
+/// counts accepts.
 async fn echo_53(ip: &str) -> (SocketAddrV4, Arc<AtomicUsize>) {
-    let addr: SocketAddrV4 = format!("{ip}:53").parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as(ip).await;
     let count = Arc::new(AtomicUsize::new(0));
     let c = count.clone();
     tokio::spawn(async move {
@@ -1042,8 +1077,7 @@ async fn tcp_dns_partial_frame_closes() {
 /// queries forwarded on it (same id and name).
 #[tokio::test]
 async fn tcp_dns_answers_for_names_never_asked_are_not_learned() {
-    let addr: SocketAddrV4 = "127.53.0.16:53".parse().unwrap();
-    let l = TcpListener::bind(addr).await.expect("bind loopback :53");
+    let (addr, l) = bind_as("127.53.0.16").await;
     tokio::spawn(async move {
         let (mut s, _) = l.accept().await.unwrap();
         let mut len = [0u8; 2];
@@ -1291,4 +1325,349 @@ async fn tcp_dns_bootstrap_names_go_direct() {
     assert_tcp_dns_direct("127.53.0.12", c, "vpn.example.com").await;
     assert_tcp_dns_direct("127.53.0.13", ctx(cfg), "a.manual.example").await;
     assert!(targets.try_recv().is_err(), "went through the proxy");
+}
+
+// ---- M6: the dual-stack relay ----
+
+/// Answers only for an IPv6 peer (as the NAT lookup does for an IPv6
+/// redirected flow): the original destination is `dst`.
+struct V6Lookup(SocketAddr);
+
+impl OrigDstLookup for V6Lookup {
+    fn attach(&self, peer: SocketAddr) -> Option<(OriginalDst, u64)> {
+        peer.is_ipv6().then_some((
+            OriginalDst {
+                dst: self.0,
+                pid: 4242,
+            },
+            1,
+        ))
+    }
+    fn release(&self, _peer: SocketAddr, _token: u64) {}
+}
+
+/// Starts a relay on 127.0.0.1 + [::1] (same port). `None` (test skipped)
+/// when this machine cannot bind the IPv6 loopback.
+async fn start_dual(lookup: Arc<dyn OrigDstLookup>, c: Arc<RelayCtx>) -> Option<Relay> {
+    let ls = bind_relay(Ipv4Addr::LOCALHOST, Ipv6Addr::LOCALHOST).unwrap();
+    if ls.v6.is_none() {
+        eprintln!("skipped: cannot bind [::1]");
+        return None;
+    }
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, ls.port()));
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_relay(ls.into_vec(), lookup, c, cancel.clone()));
+    Some(Relay { addr, cancel, task })
+}
+
+#[tokio::test]
+async fn relayed_ipv6_connection_via_proxy() {
+    let (sport, mut reqs) = mock_socks(4).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let dst: SocketAddr = "[2606:4700::1]:443".parse().unwrap();
+    let Some(r) = start_dual(Arc::new(V6Lookup(dst)), ctx(cfg)).await else {
+        return;
+    };
+    let mut c = TcpStream::connect(r.addr).await.unwrap();
+    c.write_all(b"ping").await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.atyp, 4, "SOCKS5 ATYP IPv6");
+    assert_eq!(
+        req.host,
+        "2606:4700::1"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+            .octets()
+            .to_vec()
+    );
+    assert_eq!(req.port, 443);
+    assert_eq!(req.first, b"ping");
+    r.cancel.cancel();
+}
+
+/// The SOCKS5 request for one proxied flow to `dst` (catch-all proxy, the
+/// first bytes "ping"), with `name` mapped to `dst` by DNS when given;
+/// `None` when the IPv6 relay cannot bind [::1].
+async fn proxied_v6_request(dst: &str, name: Option<&str>) -> Option<SocksReq> {
+    let (sport, mut reqs) = mock_socks(4).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let dst: SocketAddr = dst.parse().unwrap();
+    let c = ctx(cfg);
+    if let Some(n) = name {
+        c.domains
+            .insert(dst.ip(), n, 300, std::time::Instant::now());
+    }
+    let r = start_dual(Arc::new(V6Lookup(dst)), c).await?;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    r.cancel.cancel();
+    Some(req)
+}
+
+/// A proxied IPv6 flow with no peeked host asks the proxy for the name DNS
+/// answered for the destination (an IPv4-only proxy exit can still reach
+/// it), both without a peek (port 22) and after an empty one (443).
+#[tokio::test]
+async fn proxied_ipv6_without_domain_uses_mapped_name() {
+    for dst in ["[2606:4700::1]:22", "[2606:4700::1]:443"] {
+        let Some(req) = proxied_v6_request(dst, Some("ssh.example.com")).await else {
+            return;
+        };
+        assert_eq!(req.atyp, 3, "{dst}: SOCKS5 ATYP domain");
+        assert_eq!(req.host, b"ssh.example.com", "{dst}");
+        assert_eq!(req.first, b"ping");
+    }
+}
+
+/// Without a mapped name the IPv6 address itself is asked for.
+#[tokio::test]
+async fn proxied_ipv6_without_name_uses_address() {
+    let Some(req) = proxied_v6_request("[2606:4700::1]:22", None).await else {
+        return;
+    };
+    assert_eq!(req.atyp, 4, "SOCKS5 ATYP IPv6");
+    assert_eq!(req.port, 22);
+}
+
+/// IPv4 is unchanged: a mapped name is not used as the proxy target.
+#[tokio::test]
+async fn proxied_ipv4_without_domain_keeps_address() {
+    let (sport, mut reqs) = mock_socks(4).await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let dst: SocketAddrV4 = "203.0.113.7:22".parse().unwrap();
+    let c = ctx(cfg);
+    c.domains.insert(
+        (*dst.ip()).into(),
+        "ssh.example.com",
+        300,
+        std::time::Instant::now(),
+    );
+    let r = start(dst, c).await;
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let req = tokio::time::timeout(Duration::from_secs(5), reqs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.atyp, 1);
+    assert_eq!(req.host, [203, 0, 113, 7]);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn direct_ipv6_connection_from_relay() {
+    let Ok(l) = TcpListener::bind("[::1]:0").await else {
+        eprintln!("skipped: cannot bind [::1]");
+        return;
+    };
+    let origin = l.local_addr().unwrap();
+    let (tx, mut peers) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut s, peer)) = l.accept().await {
+            let _ = tx.send(peer);
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let c = ctx(cfg);
+    let Some(r) = start_dual(Arc::new(V6Lookup(origin)), c.clone()).await else {
+        return;
+    };
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut b = [0u8; 4];
+    client.read_exact(&mut b).await.unwrap();
+    assert_eq!(&b, b"ping");
+    let up = peers.recv().await.unwrap();
+    assert!(up.is_ipv6(), "direct upstream is IPv6: {up}");
+    assert!(
+        c.own_ports.contains(&(Family::V6, up.port())),
+        "own_ports keyed by family"
+    );
+    assert!(!c.own_ports.contains(&(Family::V4, up.port())));
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn socks4_ipv6_target_closes() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pport = proxy.local_addr().unwrap().port();
+    let proxy_accepts = Arc::new(AtomicUsize::new(0));
+    let pa = proxy_accepts.clone();
+    tokio::spawn(async move {
+        while proxy.accept().await.is_ok() {
+            pa.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    // A direct connect would be dialled to this origin: it must see nothing.
+    let (origin, direct_accepts, _) = mock_origin().await;
+    let dst: SocketAddr = "[2606:4700::1]:4434".parse().unwrap();
+    DIALS.lock().unwrap().insert(dst, origin);
+    let mut p = socks_profile(pport);
+    p.kind = ProxyKind::Socks4;
+    let cfg = config(
+        vec![p],
+        vec![group("rest", Action::Proxy("mock".into()), &[], true)],
+    );
+    let c = ctx(cfg);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    tokio::spawn(run_relay(
+        vec![l],
+        Arc::new(V6OrAnyLookup(dst)),
+        c.clone(),
+        cancel.clone(),
+    ));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    assert_closed(&mut client, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        proxy_accepts.load(Ordering::SeqCst),
+        0,
+        "SOCKS4 never tried"
+    );
+    assert_eq!(
+        direct_accepts.load(Ordering::SeqCst),
+        0,
+        "no direct fallback"
+    );
+    cancel.cancel();
+}
+
+/// Answers `dst` for any peer.
+struct V6OrAnyLookup(SocketAddr);
+
+impl OrigDstLookup for V6OrAnyLookup {
+    fn attach(&self, _peer: SocketAddr) -> Option<(OriginalDst, u64)> {
+        Some((
+            OriginalDst {
+                dst: self.0,
+                pid: 4242,
+            },
+            1,
+        ))
+    }
+    fn release(&self, _peer: SocketAddr, _token: u64) {}
+}
+
+#[tokio::test]
+async fn relay_starts_ipv4_only_when_ipv6_bind_fails() {
+    let mut tries = 0;
+    let ls = bind_relay_with(Ipv4Addr::LOCALHOST, |_| {
+        tries += 1;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no IPv6",
+        ))
+    })
+    .unwrap();
+    assert!(ls.v6.is_none(), "IPv4 only");
+    assert_eq!(tries, RELAY_BIND_ATTEMPTS);
+    // The IPv4 side still relays.
+    let (origin, _, _) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, ls.port()));
+    let cancel = CancellationToken::new();
+    tokio::spawn(run_relay(
+        ls.into_vec(),
+        Arc::new(FixedLookup(v4(origin))),
+        ctx(cfg),
+        cancel.clone(),
+    ));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut b = [0u8; 4];
+    client.read_exact(&mut b).await.unwrap();
+    assert_eq!(&b, b"ping");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn relay_bind_retries_the_pair_for_ipv6() {
+    let mut tries = 0;
+    let ls = bind_relay_with(Ipv4Addr::LOCALHOST, |port| {
+        tries += 1;
+        if tries < 3 {
+            return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "taken"));
+        }
+        let l = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port))?;
+        l.set_nonblocking(true)?;
+        TcpListener::from_std(l)
+    });
+    let ls = ls.unwrap();
+    if ls.v6.is_none() {
+        eprintln!("skipped: cannot bind [::1]");
+        return;
+    }
+    assert_eq!(tries, 3);
+    let v6 = ls.v6.as_ref().unwrap().local_addr().unwrap();
+    assert_eq!(v6.port(), ls.port(), "same port on both families");
+}
+
+/// IPv6 TCP/53 redirected into the dual-stack relay is routed by the
+/// queried name like IPv4: a proxied name goes to the resolver via the
+/// proxy, a Direct name to the original `[..]:53` server.
+#[tokio::test]
+async fn ipv6_tcp_dns_routed_by_name() {
+    let orig: SocketAddr = "[2001:db8::53]:53".parse().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    DIALS.lock().unwrap().insert(orig, l.local_addr().unwrap());
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    let a = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            a.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(serve_dns(s, tx.clone()));
+        }
+    });
+    let (pport, mut targets, mut queries) = mock_connect_dns().await;
+    let mut cfg = config(vec![http_profile(pport)], dns_groups());
+    cfg.settings.dns.proxy_resolver = "8.8.4.4:53".into();
+    let c = ctx(cfg);
+    let Some(r) = start_dual(Arc::new(V6Lookup(orig)), c.clone()).await else {
+        return;
+    };
+    // Proxied name: via the proxy to the resolver, original server untouched.
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x1234, "example.com");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut targets).await, "8.8.4.4:53");
+    assert_eq!(recv_t(&mut queries).await, q);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "original server contacted"
+    );
+    // Direct name: to the original IPv6 server, not through the proxy.
+    let mut client = TcpStream::connect(r.addr).await.unwrap();
+    let q = dns_query(0x0bad, "www.digikala.ir");
+    client.write_all(&framed(&q)).await.unwrap();
+    assert_eq!(read_frame(&mut client).await, dns_answer(&q));
+    assert_eq!(recv_t(&mut seen).await, q);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert!(targets.try_recv().is_err(), "went through the proxy");
+    r.cancel.cancel();
 }

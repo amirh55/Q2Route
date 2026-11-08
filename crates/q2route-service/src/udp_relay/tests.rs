@@ -3,7 +3,7 @@
 //! packets to the test.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,15 +25,48 @@ fn local() -> SocketAddrV4 {
 }
 
 fn dg(remote: SocketAddrV4, payload: &[u8]) -> Datagram {
+    dg_at(SocketAddr::V4(local()), SocketAddr::V4(remote), payload)
+}
+
+fn dg_at(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Datagram {
     Datagram {
         pid: 4242,
         profile: "mock".into(),
         group_id: Some("g".into()),
-        local: local(),
+        local,
         remote,
         payload: payload.to_vec(),
         addr: Address::default(),
     }
+}
+
+/// The app's IPv6 socket, on the same port as [`local`].
+fn local6() -> SocketAddr {
+    SocketAddr::V6(SocketAddrV6::new(
+        "2001:db8::2".parse().unwrap(),
+        local().port(),
+        0,
+        0,
+    ))
+}
+
+/// (src, dst, payload) of an injected IPv6/UDP packet; asserts the UDP
+/// checksum is valid.
+fn parse_inbound6(p: &[u8]) -> (SocketAddr, SocketAddr, Vec<u8>) {
+    use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+    let s = SlicedPacket::from_ip(p).unwrap();
+    let (Some(NetSlice::Ipv6(ip)), Some(TransportSlice::Udp(u))) = (s.net, s.transport) else {
+        panic!("not ipv6/udp")
+    };
+    let h = ip.header().to_header();
+    let want = u.to_header().calc_checksum_ipv6(&h, u.payload()).unwrap();
+    assert_eq!(u.checksum(), want, "udp checksum");
+    let a = |ip: [u8; 16], port| SocketAddr::from((Ipv6Addr::from(ip), port));
+    (
+        a(h.source, u.source_port()),
+        a(h.destination, u.destination_port()),
+        u.payload().to_vec(),
+    )
 }
 
 struct Setup {
@@ -240,7 +273,7 @@ async fn close_is_not_dropped_when_queue_is_full() {
     for _ in 0..SUBMIT_QUEUE + 100 {
         s.relay.submit(dg(echo_addr, b"flood"));
     }
-    s.relay.close(local());
+    s.relay.close(SocketAddr::V4(local()));
     let c = conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
     assert_eq!(c.local, SocketAddr::V4(local()));
     // The queued datagrams predate the close: none restarts a session.
@@ -265,13 +298,13 @@ async fn serves_port_during_session_and_guard() {
         },
     );
     let port = local().port();
-    assert!(!s.relay.serves_port(port));
+    assert!(!s.relay.serves_port(Family::V4, port));
     s.relay.submit(dg(echo_addr, b"one"));
     assert_eq!(recv(&mut seen).await, b"one");
     recv(&mut s.injected).await;
-    assert!(s.relay.serves_port(port));
-    assert!(!s.relay.serves_port(port + 1));
-    s.relay.close(local());
+    assert!(s.relay.serves_port(Family::V4, port));
+    assert!(!s.relay.serves_port(Family::V4, port + 1));
+    s.relay.close(SocketAddr::V4(local()));
     conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
     timeout(WAIT, async {
         while s.ctx.stats.snapshot().0.values().any(|g| g.active > 0) {
@@ -282,9 +315,12 @@ async fn serves_port_during_session_and_guard() {
     .unwrap();
     // Ended, still guarded.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(s.relay.serves_port(port), "guarded after the session ends");
+    assert!(
+        s.relay.serves_port(Family::V4, port),
+        "guarded after the session ends"
+    );
     tokio::time::sleep(guard + Duration::from_millis(100)).await;
-    assert!(!s.relay.serves_port(port), "guard expired");
+    assert!(!s.relay.serves_port(Family::V4, port), "guard expired");
 }
 
 #[tokio::test]
@@ -360,8 +396,10 @@ async fn close_ends_session() {
     assert_eq!(recv(&mut seen).await, b"one");
     recv(&mut s.injected).await;
     // An unspecified-ip CLOSE ends every session on that port.
-    s.relay
-        .close(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local().port()));
+    s.relay.close(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        local().port(),
+    )));
     let c = conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
     assert_eq!(c.local, SocketAddr::V4(local()));
     timeout(WAIT, async {
@@ -476,4 +514,138 @@ async fn remote_rows_are_capped() {
     assert_eq!(rows.len(), MAX_REMOTE_ROWS);
     assert!(rows.iter().all(|c| c.ended_ms.is_none()));
     assert_eq!(s.ctx.stats.bytes("g"), (4 * total as u64, 4 * total as u64));
+}
+
+#[tokio::test]
+async fn relays_ipv6_datagram_and_injects_ipv6_reply() {
+    let Some((echo_addr, mut seen)) = echo6().await else {
+        eprintln!("no IPv6 loopback; skipped");
+        return;
+    };
+    let m = mock(MockOpts::default()).await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    s.relay.submit(dg_at(local6(), echo_addr, b"ping6"));
+    assert_eq!(recv(&mut seen).await, b"ping6");
+    let (src, dst, payload) = parse_inbound6(&recv(&mut s.injected).await);
+    assert_eq!(
+        (src, dst, payload.as_slice()),
+        (echo_addr, local6(), &b"ping6"[..])
+    );
+    let c = conn_where(&s.ctx, |c| c.up == Some(5) && c.down == Some(5)).await;
+    assert_eq!((c.local, c.dst), (local6(), echo_addr));
+    assert!(s.relay.serves_port(Family::V6, local().port()));
+    assert!(!s.relay.serves_port(Family::V4, local().port()));
+}
+
+/// An IPv4 and an IPv6 socket on the same local port are two sessions:
+/// each is associated, answered, guarded and closed on its own.
+#[tokio::test]
+async fn v4_and_v6_sessions_on_same_port_are_separate() {
+    let Some((echo6_addr, mut seen6)) = echo6().await else {
+        eprintln!("no IPv6 loopback; skipped");
+        return;
+    };
+    let m = mock(MockOpts::default()).await;
+    let (echo_addr, mut seen) = echo().await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    let port = local().port();
+    s.relay.submit(dg(echo_addr, b"four"));
+    assert_eq!(recv(&mut seen).await, b"four");
+    assert_eq!(parse_inbound(&recv(&mut s.injected).await).1, local());
+    assert!(s.relay.serves_port(Family::V4, port));
+    assert!(!s.relay.serves_port(Family::V6, port), "only the v4 socket");
+    s.relay.submit(dg_at(local6(), echo6_addr, b"six"));
+    assert_eq!(recv(&mut seen6).await, b"six");
+    assert_eq!(parse_inbound6(&recv(&mut s.injected).await).1, local6());
+    assert!(s.relay.serves_port(Family::V6, port));
+    assert_eq!(m.attempts.load(Ordering::SeqCst), 2, "one association each");
+    // Closing the IPv6 socket ends only its session.
+    s.relay.close(local6());
+    let c = conn_where(&s.ctx, |c| c.ended_ms.is_some()).await;
+    assert_eq!(c.local, local6());
+    let open: Vec<_> = s
+        .ctx
+        .conns
+        .list()
+        .into_iter()
+        .filter(|c| c.ended_ms.is_none())
+        .collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].local, SocketAddr::V4(local()));
+    // The IPv4 session keeps relaying on its existing association.
+    s.relay.submit(dg(echo_addr, b"again"));
+    assert_eq!(recv(&mut seen).await, b"again");
+    assert_eq!(parse_inbound(&recv(&mut s.injected).await).2, b"again");
+    assert_eq!(m.attempts.load(Ordering::SeqCst), 2);
+    // A v4 CLOSE never ends the IPv6 socket's new session either.
+    s.relay.submit(dg_at(local6(), echo6_addr, b"six2"));
+    assert_eq!(recv(&mut seen6).await, b"six2");
+    recv(&mut s.injected).await;
+    s.relay.close(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        port,
+    )));
+    conn_where(&s.ctx, |c| {
+        c.ended_ms.is_some() && c.local == SocketAddr::V4(local())
+    })
+    .await;
+    tokio::time::sleep(QUIET).await;
+    assert!(s
+        .ctx
+        .conns
+        .list()
+        .iter()
+        .any(|c| c.local == local6() && c.ended_ms.is_none()));
+}
+
+#[test]
+fn close_matching_is_family_aware() {
+    let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+    let v4 = a("10.0.0.2:5000");
+    let v6 = a("[2001:db8::2]:5000");
+    // Same family, same ip / unspecified ip: matches.
+    assert!(same_local(&v4, a("10.0.0.2:5000")));
+    assert!(same_local(&v4, a("0.0.0.0:5000")));
+    assert!(same_local(&v6, a("[2001:db8::2]:5000")));
+    assert!(same_local(&v6, a("[::]:5000")));
+    // v4-mapped IPv6 close: its IPv4 entry only.
+    assert!(same_local(&v4, a("[::ffff:10.0.0.2]:5000")));
+    assert!(!same_local(&v6, a("[::ffff:10.0.0.2]:5000")));
+    // The IPv6 wildcard (a dual-stack socket) also ends IPv4 sessions on
+    // the port, as before M6.
+    assert!(same_local(&v4, a("[::]:5000")));
+    // Other family / ip / port: no match.
+    assert!(!same_local(&v6, a("0.0.0.0:5000")));
+    assert!(!same_local(&v6, a("10.0.0.2:5000")));
+    assert!(!same_local(&v4, a("[2001:db8::2]:5000")));
+    assert!(!same_local(&v4, a("10.0.0.3:5000")));
+    assert!(!same_local(&v4, a("10.0.0.2:5001")));
+}
+
+/// A reply whose source is v4-mapped (`::ffff:a.b.c.d`) for an IPv4 app
+/// socket is delivered as IPv4 from `a.b.c.d`; a real IPv6 source for an
+/// IPv4 socket (and the reverse) is not.
+#[test]
+fn inbound_packet_unmaps_v4_mapped_source() {
+    let l4 = SocketAddr::V4(local());
+    let mapped: SocketAddr = "[::ffff:203.0.113.9]:4000".parse().unwrap();
+    let pkt = inbound_packet(mapped, l4, b"hi").expect("delivered");
+    let p = etherparse::SlicedPacket::from_ip(&pkt).unwrap();
+    let Some(etherparse::NetSlice::Ipv4(ip)) = p.net else {
+        panic!("not IPv4");
+    };
+    assert_eq!(ip.header().source_addr(), Ipv4Addr::new(203, 0, 113, 9));
+    assert_eq!(ip.header().destination_addr(), *local().ip());
+    let v6: SocketAddr = "[2001:db8::9]:4000".parse().unwrap();
+    assert!(inbound_packet(v6, l4, b"hi").is_none());
+    let l6: SocketAddr = "[2001:db8::2]:5000".parse().unwrap();
+    assert!(inbound_packet(v6, l6, b"hi").is_some());
+    let v4: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+    assert!(inbound_packet(v4, l6, b"hi").is_none());
 }

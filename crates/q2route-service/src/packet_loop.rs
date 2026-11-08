@@ -6,21 +6,24 @@
 //! * Network layer: every outbound, non-loopback TCP/UDP packet. Relay
 //!   replies (`A:relay_port -> D:pa`) are restored to the app; everything else
 //!   goes through [`classify`], which only ever passes Direct flows.
-//!   Outbound ICMPv4 destination-unreachable is captured too: one quoting a
-//!   UDP packet to a port the UDP relay serves (the stack answering an
-//!   injected reply from the real IP) is dropped; any other passes as before.
+//!   Outbound ICMPv4 / ICMPv6 destination-unreachable is captured too: one
+//!   quoting a UDP packet to a port the UDP relay serves for that family (the
+//!   stack answering an injected reply from the real IP) is dropped; any
+//!   other is sent unchanged.
 //!   UDP/53 queries are routed by the queried name ([`dns_verdict`]):
 //!   passed, answered REFUSED, or handed to the [`DnsProxy`] and dropped; a
 //!   UDP/53 payload that is not a DNS query is an ordinary UDP flow.
-//!   IPv4 TCP/53 is redirected to the relay, which routes it by name; IPv6
-//!   TCP/53 is passed untouched (M4 gap). The proxy program's own port-53
-//!   traffic is always passed (spec 5.6).
+//!   TCP/53 (either family) is redirected to the relay, which routes it by
+//!   name. Without an IPv6 relay listener only *non-Direct* IPv6 TCP/53 is
+//!   dropped: the proxy program (proxy endpoints' pids and always-direct
+//!   apps), the service's own pid and connections to proxy endpoints are
+//!   Direct and pass in either family (spec 5.6).
 //! * DNS answers (sniff only): inbound UDP from port 53 that answers a query
 //!   this loop passed ([`DnsPending`]) feeds the IP -> names map that lets
 //!   domain rules decide flows without a peek.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,7 +45,7 @@ use crate::classify::{
 use crate::conns::{ConnLog, NewConn};
 use crate::dns_proxy::{bootstrap_direct, DnsProxy, DnsQuery};
 use crate::flows::{FlowKey, FlowTable};
-use crate::nat::{redirect_outbound, restore_inbound, NatTable, OriginalDst, Verdict};
+use crate::nat::{redirect_outbound, restore_inbound, Family, NatTable, OriginalDst, Verdict};
 use crate::proxy_servers::ServerCache;
 use crate::relay::{describe, exe_name, proxy_program, OrigDstLookup, RelayCtx};
 use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
@@ -55,8 +58,8 @@ use crate::windivert::{
 
 pub const SOCKET_FILTER: &str = "((tcp or udp) and (event == CONNECT or event == CLOSE)) \
      or (udp and event == BIND) or (tcp and event == ACCEPT)";
-pub const NETWORK_FILTER: &str =
-    "outbound and !loopback and ((tcp or udp) or (icmp and icmp.Type == 3))";
+pub const NETWORK_FILTER: &str = "outbound and !loopback and ((tcp or udp) \
+     or (icmp and icmp.Type == 3) or (icmpv6 and icmpv6.Type == 1))";
 /// Sniff-only handle: DNS answers arriving from the network.
 pub const DNS_SNIFF_FILTER: &str = "inbound and !loopback and udp.SrcPort == 53";
 /// Threads receiving from the Network-layer handle.
@@ -166,6 +169,9 @@ pub struct Shared {
 /// State of one Start..Stop run.
 pub struct RunState {
     pub relay_port: u16,
+    /// The relay also listens on IPv6 (`[::]:relay_port`). Without it a
+    /// non-Direct IPv6 TCP flow is dropped, never redirected or passed.
+    pub relay_v6: bool,
     pub nat: Arc<NatTable>,
     pub cache: FlowCache,
     pub tcp_flows: FlowTable,
@@ -177,9 +183,10 @@ pub struct RunState {
 }
 
 impl RunState {
-    pub fn new(relay_port: u16) -> RunState {
+    pub fn new(relay_port: u16, relay_v6: bool) -> RunState {
         RunState {
             relay_port,
+            relay_v6,
             nat: Arc::default(),
             cache: FlowCache::default(),
             tcp_flows: FlowTable::default(),
@@ -195,13 +202,10 @@ pub struct NatLookup(pub Arc<NatTable>);
 
 impl OrigDstLookup for NatLookup {
     fn attach(&self, peer: SocketAddr) -> Option<(OriginalDst, u64)> {
-        let SocketAddr::V4(peer) = peer else {
-            return None;
-        };
-        self.0.attach(peer.port(), *peer.ip())
+        self.0.attach(Family::of(&peer), peer.port(), peer.ip())
     }
     fn release(&self, peer: SocketAddr, token: u64) {
-        self.0.release(peer.port(), token);
+        self.0.release(Family::of(&peer), peer.port(), token);
     }
 }
 
@@ -234,22 +238,6 @@ impl InboundSink for NetworkSink {
     }
 }
 
-/// A Socket-layer local address as the UDP relay keys it: IPv4 or
-/// v4-mapped as is, the IPv6 wildcard as `0.0.0.0` (same port); `None` for
-/// other IPv6 (never relayed).
-fn relay_local(a: SocketAddr) -> Option<SocketAddrV4> {
-    match a {
-        SocketAddr::V4(a) => Some(a),
-        SocketAddr::V6(a) if a.ip().is_unspecified() => {
-            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, a.port()))
-        }
-        SocketAddr::V6(a) => a
-            .ip()
-            .to_ipv4_mapped()
-            .map(|ip| SocketAddrV4::new(ip, a.port())),
-    }
-}
-
 pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp: Arc<UdpRelay>) {
     loop {
         let addr = match h.recv(&mut []) {
@@ -279,10 +267,9 @@ pub fn socket_loop(h: Arc<Handle>, run: Arc<RunState>, conns: Arc<ConnLog>, udp:
                     Protocol::Udp
                 };
                 conns.close_local(proto, s.local);
+                // IPv4 or IPv6; the relay matches it per family.
                 if s.protocol == PROTO_UDP {
-                    if let Some(l) = relay_local(s.local) {
-                        udp.close(l);
-                    }
+                    udp.close(s.local);
                 }
                 // A new socket reusing this local port must not inherit
                 // the old socket's decision.
@@ -374,11 +361,18 @@ fn route_packet(
     if !addr.outbound() {
         return Out::Send;
     }
-    // ICMPv4 (the filter captures only type 3): never a proxied flow; only
-    // the stack's answer to an injected relay reply is held back.
+    // ICMPv4 type 3 / ICMPv6 type 1 (all the filter captures of them):
+    // never a proxied flow; only the stack's answer to an injected relay
+    // reply is held back.
     if pkt.first().is_some_and(|b| b >> 4 == 4) && pkt.get(9) == Some(&PROTO_ICMP) {
         return match icmp_quoted_udp_dst_port(pkt) {
-            Some(port) if udp.serves_port(port) => Out::Drop,
+            Some(port) if udp.serves_port(Family::V4, port) => Out::Drop,
+            _ => Out::Send,
+        };
+    }
+    if pkt.first().is_some_and(|b| b >> 4 == 6) && pkt.get(6) == Some(&PROTO_ICMPV6) {
+        return match icmpv6_quoted_udp_dst_port(pkt) {
+            Some(port) if udp.serves_port(Family::V6, port) => Out::Drop,
             _ => Out::Send,
         };
     }
@@ -393,37 +387,55 @@ fn route_packet(
             return out;
         }
     }
-    // M4 gap (no IPv6 relay until M6): IPv6 TCP/53 is passed untouched.
-    if ipv6_tcp_dns(&f) {
-        return Out::Send;
-    }
-    let tcp4 = f.proto == PROTO_TCP && f.local.is_ipv4();
-    if tcp4 && f.local.port() == run.relay_port {
+    let tcp = f.proto == PROTO_TCP;
+    let fam = Family::of(&f.local);
+    let tcp4 = tcp && fam == Family::V4;
+    // The relay's replies; an IPv6 socket only when the relay listens on
+    // IPv6 (otherwise that port number belongs to some other IPv6 socket).
+    // Any verdict but `Rewritten` is dropped (the NAT's caller contract).
+    if tcp && f.local.port() == run.relay_port && (tcp4 || run.relay_v6) {
         return (restore_inbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into();
     }
-    // The relay's direct upstream sockets are IPv4 TCP only.
-    let own_port = tcp4 && shared.relay.own_ports.contains(&f.local.port());
-    let nat_has = tcp4
+    // Own ports and NAT entries are keyed by family: an IPv4 and an IPv6
+    // socket on the same port number never share them.
+    let own_port = tcp && shared.relay.own_ports.contains(&(fam, f.local.port()));
+    let nat_has = tcp
         && run
             .nat
-            .get(f.local.port())
-            .is_some_and(|o| SocketAddr::V4(o.dst) == f.remote);
-    // IPv4 TCP/53 is decided by the queried name in the relay.
-    let tcp_dns = tcp4 && f.remote.port() == 53;
-    let action = classify(&m, own_port, shared.own_pid, &run.cache, nat_has, || {
-        if tcp_dns {
-            let pid = lookup_pid(run, &f);
-            let own = if pid == shared.own_pid || shared.proxy_endpoints.load().contains(&f.remote)
-            {
-                Some(MatchReason::ExcludedPid)
+            .get(fam, f.local.port())
+            .is_some_and(|o| o.dst == f.remote);
+    // TCP/53 (either family) is decided by the queried name in the relay.
+    // Without an IPv6 relay listener a non-Direct IPv6 one is dropped
+    // (classify): fail closed, never passed to the original server.
+    let tcp_dns = tcp && f.remote.port() == 53;
+    // With "Proxy IPv6 traffic" off, a non-Direct IPv6 SYN (other than
+    // TCP/53, which the relay answers by name over IPv4) is dropped at once,
+    // so the app falls back to IPv4 (Happy Eyeballs) instead of connecting
+    // to the relay and being closed. Relay replies above stay on `run.relay_v6`.
+    let relay_v6 = run.relay_v6
+        && (fam == Family::V4 || tcp_dns || shared.relay.rules.load().proxy_ipv6);
+    let action = classify(
+        &m,
+        own_port,
+        shared.own_pid,
+        &run.cache,
+        nat_has,
+        relay_v6,
+        || {
+            if tcp_dns {
+                let pid = lookup_pid(run, &f);
+                let own =
+                    if pid == shared.own_pid || shared.proxy_endpoints.load().contains(&f.remote) {
+                        Some(MatchReason::ExcludedPid)
+                    } else {
+                        is_proxy_program(shared, pid).then_some(MatchReason::BootstrapName)
+                    };
+                tcp_dns_decision(pid, own)
             } else {
-                is_proxy_program(shared, pid).then_some(MatchReason::BootstrapName)
-            };
-            tcp_dns_decision(pid, own)
-        } else {
-            decide_flow(shared, run, &f)
-        }
-    });
+                decide_flow(shared, run, &f)
+            }
+        },
+    );
     match action {
         Action::Pass => Out::Send,
         Action::Drop => Out::Drop,
@@ -436,10 +448,14 @@ fn route_packet(
             Out::ResetApp
         }
         Action::NewRedirect { pid } => {
-            let SocketAddr::V4(dst) = f.remote else {
+            // IPv6 only when the relay listens on IPv6 (classify ensures it).
+            if fam == Family::V6 && !relay_v6 {
                 return Out::Drop;
-            };
-            run.nat.insert(f.local.port(), OriginalDst { dst, pid });
+            }
+            let dst = f.remote;
+            run.nat
+                .insert(fam, f.local.port(), OriginalDst { dst, pid });
+            // Any verdict but `Rewritten` is dropped (the NAT's caller contract).
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
         // Handed to the UDP relay; the packet itself never leaves.
@@ -448,22 +464,22 @@ fn route_packet(
             profile,
             group_id,
         } => {
-            let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (f.local, f.remote) else {
-                return Out::Drop;
-            };
-            if let Some(payload) = udp4_payload(pkt) {
+            // IPv4 or IPv6 (no extension headers, consistent lengths);
+            // anything else is only dropped.
+            if let Some(payload) = udp_payload(pkt) {
                 udp.submit(Datagram {
                     pid,
                     profile,
                     group_id,
-                    local,
-                    remote,
+                    local: f.local,
+                    remote: f.remote,
                     payload: payload.to_vec(),
                     addr: *addr,
                 });
             }
             Out::Drop
         }
+        // Any verdict but `Rewritten` is dropped (the NAT's caller contract).
         Action::Redirect => {
             (redirect_outbound(pkt, addr, run.relay_port, &run.nat) == Verdict::Rewritten).into()
         }
@@ -471,18 +487,17 @@ fn route_packet(
 }
 
 const PROTO_ICMP: u8 = 1;
+const PROTO_ICMPV6: u8 = 58;
 
-/// IPv6 TCP to port 53: always Direct in M4 (documented gap; there is no
-/// IPv6 relay to route it by name).
-fn ipv6_tcp_dns(f: &FlowId) -> bool {
-    f.proto == PROTO_TCP && f.remote.port() == 53 && f.remote.is_ipv6()
-}
-
-/// The decision for an IPv4 TCP/53 flow: the service's own sockets, proxy
-/// endpoints and the proxy program (`own`: why) are Direct; every other
-/// flow is NeedDomain, so its SYN is redirected to the relay (cached
-/// non-Direct, like a proxied flow), which routes it by the queried name
-/// ([`crate::relay`]).
+/// The decision for a TCP/53 flow (either family): the service's own
+/// sockets, proxy endpoints and the proxy program (`own`: why) are Direct;
+/// every other flow is NeedDomain, so its SYN is redirected to the relay
+/// (cached non-Direct, like a proxied flow), which routes it by the queried
+/// name ([`crate::relay`]). Excluded apps (pids on a proxy endpoint, and
+/// always-direct exes) are Direct here through [`is_proxy_program`], the
+/// same Direct verdict [`decide_flow`] gives them for any other port; a
+/// TCP/53 connection the relay finds is not DNS is decided by the relay's
+/// ordinary flow decision, which also sends them Direct.
 fn tcp_dns_decision(pid: u32, own: Option<MatchReason>) -> (u32, Decision) {
     match own {
         Some(reason) => (pid, direct(reason)),
@@ -531,6 +546,27 @@ fn icmp_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
     be16(q, qihl + 2)
 }
 
+/// For an IPv6 ICMPv6 destination unreachable (type 1, directly after the
+/// fixed header) quoting an IPv6/UDP packet (UDP directly after its fixed
+/// header): the quoted UDP destination port. `None` for anything else or
+/// anything malformed / truncated.
+fn icmpv6_quoted_udp_dst_port(p: &[u8]) -> Option<u16> {
+    if p.len() < 40 || p[0] >> 4 != 6 || p[6] != PROTO_ICMPV6 {
+        return None;
+    }
+    let total = (40 + usize::from(u16::from_be_bytes([p[4], p[5]]))).min(p.len());
+    let icmp = p.get(40..total)?;
+    if *icmp.first()? != 1 {
+        return None;
+    }
+    // ICMPv6 header (8 bytes), then the quoted IPv6 header + UDP header.
+    let q = icmp.get(8..)?;
+    if q.len() < 40 || q[0] >> 4 != 6 || q[6] != PROTO_UDP {
+        return None;
+    }
+    Some(u16::from_be_bytes([*q.get(42)?, *q.get(43)?]))
+}
+
 /// UDP payload of an IPv4/UDP packet (bounded by the UDP and IP lengths);
 /// `None` if the lengths are inconsistent (e.g. a truncated fragment).
 fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
@@ -544,7 +580,8 @@ fn udp4_payload(p: &[u8]) -> Option<&[u8]> {
 }
 
 /// UDP payload of an IPv4 or IPv6 UDP packet. IPv6 with extension headers
-/// is not parsed (`None`: treated as malformed by the DNS path).
+/// (fragments included) is not parsed (`None`: treated as malformed by the
+/// DNS path, dropped by the UDP relay path).
 fn udp_payload(p: &[u8]) -> Option<&[u8]> {
     match *p.first()? >> 4 {
         4 if p.get(9) == Some(&PROTO_UDP) => udp4_payload(p),
@@ -843,19 +880,6 @@ mod tests {
         assert_eq!(udp4_payload(&p[..25]), None, "truncated");
     }
 
-    #[test]
-    fn relay_local_maps_socket_addresses() {
-        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let v4 = |s: &str| Some(s.parse::<SocketAddrV4>().unwrap());
-        assert_eq!(relay_local(p("10.0.0.2:5000")), v4("10.0.0.2:5000"));
-        assert_eq!(
-            relay_local(p("[::ffff:10.0.0.2]:5000")),
-            v4("10.0.0.2:5000")
-        );
-        assert_eq!(relay_local(p("[::]:5000")), v4("0.0.0.0:5000"));
-        assert_eq!(relay_local(p("[2001:db8::1]:5000")), None);
-    }
-
     /// IPv4 ICMP `ty`/code 3 quoting the first 28 bytes of `quoted`.
     fn icmp4(ty: u8, quoted: &[u8]) -> Vec<u8> {
         let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 128, PROTO_ICMP, 0, 0];
@@ -892,6 +916,157 @@ mod tests {
         }
         // The outer packet itself is UDP, not ICMP.
         assert_eq!(icmp_quoted_udp_dst_port(&udp), None);
+    }
+
+    /// IPv6 ICMPv6 `ty`/code 4 quoting the first 48 bytes of `quoted`.
+    fn icmp6(ty: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, 0, 0, PROTO_ICMPV6, 64];
+        p.extend_from_slice(
+            &"2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        p.extend_from_slice(
+            &"2001:db8::99"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        p.extend_from_slice(&[ty, 4, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&quoted[..48.min(quoted.len())]);
+        let len = (p.len() - 40) as u16;
+        p[4..6].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn icmpv6_quoted_udp_dst_port_cases() {
+        // The triggering inbound packet: remote -> app's local port 5000.
+        let udp = crate::udp_packet::build_inbound_udp6(
+            "[2001:db8::99]:3478".parse().unwrap(),
+            "[2001:db8::2]:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        assert_eq!(icmpv6_quoted_udp_dst_port(&icmp6(1, &udp)), Some(5000));
+        let mut tcp = udp.clone();
+        tcp[6] = PROTO_TCP;
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(1, &tcp)),
+            None,
+            "quotes TCP"
+        );
+        let mut ext = udp.clone();
+        ext[6] = 0;
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(1, &ext)),
+            None,
+            "quoted extension header"
+        );
+        assert_eq!(
+            icmpv6_quoted_udp_dst_port(&icmp6(128, &udp)),
+            None,
+            "echo request"
+        );
+        let full = icmp6(1, &udp);
+        for n in [0, 6, 39, 40, 47, 48, 87, 90, 91] {
+            assert_eq!(
+                icmpv6_quoted_udp_dst_port(&full[..n]),
+                None,
+                "truncated to {n}"
+            );
+        }
+        // Payload length shorter than the quote: bounded by it.
+        let mut short = full.clone();
+        short[4..6].copy_from_slice(&50u16.to_be_bytes());
+        assert_eq!(icmpv6_quoted_udp_dst_port(&short), None, "short length");
+        // Not ICMPv6: the packet itself is UDP, or ICMPv4.
+        assert_eq!(icmpv6_quoted_udp_dst_port(&udp), None);
+        let v4 = crate::udp_packet::build_inbound_udp(
+            "8.8.4.4:3478".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        assert_eq!(icmpv6_quoted_udp_dst_port(&icmp4(3, &v4)), None);
+        assert_eq!(icmp_quoted_udp_dst_port(&full), None, "v4 parser");
+    }
+
+    /// An ICMPv6 destination unreachable for a port the relay does not
+    /// serve is sent byte-for-byte.
+    #[tokio::test]
+    async fn icmpv6_unreachable_not_served_passes_unchanged() {
+        let h = harness();
+        let udp = crate::udp_packet::build_inbound_udp6(
+            "[2001:db8::99]:3478".parse().unwrap(),
+            "[2001:db8::2]:5000".parse().unwrap(),
+            b"reply",
+        )
+        .unwrap();
+        let orig = icmp6(1, &udp);
+        let mut pkt = orig.clone();
+        let mut addr = Address::default();
+        addr.set_outbound(true);
+        let out = route_packet(&mut pkt, &mut addr, &h.shared, &h.run, &h.udp, &h.dns);
+        assert_eq!(out, Out::Send);
+        assert_eq!(pkt, orig);
+        h.cancel.cancel();
+    }
+
+    /// A proxied IPv6 UDP packet goes to the UDP relay (never sent); one
+    /// with an extension header is dropped too.
+    #[tokio::test]
+    async fn ipv6_udp_proxied_is_relayed_never_sent() {
+        let h = harness();
+        let (l, d) = ("[2001:db8::2]:47001", "[2606:4700::1]:3478");
+        let pkt =
+            crate::udp_packet::build_inbound_udp6(l.parse().unwrap(), d.parse().unwrap(), b"x")
+                .unwrap();
+        assert_eq!(h.route(BROWSER, PROTO_UDP, l, d, pkt.clone()), Out::Drop);
+        assert!(matches!(
+            h.cached(PROTO_UDP, l, d),
+            Some(Cached::UdpProxy(..))
+        ));
+        let mut ext = pkt[..40].to_vec();
+        ext[6] = 0;
+        let len = u16::from_be_bytes([pkt[4], pkt[5]]) + 8;
+        ext[4..6].copy_from_slice(&len.to_be_bytes());
+        ext.extend_from_slice(&[PROTO_UDP, 0, 1, 4, 0, 0, 0, 0]);
+        ext.extend_from_slice(&pkt[40..]);
+        assert_eq!(h.route(BROWSER, PROTO_UDP, l, d, ext), Out::Drop);
+        // The relay took it: its session serves IPv6 port 47001 (live, or
+        // within the guard once its association to the dead proxy failed).
+        tokio::time::timeout(crate::test_util::WAIT, async {
+            while !h.udp.serves_port(Family::V6, 47001) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("relay session on [..]:47001");
+        assert!(!h.udp.serves_port(Family::V4, 47001));
+        // The stack's ICMPv6 port unreachable for that port: held back; an
+        // ICMPv4 one for the same port number (IPv4 socket): sent.
+        let reply =
+            crate::udp_packet::build_inbound_udp6(d.parse().unwrap(), l.parse().unwrap(), b"r")
+                .unwrap();
+        let reply4 = crate::udp_packet::build_inbound_udp(
+            "203.0.113.9:3478".parse().unwrap(),
+            "10.0.0.2:47001".parse().unwrap(),
+            b"r",
+        )
+        .unwrap();
+        for (pkt, want) in [
+            (icmp6(1, &reply), Out::Drop),
+            (icmp4(3, &reply4), Out::Send),
+        ] {
+            let mut pkt = pkt;
+            let mut addr = Address::default();
+            addr.set_outbound(true);
+            let out = route_packet(&mut pkt, &mut addr, &h.shared, &h.run, &h.udp, &h.dns);
+            assert_eq!(out, want);
+        }
+        h.cancel.cancel();
     }
 
     fn seed_rules() -> RuleSet {
@@ -1113,7 +1288,7 @@ mod tests {
         const OWN: u32 = 7;
         let cache = FlowCache::default();
         let syn = tcp_meta("8.8.8.8:53", true);
-        let a = classify(&syn, false, OWN, &cache, false, || {
+        let a = classify(&syn, false, OWN, &cache, false, false, || {
             tcp_dns_decision(4242, None)
         });
         assert_eq!(a, Action::NewRedirect { pid: 4242 });
@@ -1122,17 +1297,19 @@ mod tests {
         let data = tcp_meta("8.8.8.8:53", false);
         let never = || -> (u32, Decision) { panic!("re-decided") };
         assert_eq!(
-            classify(&data, false, OWN, &cache, true, never),
+            classify(&data, false, OWN, &cache, true, false, never),
             Action::Redirect
         );
         assert_eq!(
-            classify(&data, false, OWN, &cache, false, never),
+            classify(&data, false, OWN, &cache, false, false, never),
             Action::Reset
         );
         // A flow that predates Q2Route (no SYN seen): reset, not passed.
         let old = FlowCache::default();
         assert_eq!(
-            classify(&data, false, OWN, &old, false, || tcp_dns_decision(1, None)),
+            classify(&data, false, OWN, &old, false, false, || tcp_dns_decision(
+                1, None
+            )),
             Action::Reset
         );
         // The service's own (and proxy endpoints) and the proxy program:
@@ -1143,7 +1320,7 @@ mod tests {
         ] {
             let own = FlowCache::default();
             assert_eq!(
-                classify(&syn, false, OWN, &own, false, || tcp_dns_decision(
+                classify(&syn, false, OWN, &own, false, false, || tcp_dns_decision(
                     pid,
                     Some(why)
                 )),
@@ -1243,7 +1420,7 @@ mod tests {
                 own_pid: OWN_PID,
                 server_cache: Arc::default(),
             },
-            run: RunState::new(1),
+            run: RunState::new(1, true),
             udp,
             dns,
             cancel,
@@ -1295,18 +1472,234 @@ mod tests {
     }
 
     fn tcp_syn(local: &str, remote: &str) -> Vec<u8> {
+        tcp_pkt(local, remote, true)
+    }
+
+    /// An outbound TCP packet (SYN, or an ACK carrying "x"), IPv4 or IPv6.
+    fn tcp_pkt(local: &str, remote: &str, syn: bool) -> Vec<u8> {
         let (l, r) = (sa(local), sa(remote));
-        let ip = |a: SocketAddr| match a {
-            SocketAddr::V4(a) => a.ip().octets(),
-            SocketAddr::V6(_) => panic!("v4 only"),
+        let b = match (l, r) {
+            (SocketAddr::V4(l), SocketAddr::V4(r)) => {
+                etherparse::PacketBuilder::ipv4(l.ip().octets(), r.ip().octets(), 64)
+            }
+            (SocketAddr::V6(l), SocketAddr::V6(r)) => {
+                etherparse::PacketBuilder::ipv6(l.ip().octets(), r.ip().octets(), 64)
+            }
+            _ => panic!("mixed families"),
         };
+        let b = b.tcp(l.port(), r.port(), 1, 65535);
         let mut out = Vec::new();
-        etherparse::PacketBuilder::ipv4(ip(l), ip(r), 64)
-            .tcp(l.port(), r.port(), 1, 65535)
-            .syn()
-            .write(&mut out, b"")
-            .unwrap();
+        if syn {
+            b.syn().write(&mut out, b"").unwrap();
+        } else {
+            b.ack(1).write(&mut out, b"x").unwrap();
+        }
         out
+    }
+
+    /// `p` (IPv6/TCP) with an 8-byte hop-by-hop header before the TCP header.
+    fn with_hop_by_hop(p: &[u8]) -> Vec<u8> {
+        let mut out = p[..40].to_vec();
+        out[6] = 0; // next header: hop-by-hop
+        let len = u16::from_be_bytes([p[4], p[5]]) + 8;
+        out[4..6].copy_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&[PROTO_TCP, 0, 1, 4, 0, 0, 0, 0]); // PadN
+        out.extend_from_slice(&p[40..]);
+        out
+    }
+
+    /// `p` (IPv6/TCP) with a TCP data offset below 5: the NAT cannot parse
+    /// its ports, while the classifier still sees the flow.
+    fn with_bad_data_offset(p: &[u8]) -> Vec<u8> {
+        let mut out = p.to_vec();
+        out[40 + 12] = 4 << 4;
+        out
+    }
+
+    /// Controller ruling: on a redirected IPv6 flow, every NAT verdict
+    /// other than `Rewritten` (extension headers: `Drop`; unparsable
+    /// ports: `Pass`) is dropped, never sent.
+    #[tokio::test]
+    async fn ipv6_redirected_flow_unrewritable_packet_dropped() {
+        let h = harness();
+        let (local, dst) = ("[2001:db8::2]:43001", "[2606:4700::1]:443");
+        let out = h.route(BROWSER, PROTO_TCP, local, dst, tcp_pkt(local, dst, true));
+        assert_eq!(out, Out::Send, "SYN rewritten toward the relay");
+        assert_eq!(
+            h.run.nat.get(Family::V6, 43001).map(|o| o.dst),
+            Some(sa(dst))
+        );
+        let data = tcp_pkt(local, dst, false);
+        for (what, pkt) in [
+            ("extension header", with_hop_by_hop(&data)),
+            ("unparsable ports", with_bad_data_offset(&data)),
+        ] {
+            assert_eq!(
+                h.route(BROWSER, PROTO_TCP, local, dst, pkt),
+                Out::Drop,
+                "{what}"
+            );
+        }
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, local, dst, data),
+            Out::Send,
+            "a plain packet of the flow is rewritten"
+        );
+        // The relay's reply (A:relay_port -> D:pa) likewise.
+        let relay = format!("[2001:db8::2]:{}", h.run.relay_port);
+        let reply_to = "[2606:4700::1]:43001";
+        let reply = tcp_pkt(&relay, reply_to, false);
+        for (what, pkt) in [
+            ("extension header", with_hop_by_hop(&reply)),
+            ("unparsable ports", with_bad_data_offset(&reply)),
+        ] {
+            assert_eq!(
+                h.route(BROWSER, PROTO_TCP, &relay, reply_to, pkt),
+                Out::Drop,
+                "relay reply: {what}"
+            );
+        }
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, &relay, reply_to, reply),
+            Out::Send,
+            "a plain relay reply is restored"
+        );
+        h.cancel.cancel();
+    }
+
+    /// An IPv4 and an IPv6 socket on the same port: the own-port exemption
+    /// of one never covers the other.
+    #[tokio::test]
+    async fn own_ports_v4_v6_distinct() {
+        let h = harness();
+        let dst4 = "203.0.113.9:443";
+        let dst6 = "[2606:4700::1]:443";
+        h.shared.relay.own_ports.insert((Family::V4, 44001));
+        let (l4, l6) = ("10.0.0.2:44001", "[2001:db8::2]:44001");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l4, dst4, tcp_syn(l4, dst4)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V4, 44001).is_none(), "v4 own: passed");
+        assert_eq!(h.cached(PROTO_TCP, l4, dst4), None, "not even decided");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, dst6, tcp_pkt(l6, dst6, true)),
+            Out::Send
+        );
+        assert!(
+            h.run.nat.get(Family::V6, 44001).is_some(),
+            "v6 on the same port: redirected, not exempt"
+        );
+        h.shared.relay.own_ports.insert((Family::V6, 44002));
+        let (l4, l6) = ("10.0.0.2:44002", "[2001:db8::2]:44002");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, dst6, tcp_pkt(l6, dst6, true)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V6, 44002).is_none(), "v6 own: passed");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l4, dst4, tcp_syn(l4, dst4)),
+            Out::Send
+        );
+        assert!(
+            h.run.nat.get(Family::V4, 44002).is_some(),
+            "v4 on the same port: redirected, not exempt"
+        );
+        h.cancel.cancel();
+    }
+
+    /// Without an IPv6 relay listener, a non-Direct IPv6 SYN is dropped and
+    /// an IPv6 packet from the relay's port number is not a relay reply.
+    #[tokio::test]
+    async fn ipv6_without_relay_v6_is_dropped() {
+        let mut h = harness();
+        h.run = RunState::new(1, false);
+        let (local, dst) = ("[2001:db8::2]:45001", "[2606:4700::1]:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, local, dst, tcp_pkt(local, dst, true)),
+            Out::Drop
+        );
+        assert!(h.run.nat.get(Family::V6, 45001).is_none());
+        // A Direct app's IPv6 socket that happens to use the relay port.
+        let (l, d) = ("[2001:db8::2]:1", "[2001:db8::99]:443");
+        assert_eq!(
+            h.route(DIRECT_APP, PROTO_TCP, l, d, tcp_pkt(l, d, true)),
+            Out::Send
+        );
+        assert_eq!(h.cached(PROTO_TCP, l, d), Some(Cached::Direct));
+        h.cancel.cancel();
+    }
+
+    /// Turns "Proxy IPv6 traffic" off in the harness's live rules.
+    fn proxy_ipv6_off(h: &Harness) {
+        let mut cfg = (**h.shared.relay.cfg.load()).clone();
+        cfg.settings.proxy_ipv6 = false;
+        h.shared
+            .relay
+            .rules
+            .store(Arc::new(q2route_core::ruleset::RuleSet::compile(&cfg).unwrap()));
+    }
+
+    /// "Proxy IPv6 traffic" off: a proxied IPv6 SYN whose name is unknown
+    /// (NeedDomain) is dropped at the SYN, never accepted by the IPv6 relay,
+    /// so the app falls back to IPv4. IPv4 is still redirected.
+    #[tokio::test]
+    async fn ipv6_need_domain_syn_dropped_when_proxy_ipv6_off() {
+        let h = harness();
+        proxy_ipv6_off(&h);
+        let (l6, d6) = ("[2001:db8::2]:47001", "[2606:4700::1]:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, d6, tcp_syn(l6, d6)),
+            Out::Drop
+        );
+        assert!(h.run.nat.get(Family::V6, 47001).is_none(), "not redirected");
+        let (l4, d4) = ("10.0.0.2:47002", "1.1.1.1:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l4, d4, tcp_syn(l4, d4)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V4, 47002).is_some(), "v4 redirected");
+        h.cancel.cancel();
+    }
+
+    /// The same IPv6 TCP/443 SYN with no known name is redirected while the
+    /// setting is on (the default), and IPv6 TCP/53 still goes to the relay
+    /// when it is off (answered by name).
+    #[tokio::test]
+    async fn ipv6_syn_redirect_follows_proxy_ipv6() {
+        let h = harness();
+        let (l6, d6) = ("[2001:db8::2]:47003", "[2606:4700::1]:443");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l6, d6, tcp_syn(l6, d6)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V6, 47003).is_some(), "on: redirected");
+        proxy_ipv6_off(&h);
+        let (l, d) = ("[2001:db8::2]:47004", "[2606:4700::1111]:53");
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, l, d, tcp_syn(l, d)),
+            Out::Send
+        );
+        assert!(h.run.nat.get(Family::V6, 47004).is_some(), "TCP/53 relayed");
+        h.cancel.cancel();
+    }
+
+    #[test]
+    fn nat_lookup_by_peer_family() {
+        let nat = Arc::new(NatTable::default());
+        let o6 = OriginalDst {
+            dst: sa("[2606:4700::1]:443"),
+            pid: 9,
+        };
+        nat.insert(Family::V6, 46001, o6);
+        let l = NatLookup(nat.clone());
+        let (got, token) = l.attach(sa("[2606:4700::1]:46001")).unwrap();
+        assert_eq!(got, o6);
+        assert!(
+            l.attach(sa("1.2.3.4:46001")).is_none(),
+            "v4 peer, same port"
+        );
+        l.release(sa("[2606:4700::1]:46001"), token);
     }
 
     /// Finding 1: the proxy program's own TCP/53 (e.g. a v2ray server on
@@ -1328,7 +1721,10 @@ mod tests {
                 h.cached(PROTO_TCP, &local, "203.0.113.5:53"),
                 Some(Cached::Direct)
             );
-            assert!(h.run.nat.get(port).is_none(), "pid {pid} redirected");
+            assert!(
+                h.run.nat.get(Family::V4, port).is_none(),
+                "pid {pid} redirected"
+            );
         }
         // Any other app's TCP/53 goes to the relay (NAT entry, not Direct).
         let local = "10.0.0.2:40003";
@@ -1344,7 +1740,7 @@ mod tests {
             h.cached(PROTO_TCP, local, "203.0.113.5:53"),
             Some(Cached::Other)
         );
-        assert!(h.run.nat.get(40003).is_some());
+        assert!(h.run.nat.get(Family::V4, 40003).is_some());
         // The service itself: passed.
         let local = "10.0.0.2:40004";
         let out = h.route(
@@ -1355,7 +1751,7 @@ mod tests {
             tcp_syn(local, "203.0.113.5:53"),
         );
         assert_eq!(out, Out::Send);
-        assert!(h.run.nat.get(40004).is_none());
+        assert!(h.run.nat.get(Family::V4, 40004).is_none());
         h.cancel.cancel();
     }
 
@@ -1420,15 +1816,55 @@ mod tests {
         h.cancel.cancel();
     }
 
-    #[test]
-    fn tcp_dns_ipv6_stays_direct_m4_gap() {
-        // M4 gap (M6 adds an IPv6 relay): IPv6 TCP/53 is passed untouched.
-        assert!(ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:53", true).flow));
-        assert!(!ipv6_tcp_dns(&tcp_meta("8.8.8.8:53", true).flow));
-        assert!(!ipv6_tcp_dns(&tcp_meta("[2001:db8::53]:443", true).flow));
-        let mut udp = tcp_meta("[2001:db8::53]:53", false).flow;
-        udp.proto = PROTO_UDP;
-        assert!(!ipv6_tcp_dns(&udp));
+    /// IPv6 TCP/53 is decided by name in the relay like IPv4: any app's SYN
+    /// is redirected (NAT entry, cached non-Direct); the proxy program, the
+    /// service itself and excluded apps pass.
+    #[tokio::test]
+    async fn ipv6_tcp_dns_goes_to_relay() {
+        let h = harness();
+        let dst = "[2001:db8::53]:53";
+        for (pid, port) in [(BROWSER, 47001), (DIRECT_APP, 47002)] {
+            let local = format!("[2001:db8::2]:{port}");
+            let out = h.route(pid, PROTO_TCP, &local, dst, tcp_pkt(&local, dst, true));
+            assert_eq!(out, Out::Send, "pid {pid}: rewritten toward the relay");
+            assert_eq!(h.cached(PROTO_TCP, &local, dst), Some(Cached::Other));
+            let o = h.run.nat.get(Family::V6, port).expect("NAT entry");
+            assert_eq!(o.dst, sa(dst));
+        }
+        for (pid, port) in [(EXCLUDED, 47003), (XRAY, 47004), (OWN_PID, 47005)] {
+            let local = format!("[2001:db8::2]:{port}");
+            let out = h.route(pid, PROTO_TCP, &local, dst, tcp_pkt(&local, dst, true));
+            assert_eq!(out, Out::Send, "pid {pid}");
+            assert_eq!(h.cached(PROTO_TCP, &local, dst), Some(Cached::Direct));
+            assert!(
+                h.run.nat.get(Family::V6, port).is_none(),
+                "pid {pid} redirected"
+            );
+        }
+        h.cancel.cancel();
+    }
+
+    /// Without an IPv6 relay listener, IPv6 TCP/53 fails closed (a passed
+    /// query could carry a proxied name to the ISP); the proxy program's
+    /// still passes.
+    #[tokio::test]
+    async fn ipv6_tcp_dns_without_relay_v6_is_dropped() {
+        let mut h = harness();
+        h.run = RunState::new(1, false);
+        let dst = "[2001:db8::53]:53";
+        let local = "[2001:db8::2]:48001";
+        assert_eq!(
+            h.route(BROWSER, PROTO_TCP, local, dst, tcp_pkt(local, dst, true)),
+            Out::Drop
+        );
+        assert!(h.run.nat.get(Family::V6, 48001).is_none());
+        let local = "[2001:db8::2]:48002";
+        assert_eq!(
+            h.route(XRAY, PROTO_TCP, local, dst, tcp_pkt(local, dst, true)),
+            Out::Send
+        );
+        assert_eq!(h.cached(PROTO_TCP, local, dst), Some(Cached::Direct));
+        h.cancel.cancel();
     }
 
     #[test]
@@ -1441,7 +1877,13 @@ mod tests {
             Layer::Network,
         )
         .unwrap();
+        check_filter(
+            "outbound and !loopback and icmpv6 and icmpv6.Type == 1",
+            Layer::Network,
+        )
+        .unwrap();
         assert!(NETWORK_FILTER.contains("icmp and icmp.Type == 3"));
+        assert!(NETWORK_FILTER.contains("or (icmpv6 and icmpv6.Type == 1)"));
         assert!(check_filter("tcp and event == NOPE", Layer::Socket).is_err());
     }
 }

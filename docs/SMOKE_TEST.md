@@ -118,11 +118,24 @@ Install this update with `dist\Q2Route-update\Update.cmd`.
 | D8 | Switch v2rayN to a server with a different hostname. | It connects within ~15 s; the log shows the new name in `proxy servers resolved directly`. | |
 | D9 | Update a v2rayN subscription while the current server is unreachable; if it fails, add the subscription host to "Names always resolved directly" and retry. | The subscription updates. | |
 
+## M6: IPv6 through the proxy
+
+Install this update with `dist\Q2Route-update\Update.cmd`. On IPv6 the relay port can be reached from the internet (there is no NAT, and the firewall rule is scoped to the program, not the port); connections without a NAT entry are closed immediately, so nothing is exposed.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| V1 | `curl.exe -6 https://ifconfig.co` | Shows the proxy exit's IPv6, or fails if the server has no IPv6 — never your real IPv6. | |
+| V2 | Browser: `https://test-ipv6.com` (or browserleaks/ip). | No real IPv6 shown. | |
+| V3 | Check the service log after start. | The log shows `relay listening on <port> (IPv4+IPv6)`; on a machine without IPv6 it shows IPv4 only and nothing breaks. | |
+| V4 | `nslookup -vc example.com <your IPv6 DNS server>` (forces TCP). | It resolves; Connections shows the TCP/53 row routed via the proxy. | |
+| V5 | A proxied game over IPv6 (if available). | Connections shows its UDP rows with route Proxy. | |
+| V6 | With a VPN server that has no IPv6: browse a site that has IPv6 and use a non-web proxied app (e.g. a game or SSH to an IPv6-capable host). | Works. If it doesn't, turn off "Proxy IPv6 traffic" on the Proxies page → it works over IPv4. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
 |---|---|---|---|
-| L1 | `curl -6 https://ifconfig.co` | Fails, or never shows the real IPv6 / IPv4 (proxied IPv6 is blocked in M1). | pass: `Could not resolve host`, no IPv6 exposure. |
+| L1 | `curl -6 https://ifconfig.co` | Fails, or never shows the real IPv6 / IPv4. Since M6 see V1 (proxied IPv6 goes through the proxy). | pass: `Could not resolve host`, no IPv6 exposure. |
 | L2 | `curl -4 https://ifconfig.co` | Shows the v2ray exit IP. | inconclusive: log shows curl proxied via v2ray, but TLS failed (`CRYPT_E_REVOCATION_OFFLINE`). Retry with `curl.exe --ssl-no-revoke -4 https://ifconfig.co`. No real IP shown. |
 | L3 | Browser: `https://browserleaks.com/ip` | Only the v2ray exit IP; no real IPv4/IPv6. | pass |
 | L4 | Browser: `https://browserleaks.com/webrtc` | No real public IP in the WebRTC candidates (local/LAN addresses are fine). | pass |
