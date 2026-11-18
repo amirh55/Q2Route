@@ -18,6 +18,7 @@ use tokio::net::TcpStream;
 use crate::client::Client;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(8);
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOKUP_TRIES: u32 = 3;
 const LOOKUP_GAP: Duration = Duration::from_millis(300);
 
@@ -28,34 +29,54 @@ pub struct LeakCheck {
 
 impl LeakCheck {
     pub fn start(client: &Client) -> LeakCheck {
+        let client = client.clone();
+        Self::start_with(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return cant_tell(format!("Can't tell: {e}")),
+            };
+            let v = rt
+                .block_on(tokio::time::timeout(OVERALL_TIMEOUT, run(client)))
+                .unwrap_or_else(|_| cant_tell("Can't tell: the check timed out".into()));
+            // A hung blocking DNS call must not delay delivery of `v`.
+            rt.shutdown_background();
+            v
+        })
+    }
+
+    fn start_with(runner: impl FnOnce() -> Verdict + Send + 'static) -> LeakCheck {
         let result = Arc::new(Mutex::new(None));
-        let (out, client) = (result.clone(), client.clone());
+        let out = result.clone();
         let spawned = std::thread::Builder::new()
             .name("q2route-leak".into())
             .spawn(move || {
-                let v = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt.block_on(run(client)),
-                    Err(e) => cant_tell(format!("Can't tell: {e}")),
-                };
-                *out.lock().expect("leak result lock") = Some(v);
+                let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(runner))
+                    .unwrap_or_else(|_| {
+                        cant_tell("Can't tell: the check failed unexpectedly".into())
+                    });
+                *lock(&out) = Some(v);
             });
         if let Err(e) = spawned {
-            *result.lock().expect("leak result lock") = Some(cant_tell(format!("Can't tell: {e}")));
+            *lock(&result) = Some(cant_tell(format!("Can't tell: {e}")));
         }
         LeakCheck { result }
     }
 
     /// `Some` once the check is done.
     pub fn poll(&self) -> Option<Verdict> {
-        self.result.lock().expect("leak result lock").clone()
+        lock(&self.result).clone()
     }
 
     pub fn running(&self) -> bool {
         self.poll().is_none()
     }
+}
+
+fn lock(m: &Mutex<Option<Verdict>>) -> std::sync::MutexGuard<'_, Option<Verdict>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn cant_tell(headline: String) -> Verdict {
@@ -74,7 +95,12 @@ pub fn find_route(
     local: SocketAddr,
     groups: &[(String, String)],
 ) -> ProbeRoute {
-    let Some(c) = conns.iter().find(|c| c.pid == pid && c.local == local) else {
+    // Prefer a live entry, then the most recently started one.
+    let best = conns
+        .iter()
+        .filter(|c| c.pid == pid && c.local == local)
+        .max_by_key(|c| (c.ended_ms.is_none(), c.started_ms));
+    let Some(c) = best else {
         return ProbeRoute::Unknown;
     };
     let group = match &c.group_id {
@@ -339,7 +365,7 @@ fn query_txt(name: &str) -> Result<Vec<String>, String> {
             let r = &*rec;
             if r.wType == DNS_TYPE_TEXT {
                 let txt = &r.Data.TXT;
-                let strings = txt.pStringArray.as_ptr();
+                let strings = std::ptr::addr_of!(txt.pStringArray) as *const *mut u16;
                 for i in 0..txt.dwStringCount as usize {
                     let p = *strings.add(i);
                     if p.is_null() {
@@ -420,6 +446,37 @@ mod tests {
         );
         assert_eq!(find_route(&d, 8, local, &groups), ProbeRoute::Unknown);
         assert_eq!(find_route(&[], 7, local, &groups), ProbeRoute::Unknown);
+    }
+
+    #[test]
+    fn route_lookup_prefers_live_then_newest() {
+        let local: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        let mut old_live = conn(7, "10.0.0.2:5555", Route::Direct, None);
+        old_live.started_ms = 1;
+        let mut new_ended = conn(7, "10.0.0.2:5555", Route::Block, None);
+        new_ended.started_ms = 9;
+        new_ended.ended_ms = Some(10);
+        let mut newer_live = conn(7, "10.0.0.2:5555", Route::Proxy("p".into()), None);
+        newer_live.started_ms = 5;
+        let r = find_route(&[old_live.clone(), new_ended.clone()], 7, local, &[]);
+        assert!(matches!(r, ProbeRoute::Direct { .. }));
+        let r = find_route(&[old_live, new_ended, newer_live], 7, local, &[]);
+        assert!(matches!(r, ProbeRoute::Proxy { .. }));
+    }
+
+    #[test]
+    fn panicking_runner_ends_with_cant_tell() {
+        let c = LeakCheck::start_with(|| panic!("boom"));
+        for _ in 0..200 {
+            if !c.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!c.running());
+        let v = c.poll().unwrap();
+        assert_eq!(v.level, Level::CantTell);
+        assert!(v.headline.contains("failed unexpectedly"));
     }
 
     #[tokio::test]
