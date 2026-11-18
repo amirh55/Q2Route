@@ -12,7 +12,7 @@ use crate::client::Client;
 use crate::views::dashboard::{self, action_switch, rule_summary};
 
 const HINT: &str = "One per line. Apps: steam.exe, C:\\Games\\x.exe or a folder ending in \\. \
-Domains: example.com, *.ir, keyword:steam. IPs: 1.2.3.4, 5.0.0.0/8, geoip:ir. \
+Domains: example.com, *.ir, keyword:steam, geosite:ir. IPs: 1.2.3.4, 5.0.0.0/8, geoip:ir. \
 Ports: 443 or 27000-27100.";
 const LIST_WIDTH: f32 = 300.0;
 
@@ -550,13 +550,19 @@ mod tests {
 
     #[test]
     fn move_buttons_respect_edges_and_catch_all() {
-        // Seed: three movable groups then the catch-all.
+        // Seed: four movable groups then the catch-all.
         let g = Config::seed().groups;
-        assert_eq!(g.len(), 4);
-        let m: Vec<_> = (0..4).map(|i| can_move(&g, i)).collect();
+        assert_eq!(g.len(), 5);
+        let m: Vec<_> = (0..5).map(|i| can_move(&g, i)).collect();
         assert_eq!(
             m,
-            [(false, true), (true, true), (true, false), (false, false)]
+            [
+                (false, true),
+                (true, true),
+                (true, true),
+                (true, false),
+                (false, false)
+            ]
         );
     }
 }

@@ -412,8 +412,8 @@ fn route_packet(
     // TCP/53, which the relay answers by name over IPv4) is dropped at once,
     // so the app falls back to IPv4 (Happy Eyeballs) instead of connecting
     // to the relay and being closed. Relay replies above stay on `run.relay_v6`.
-    let relay_v6 = run.relay_v6
-        && (fam == Family::V4 || tcp_dns || shared.relay.rules.load().proxy_ipv6);
+    let relay_v6 =
+        run.relay_v6 && (fam == Family::V4 || tcp_dns || shared.relay.rules.load().proxy_ipv6);
     let action = classify(
         &m,
         own_port,
@@ -1634,10 +1634,9 @@ mod tests {
     fn proxy_ipv6_off(h: &Harness) {
         let mut cfg = (**h.shared.relay.cfg.load()).clone();
         cfg.settings.proxy_ipv6 = false;
-        h.shared
-            .relay
-            .rules
-            .store(Arc::new(q2route_core::ruleset::RuleSet::compile(&cfg).unwrap()));
+        h.shared.relay.rules.store(Arc::new(
+            q2route_core::ruleset::RuleSet::compile(&cfg).unwrap(),
+        ));
     }
 
     /// "Proxy IPv6 traffic" off: a proxied IPv6 SYN whose name is unknown
@@ -1676,10 +1675,7 @@ mod tests {
         assert!(h.run.nat.get(Family::V6, 47003).is_some(), "on: redirected");
         proxy_ipv6_off(&h);
         let (l, d) = ("[2001:db8::2]:47004", "[2606:4700::1111]:53");
-        assert_eq!(
-            h.route(BROWSER, PROTO_TCP, l, d, tcp_syn(l, d)),
-            Out::Send
-        );
+        assert_eq!(h.route(BROWSER, PROTO_TCP, l, d, tcp_syn(l, d)), Out::Send);
         assert!(h.run.nat.get(Family::V6, 47004).is_some(), "TCP/53 relayed");
         h.cancel.cancel();
     }

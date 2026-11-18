@@ -221,7 +221,13 @@ impl Default for Settings {
 
 /// Bumped when the seed gains something existing configs should get too
 /// (see [`Config::migrate`]). 1: `geoip:ir` in "Iranian sites".
-pub const SEED_VERSION: u32 = 1;
+/// 2: `geosite:ir` in "Iranian sites", `geosite:steam` in "Steam", the
+/// "Shared names (not Iranian)" group.
+pub const SEED_VERSION: u32 = 2;
+
+/// Roots anyone can register under; `geosite:ir` lists them, but they are
+/// not Iranian, so the seed proxies them ahead of "Iranian sites".
+const NOT_IRANIAN: [&str; 4] = ["*.co.com", "*.pe.hu", "*.info.com", "*.f.com"];
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
@@ -267,13 +273,24 @@ impl Config {
             }],
             groups: vec![
                 group(
+                    "not-iranian",
+                    "Shared names (not Iranian)",
+                    true,
+                    Action::Proxy("v2ray".into()),
+                    vec![Rule {
+                        domains: NOT_IRANIAN.iter().map(|d| d.to_string()).collect(),
+                        ..Rule::default()
+                    }],
+                    false,
+                ),
+                group(
                     "iranian-sites",
                     "Iranian sites",
                     true,
                     Action::Direct,
                     vec![
                         Rule {
-                            domains: vec!["*.ir".into()],
+                            domains: vec!["*.ir".into(), "geosite:ir".into()],
                             ..Rule::default()
                         },
                         Rule {
@@ -288,11 +305,17 @@ impl Config {
                     "Steam",
                     false,
                     Action::Direct,
-                    vec![Rule {
-                        apps: vec!["steam.exe".into()],
-                        include_children: true,
-                        ..Rule::default()
-                    }],
+                    vec![
+                        Rule {
+                            apps: vec!["steam.exe".into()],
+                            include_children: true,
+                            ..Rule::default()
+                        },
+                        Rule {
+                            domains: vec!["geosite:steam".into()],
+                            ..Rule::default()
+                        },
+                    ],
                     false,
                 ),
                 group("games", "Games", true, Action::Direct, vec![], false),
@@ -327,8 +350,11 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let mut c: Config = toml::from_str(&s)?;
+                // Migrate first: it drops entries older versions accepted
+                // and validation now rejects.
+                let migrated = c.migrate();
                 c.validate()?;
-                if c.migrate() {
+                if migrated {
                     c.save(path)?;
                 }
                 Ok(c)
@@ -358,6 +384,61 @@ impl Config {
                 if !has {
                     g.rules.push(Rule {
                         ips: vec!["geoip:ir".into()],
+                        ..Rule::default()
+                    });
+                }
+            }
+        }
+        if self.seed_version < 2 {
+            self.settings
+                .dns
+                .direct_names
+                .retain(|n| !matches!(DomainPattern::parse(n), Ok(DomainPattern::Geo { .. })));
+            if !self.groups.iter().any(|g| g.id == "not-iranian") {
+                if let Some(at) = self.groups.iter().position(|g| g.id == "iranian-sites") {
+                    self.groups.insert(
+                        at,
+                        Group {
+                            id: "not-iranian".into(),
+                            name: "Shared names (not Iranian)".into(),
+                            enabled: true,
+                            action: Action::Proxy(self.default_proxy.clone()),
+                            rules: vec![Rule {
+                                domains: NOT_IRANIAN.iter().map(|d| d.to_string()).collect(),
+                                ..Rule::default()
+                            }],
+                            catch_all: false,
+                        },
+                    );
+                }
+            }
+            let has = |g: &Group, code: &str| {
+                g.rules.iter().any(|r| {
+                    r.domains
+                        .iter()
+                        .any(|d| d.trim().eq_ignore_ascii_case(code))
+                })
+            };
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == "iranian-sites") {
+                if !has(g, "geosite:ir") {
+                    let holder = g.rules.iter_mut().find(|r| {
+                        r.domains
+                            .iter()
+                            .any(|d| d.trim().eq_ignore_ascii_case("*.ir"))
+                    });
+                    match holder {
+                        Some(r) => r.domains.push("geosite:ir".into()),
+                        None => g.rules.push(Rule {
+                            domains: vec!["geosite:ir".into()],
+                            ..Rule::default()
+                        }),
+                    }
+                }
+            }
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == "steam") {
+                if !has(g, "geosite:steam") {
+                    g.rules.push(Rule {
+                        domains: vec!["geosite:steam".into()],
                         ..Rule::default()
                     });
                 }
@@ -422,9 +503,14 @@ impl Config {
         if let Some(n) = dns
             .direct_names
             .iter()
-            .find(|n| DomainPattern::parse(n).is_err())
+            .find(|n| !matches!(DomainPattern::parse(n), Ok(p) if !matches!(p, DomainPattern::Geo { .. })))
         {
-            return bad(format!("DNS direct name '{n}' is not a valid domain"));
+            let hint = if matches!(DomainPattern::parse(n), Ok(DomainPattern::Geo { .. })) {
+                " (geosite: lists are not supported here)"
+            } else {
+                ""
+            };
+            return bad(format!("DNS direct name '{n}' is not a valid domain{hint}"));
         }
         // Ruling R18: an enabled catch-all must always exist, so unmatched
         // traffic is never silently routed some other way.

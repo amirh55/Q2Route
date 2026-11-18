@@ -8,7 +8,12 @@ use std::path::PathBuf;
 
 fn cfg() -> Config {
     let mut c = Config::seed();
+    // The shared-names exception has its own test; these index the others.
+    c.groups.remove(0);
     c.set_group_enabled("steam", true).unwrap();
+    // These tests exercise the app rule; the seed's geosite:steam rule would
+    // make unknown domains matter (it has its own tests).
+    c.groups[1].rules.truncate(1);
     c.groups.insert(
         2,
         Group {
@@ -595,7 +600,7 @@ fn d_geo(proto: Protocol, pid: u32, dst: &str, domain: Option<&str>) -> Decision
         IpSet::from_cidrs(&[("185.188.104.0".parse().unwrap(), 22)]),
     )]);
     run(
-        &RuleSet::compile_with(&cfg(), &geo).unwrap(),
+        &RuleSet::compile_with(&cfg(), &geo, &Default::default()).unwrap(),
         &HashSet::new(),
         proto,
         pid,
@@ -880,4 +885,155 @@ fn mapped_direct_name_on_web_port_still_peeks() {
         dm(40, "5.6.7.8:443", &["example.com"], &rs),
         Decision::Final(Route::Proxy(_), _)
     ));
+}
+
+fn geo_cfg(c: &Config, with_data: bool) -> RuleSet {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let sites = if with_data {
+        GeoSite::from_sets([(
+            "ir".to_string(),
+            DomainSet::from_entries(&[], &["digikala.com"], &[]),
+        )])
+    } else {
+        GeoSite::default()
+    };
+    RuleSet::compile_with(c, &q2route_core::geoip::GeoIp::default(), &sites).unwrap()
+}
+
+#[test]
+fn geosite_ir_direct() {
+    let rs = geo_cfg(&cfg(), true);
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            Some("www.digikala.com")
+        ),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn shared_names_in_geosite_ir_are_proxied_not_direct() {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let sites = GeoSite::from_sets([(
+        "ir".to_string(),
+        DomainSet::from_entries(&[], &["co.com", "digikala.com"], &[]),
+    )]);
+    let rs = RuleSet::compile_with(
+        &Config::seed(),
+        &q2route_core::geoip::GeoIp::default(),
+        &sites,
+    )
+    .unwrap();
+    let go = |host| {
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            Some(host),
+        )
+    };
+    assert_eq!(
+        go("shop.co.com"),
+        fin(proxy(), Some("not-iranian"), MatchReason::Own)
+    );
+    assert_eq!(
+        go("www.digikala.com"),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn geosite_missing_data_goes_to_proxy() {
+    let rs = geo_cfg(&cfg(), false);
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            Some("www.digikala.com")
+        ),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+}
+
+#[test]
+fn geosite_rule_needs_domain_like_suffix() {
+    let rs = geo_cfg(&cfg(), true);
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            None
+        ),
+        Decision::NeedDomain
+    );
+}
+
+#[test]
+fn geosite_and_port_anded() {
+    let mut c = cfg();
+    c.groups[0].rules = vec![Rule {
+        domains: vec!["geosite:ir".into()],
+        ports: vec!["8443".into()],
+        ..Rule::default()
+    }];
+    let rs = geo_cfg(&c, true);
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            Some("www.digikala.com")
+        ),
+        fin(proxy(), Some("everything-else"), MatchReason::CatchAll)
+    );
+    assert_eq!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:8443",
+            Some("www.digikala.com")
+        ),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn seed_steam_geosite_end_to_end() {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let mut c = Config::seed();
+    c.set_group_enabled("steam", true).unwrap();
+    let sites = GeoSite::from_sets([
+        (
+            "steam".to_string(),
+            DomainSet::from_entries(&[], &["steampowered.com"], &[]),
+        ),
+        (
+            "ir".to_string(),
+            DomainSet::from_entries(&[], &["digikala.com"], &[]),
+        ),
+    ]);
+    let rs = RuleSet::compile_with(&c, &q2route_core::geoip::GeoIp::default(), &sites).unwrap();
+    let go = |dst, dom| run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, dom);
+    assert_eq!(
+        go("34.160.111.145:443", Some("store.steampowered.com")),
+        fin(Route::Direct, Some("steam"), MatchReason::Own)
+    );
+    assert_eq!(go("34.160.111.145:443", None), Decision::NeedDomain);
 }

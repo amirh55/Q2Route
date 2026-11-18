@@ -260,7 +260,13 @@ mod tests {
         let labels: Vec<&str> = m.groups.iter().map(|(_, l, _)| l.as_str()).collect();
         assert_eq!(
             labels,
-            ["Iranian sites", "Steam (off)", "Games", "Everything else"]
+            [
+                "Shared names (not Iranian)",
+                "Iranian sites",
+                "Steam (off)",
+                "Games",
+                "Everything else"
+            ]
         );
     }
 

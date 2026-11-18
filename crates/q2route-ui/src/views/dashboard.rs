@@ -14,6 +14,14 @@ pub const BLOCK: Color32 = Color32::from_rgb(0xb7, 0x3a, 0x3a);
 const CARD: Color32 = Color32::from_rgb(0x26, 0x27, 0x2d);
 const CARD_WIDTH: f32 = 250.0;
 
+/// `s` without the ASCII `prefix`, matched case-insensitively.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let n = prefix.len();
+    s.get(..n)
+        .filter(|h| h.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[n..])
+}
+
 /// One rule as a line, e.g. `steam.exe + children + port 443`.
 pub fn rule_summary(r: &Rule) -> String {
     let mut parts = vec![];
@@ -25,11 +33,22 @@ pub fn rule_summary(r: &Rule) -> String {
             apps
         });
     }
-    parts.extend(r.domains.iter().cloned());
-    parts.extend(r.ips.iter().map(|i| match i.trim().strip_prefix("geoip:") {
-        Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
-        None => i.clone(),
-    }));
+    parts.extend(
+        r.domains
+            .iter()
+            .map(|d| match strip_prefix_ci(d.trim(), "geosite:") {
+                Some(code) => format!("GeoSite {}", code.trim().to_uppercase()),
+                None => d.clone(),
+            }),
+    );
+    parts.extend(
+        r.ips
+            .iter()
+            .map(|i| match strip_prefix_ci(i.trim(), "geoip:") {
+                Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
+                None => i.clone(),
+            }),
+    );
     if !r.ports.is_empty() {
         parts.push(format!("port {}", r.ports.join(", ")));
     }
@@ -278,8 +297,9 @@ mod tests {
         assert_eq!(
             s,
             [
-                "*.ir; GeoIP IR",
-                "steam.exe + children",
+                "*.co.com + *.pe.hu + *.info.com + *.f.com",
+                "*.ir + GeoSite IR; GeoIP IR",
+                "steam.exe + children; GeoSite STEAM",
                 "No rules yet",
                 "catch-all"
             ]
@@ -287,9 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn rule_summary_geosite_attr() {
+        let rule = Rule {
+            domains: vec!["geosite:ads@ads".into()],
+            ..Rule::default()
+        };
+        assert_eq!(rule_summary(&rule), "GeoSite ADS@ADS");
+    }
+
+    #[test]
+    fn rule_summary_geo_prefix_is_case_insensitive() {
+        let rule = Rule {
+            domains: vec!["GEOSITE:ir".into()],
+            ips: vec!["GEOIP:ir".into()],
+            ..Rule::default()
+        };
+        assert_eq!(rule_summary(&rule), "GeoSite IR + GeoIP IR");
+        let rule = Rule {
+            domains: vec!["GEOSITE:ir".into()],
+            ..Rule::default()
+        };
+        assert_eq!(rule_summary(&rule), "GeoSite IR");
+        let rule = Rule {
+            ips: vec!["GEOIP:ir".into()],
+            ..Rule::default()
+        };
+        assert_eq!(rule_summary(&rule), "GeoIP IR");
+    }
+
+    #[test]
     fn catch_all_has_no_enabled_toggle() {
         let cfg = Config::seed();
         let shown: Vec<bool> = cfg.groups.iter().map(has_enabled_toggle).collect();
-        assert_eq!(shown, [true, true, true, false]);
+        assert_eq!(shown, [true, true, true, true, false]);
     }
 }
