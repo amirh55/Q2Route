@@ -24,6 +24,7 @@ struct Shared {
     latest: Mutex<Option<StateSnapshot>>,
 }
 
+#[derive(Clone)]
 pub struct Client {
     tx: mpsc::UnboundedSender<Job>,
     shared: Arc<Shared>,
