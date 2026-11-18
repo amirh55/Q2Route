@@ -288,3 +288,78 @@ fn verdict_no_ipv6_line() {
     let v = verdict(&base());
     assert_eq!(v.lines[2], "IPv6: none (nothing to leak)");
 }
+
+#[tokio::test]
+async fn http_huge_chunk_size_is_error_not_panic() {
+    let (c, _h) = serve(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nabc".to_vec(),
+    )
+    .await;
+    assert!(matches!(
+        http_get(c, "h", "/").await,
+        Err(LeakError::Http(_))
+    ));
+}
+
+#[tokio::test]
+async fn http_truncated_chunked_is_error() {
+    let (c, _h) =
+        serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc".to_vec()).await;
+    assert!(matches!(
+        http_get(c, "h", "/").await,
+        Err(LeakError::Http(_))
+    ));
+}
+
+#[tokio::test]
+async fn http_eof_before_content_length_is_error() {
+    let (c, _h) = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc".to_vec()).await;
+    assert!(matches!(
+        http_get(c, "h", "/").await,
+        Err(LeakError::Http(_))
+    ));
+}
+
+#[tokio::test]
+async fn http_chunk_extension_and_mixed_case_headers() {
+    let (c, _h) = serve(
+        b"HTTP/1.1 200 OK\r\ntRaNsFeR-eNcOdInG: Chunked\r\n\r\n3;ext=1\r\nabc\r\n0\r\n\r\n"
+            .to_vec(),
+    )
+    .await;
+    assert_eq!(http_get(c, "h", "/").await.unwrap(), "abc");
+    let (c, _h) = serve(b"HTTP/1.1 200 OK\r\ncontent-LENGTH: 2\r\n\r\nokXX".to_vec()).await;
+    assert_eq!(http_get(c, "h", "/").await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn http_bad_content_length_is_error() {
+    let (c, _h) = serve(b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nxyz".to_vec()).await;
+    assert!(matches!(
+        http_get(c, "h", "/").await,
+        Err(LeakError::Http(_))
+    ));
+}
+
+#[test]
+fn verdict_direct_failed_is_cant_tell() {
+    let mut i = base();
+    i.ipv4 = failed(direct());
+    assert_eq!(verdict(&i).level, Level::CantTell);
+}
+
+#[test]
+fn verdict_ipv4_failed_ipv6_ir_is_leak() {
+    let mut i = base();
+    i.ipv4 = failed(proxy());
+    i.ipv6 = got(info("2a00::1", "IR", "Iran", "X"), proxy());
+    assert_eq!(verdict(&i).level, Level::Leak);
+}
+
+#[test]
+fn verdict_ipv4_none_never_names_dns_ip() {
+    let mut i = base();
+    i.ipv4 = no_v6();
+    let v = verdict(&i);
+    assert!(!v.headline.contains("141.98.7.5"));
+}

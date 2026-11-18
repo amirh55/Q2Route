@@ -60,6 +60,9 @@ fn dechunk(mut b: &[u8]) -> Result<Option<Vec<u8>>, LeakError> {
         if size == 0 {
             return Ok(Some(out));
         }
+        if size > MAX_RESPONSE {
+            return Err(LeakError::Http("chunk too large".into()));
+        }
         if b.len() < size + 2 {
             return Ok(None);
         }
@@ -95,7 +98,10 @@ fn parse_response(buf: &[u8], eof: bool) -> Result<Parsed, LeakError> {
         if let Some((k, v)) = l.split_once(':') {
             let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
             if k == "content-length" {
-                content_length = v.parse::<usize>().ok();
+                content_length = Some(
+                    v.parse::<usize>()
+                        .map_err(|_| LeakError::Http("bad content-length".into()))?,
+                );
             } else if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
                 chunked = true;
             }
@@ -334,16 +340,6 @@ pub fn verdict(i: &LeakInputs) -> Verdict {
         );
     }
     if let ProbeOutcome::Got(info) = &i.ipv4.outcome {
-        return mk(
-            Level::NoLeak,
-            format!("No leak: proxied apps appear as {}", describe(info)),
-        );
-    }
-    // IPv4 gave nothing; judge by the other probes.
-    if let Some(info) = probes.iter().find_map(|(_, p)| match &p.outcome {
-        ProbeOutcome::Got(i) => Some(i),
-        _ => None,
-    }) {
         return mk(
             Level::NoLeak,
             format!("No leak: proxied apps appear as {}", describe(info)),
