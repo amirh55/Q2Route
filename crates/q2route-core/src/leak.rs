@@ -1,6 +1,6 @@
 //! Leak check: tiny HTTP/1.1 client, response parsers and the verdict logic.
 //!
-//! Pure logic only; the service performs the actual probes.
+//! Pure logic only; the UI process performs the actual probes.
 
 use serde::Deserialize;
 use std::net::IpAddr;
@@ -80,7 +80,7 @@ enum Parsed {
 fn parse_response(buf: &[u8], eof: bool) -> Result<Parsed, LeakError> {
     let Some(h_end) = find(buf, b"\r\n\r\n") else {
         return if eof {
-            Err(LeakError::Http("truncated headers".into()))
+            Err(LeakError::Io("connection closed before the headers".into()))
         } else {
             Ok(Parsed::NeedMore)
         };
@@ -111,14 +111,14 @@ fn parse_response(buf: &[u8], eof: bool) -> Result<Parsed, LeakError> {
     let bytes = if chunked {
         match dechunk(body)? {
             Some(b) => b,
-            None if eof => return Err(LeakError::Http("truncated chunked body".into())),
+            None if eof => return Err(LeakError::Io("truncated chunked body".into())),
             None => return Ok(Parsed::NeedMore),
         }
     } else if let Some(n) = content_length {
         if body.len() >= n {
             body[..n].to_vec()
         } else if eof {
-            return Err(LeakError::Http("truncated body".into()));
+            return Err(LeakError::Io("truncated body".into()));
         } else {
             return Ok(Parsed::NeedMore);
         }
@@ -218,16 +218,25 @@ pub fn parse_resolver_txt(strings: &[String]) -> (Option<IpAddr>, Option<IpAddr>
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProbeRoute {
-    Proxy { group: String },
-    Block { group: String },
-    Direct { group: String },
+    Proxy {
+        group: String,
+    },
+    Block {
+        group: String,
+    },
+    /// `group` is `None` for an always-direct app or a connection that
+    /// matched no group.
+    Direct {
+        group: Option<String>,
+    },
     Unknown,
 }
 
 impl ProbeRoute {
     fn group(&self) -> Option<&str> {
         match self {
-            Self::Proxy { group } | Self::Block { group } | Self::Direct { group } => Some(group),
+            Self::Proxy { group } | Self::Block { group } => Some(group),
+            Self::Direct { group } => group.as_deref(),
             Self::Unknown => None,
         }
     }
@@ -239,8 +248,21 @@ impl ProbeRoute {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProbeOutcome {
     Got(IpInfo),
+    /// Not reached, or no full answer (connect, timeout, I/O).
     Failed(String),
+    /// Reached, but the service answered with an error (e.g. HTTP 429).
+    Refused(String),
     NoIpv6,
+}
+
+impl ProbeOutcome {
+    /// `Failed` for connect/timeout/I-O errors, `Refused` for HTTP/parse errors.
+    pub fn from_error(e: &LeakError) -> ProbeOutcome {
+        match e {
+            LeakError::Http(m) | LeakError::Parse(m) => ProbeOutcome::Refused(m.clone()),
+            LeakError::Io(_) | LeakError::Timeout => ProbeOutcome::Failed(e.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -253,8 +275,13 @@ pub struct Probe {
 pub struct LeakInputs {
     pub running: bool,
     pub ipv4: Probe,
-    /// `Got` is the resolver's geolocation.
+    /// `Got` is the resolver's geolocation. Its route is the route of the
+    /// geolocation connection, used only for the honesty rules (the DNS query
+    /// itself is routed by name).
     pub dns: Probe,
+    /// The resolver's EDNS client subnet (network address) and its
+    /// geolocation, when the TXT answer carried one.
+    pub dns_subnet: Option<(IpAddr, Probe)>,
     pub ipv6: Probe,
 }
 
@@ -276,12 +303,22 @@ fn describe(i: &IpInfo) -> String {
     format!("{} ({}, {})", i.ip, i.country, i.isp)
 }
 
-fn line(label: &str, p: &Probe) -> String {
-    let body = match &p.outcome {
-        ProbeOutcome::Got(i) if label == "DNS" => format!("resolver {}", describe(i)),
+fn outcome_text(o: &ProbeOutcome) -> String {
+    match o {
         ProbeOutcome::Got(i) => describe(i),
         ProbeOutcome::Failed(e) => format!("failed ({e})"),
+        ProbeOutcome::Refused(e) => format!("service error: {e}"),
         ProbeOutcome::NoIpv6 => "none (nothing to leak)".to_string(),
+    }
+}
+
+/// IPv4/IPv6 line. A Direct-routed address is the real one, so it is never shown.
+fn addr_line(label: &str, p: &Probe) -> String {
+    let body = match (&p.route, &p.outcome) {
+        (ProbeRoute::Direct { .. }, ProbeOutcome::Got(_)) => {
+            "address not shown (routed Direct)".to_string()
+        }
+        (_, o) => outcome_text(o),
     };
     match p.route.group() {
         Some(g) => format!("{label}: {body} \u{2014} via {g}"),
@@ -289,55 +326,105 @@ fn line(label: &str, p: &Probe) -> String {
     }
 }
 
+/// No route suffix: the DNS query is routed by name, not by this process's route.
+fn dns_line(dns: &Probe, subnet: Option<&(IpAddr, Probe)>) -> String {
+    let mut s = match &dns.outcome {
+        ProbeOutcome::Got(i) => format!("DNS: resolver {}", describe(i)),
+        o => format!("DNS: {}", outcome_text(o)),
+    };
+    if let Some((net, p)) = subnet {
+        match &p.outcome {
+            ProbeOutcome::Got(i) => s.push_str(&format!("; client subnet {net} ({})", i.country)),
+            o => s.push_str(&format!("; client subnet {net}: {}", outcome_text(o))),
+        }
+    }
+    s
+}
+
 fn is_home(p: &Probe) -> bool {
     matches!(&p.outcome, ProbeOutcome::Got(i) if i.country_code.eq_ignore_ascii_case(HOME_COUNTRY))
 }
 
+const UNCONFIRMED: &str = "Can't tell: couldn't confirm how this check was routed";
+const NOT_THROUGH: &str = "No leak, but proxied traffic isn't getting through";
+
+fn direct_headline(r: &ProbeRoute) -> String {
+    match r.group() {
+        Some(g) => format!("Can't tell: this check was routed Direct by \"{g}\""),
+        None => "Can't tell: this check was routed Direct (always-direct app or no group)".into(),
+    }
+}
+
 pub fn verdict(i: &LeakInputs) -> Verdict {
+    if !i.running {
+        return Verdict {
+            level: Level::CantTell,
+            headline: "Can't tell: Q2Route is stopped (everything goes direct)".into(),
+            lines: Vec::new(),
+        };
+    }
+    // IPv4 routed Direct: the other probes say nothing about proxied apps,
+    // and no line may show the real address.
+    if i.ipv4.route.is_direct() {
+        return Verdict {
+            level: Level::CantTell,
+            headline: direct_headline(&i.ipv4.route),
+            lines: vec![addr_line("IPv4", &i.ipv4)],
+        };
+    }
     let lines = vec![
-        line("IPv4", &i.ipv4),
-        line("DNS", &i.dns),
-        line("IPv6", &i.ipv6),
+        addr_line("IPv4", &i.ipv4),
+        dns_line(&i.dns, i.dns_subnet.as_ref()),
+        addr_line("IPv6", &i.ipv6),
     ];
     let mk = |level, headline: String| Verdict {
         level,
         headline,
         lines: lines.clone(),
     };
-    if !i.running {
-        return mk(
-            Level::CantTell,
-            "Can't tell: Q2Route is stopped (everything goes direct)".into(),
-        );
+
+    let mut probes = vec![("IPv4", &i.ipv4), ("DNS", &i.dns)];
+    probes.extend(i.dns_subnet.as_ref().map(|(_, p)| ("DNS", p)));
+    probes.push(("IPv6", &i.ipv6));
+
+    let mut leaks: Vec<&str> = Vec::new();
+    for (n, p) in &probes {
+        if is_home(p) && !p.route.is_direct() && !leaks.contains(n) {
+            leaks.push(n);
+        }
     }
-    let probes = [("IPv4", &i.ipv4), ("DNS", &i.dns), ("IPv6", &i.ipv6)];
-    let leaks: Vec<&str> = probes
-        .iter()
-        .filter(|(_, p)| is_home(p) && !p.route.is_direct())
-        .map(|(n, _)| *n)
-        .collect();
     if !leaks.is_empty() {
         return mk(
             Level::Leak,
-            format!("LEAK: {} show your Iranian IP", leaks.join(", ")),
+            format!("LEAK: {} appear from Iran", leaks.join(", ")),
         );
     }
-    // IPv4 first, then whichever other probe was routed Direct.
-    let direct = probes
+    if let Some((_, p)) = probes
         .iter()
-        .map(|(_, p)| *p)
-        .find(|p| p.route.is_direct() && p.outcome != ProbeOutcome::NoIpv6);
-    if let Some(g) = direct.and_then(|p| p.route.group()) {
-        return mk(
-            Level::CantTell,
-            format!("Can't tell: this check was routed Direct by \"{g}\""),
-        );
+        .find(|(_, p)| p.route.is_direct() && p.outcome != ProbeOutcome::NoIpv6)
+    {
+        return mk(Level::CantTell, direct_headline(&p.route));
     }
-    if let ProbeOutcome::Failed(_) = i.ipv4.outcome {
-        return mk(
-            Level::NoLeak,
-            "No leak, but proxied traffic isn't getting through".into(),
-        );
+    // In probe order (IPv4 first): an unconfirmed route or a service error
+    // means we can't tell; a proxied IPv4 failure means traffic isn't getting through.
+    for (n, p) in &probes {
+        match &p.outcome {
+            ProbeOutcome::Failed(_) | ProbeOutcome::Refused(_)
+                if p.route == ProbeRoute::Unknown =>
+            {
+                return mk(Level::CantTell, UNCONFIRMED.into());
+            }
+            ProbeOutcome::Refused(e) => {
+                return mk(
+                    Level::CantTell,
+                    format!("Can't tell: the IP service answered with an error ({e})"),
+                );
+            }
+            ProbeOutcome::Failed(_) if *n == "IPv4" => {
+                return mk(Level::NoLeak, NOT_THROUGH.into());
+            }
+            _ => {}
+        }
     }
     if let ProbeOutcome::Got(info) = &i.ipv4.outcome {
         return mk(
@@ -349,10 +436,7 @@ pub fn verdict(i: &LeakInputs) -> Verdict {
         .iter()
         .any(|(_, p)| matches!(p.outcome, ProbeOutcome::Failed(_)))
     {
-        return mk(
-            Level::NoLeak,
-            "No leak, but proxied traffic isn't getting through".into(),
-        );
+        return mk(Level::NoLeak, NOT_THROUGH.into());
     }
     mk(
         Level::CantTell,

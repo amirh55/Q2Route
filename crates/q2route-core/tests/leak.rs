@@ -136,7 +136,7 @@ fn proxy() -> ProbeRoute {
 }
 fn direct() -> ProbeRoute {
     ProbeRoute::Direct {
-        group: "direct".into(),
+        group: Some("direct".into()),
     }
 }
 fn got(i: IpInfo, route: ProbeRoute) -> Probe {
@@ -151,6 +151,12 @@ fn failed(route: ProbeRoute) -> Probe {
         route,
     }
 }
+fn refused(route: ProbeRoute) -> Probe {
+    Probe {
+        outcome: ProbeOutcome::Refused("status HTTP/1.1 429 Too Many Requests".into()),
+        route,
+    }
+}
 fn no_v6() -> Probe {
     Probe {
         outcome: ProbeOutcome::NoIpv6,
@@ -162,6 +168,7 @@ fn base() -> LeakInputs {
         running: true,
         ipv4: got(de(), proxy()),
         dns: got(de(), proxy()),
+        dns_subnet: None,
         ipv6: no_v6(),
     }
 }
@@ -179,10 +186,7 @@ fn verdict_all_foreign_is_no_leak() {
         v.lines[0],
         "IPv4: 141.98.7.5 (Germany, Hetzner) \u{2014} via proxy"
     );
-    assert_eq!(
-        v.lines[1],
-        "DNS: resolver 141.98.7.5 (Germany, Hetzner) \u{2014} via proxy"
-    );
+    assert_eq!(v.lines[1], "DNS: resolver 141.98.7.5 (Germany, Hetzner)");
 }
 
 #[test]
@@ -191,7 +195,7 @@ fn verdict_ipv4_ir_is_leak() {
     i.ipv4 = got(ir(), proxy());
     let v = verdict(&i);
     assert_eq!(v.level, Level::Leak);
-    assert_eq!(v.headline, "LEAK: IPv4 show your Iranian IP");
+    assert_eq!(v.headline, "LEAK: IPv4 appear from Iran");
 }
 
 #[test]
@@ -200,7 +204,7 @@ fn verdict_dns_leak() {
     i.dns = got(ir(), proxy());
     let v = verdict(&i);
     assert_eq!(v.level, Level::Leak);
-    assert_eq!(v.headline, "LEAK: DNS show your Iranian IP");
+    assert_eq!(v.headline, "LEAK: DNS appear from Iran");
 }
 
 #[test]
@@ -210,7 +214,7 @@ fn verdict_ipv6_ir_is_leak() {
     i.ipv6 = got(info("2a00::1", "IR", "Iran", "X"), proxy());
     let v = verdict(&i);
     assert_eq!(v.level, Level::Leak);
-    assert_eq!(v.headline, "LEAK: IPv4, IPv6 show your Iranian IP");
+    assert_eq!(v.headline, "LEAK: IPv4, IPv6 appear from Iran");
 }
 
 #[test]
@@ -224,6 +228,7 @@ fn verdict_stopped_is_cant_tell() {
         v.headline,
         "Can't tell: Q2Route is stopped (everything goes direct)"
     );
+    assert!(v.lines.is_empty());
 }
 
 #[test]
@@ -241,7 +246,7 @@ fn verdict_direct_route_is_cant_tell() {
     j.dns = got(
         de(),
         ProbeRoute::Direct {
-            group: "dns-direct".into(),
+            group: Some("dns-direct".into()),
         },
     );
     assert_eq!(
@@ -278,6 +283,7 @@ fn verdict_nothing_produced_and_no_proxy_failure_is_cant_tell() {
         running: true,
         ipv4: no_v6(),
         dns: no_v6(),
+        dns_subnet: None,
         ipv6: no_v6(),
     };
     assert_eq!(verdict(&i).level, Level::CantTell);
@@ -305,19 +311,13 @@ async fn http_huge_chunk_size_is_error_not_panic() {
 async fn http_truncated_chunked_is_error() {
     let (c, _h) =
         serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc".to_vec()).await;
-    assert!(matches!(
-        http_get(c, "h", "/").await,
-        Err(LeakError::Http(_))
-    ));
+    assert!(matches!(http_get(c, "h", "/").await, Err(LeakError::Io(_))));
 }
 
 #[tokio::test]
 async fn http_eof_before_content_length_is_error() {
     let (c, _h) = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc".to_vec()).await;
-    assert!(matches!(
-        http_get(c, "h", "/").await,
-        Err(LeakError::Http(_))
-    ));
+    assert!(matches!(http_get(c, "h", "/").await, Err(LeakError::Io(_))));
 }
 
 #[tokio::test]
@@ -362,4 +362,169 @@ fn verdict_ipv4_none_never_names_dns_ip() {
     i.ipv4 = no_v6();
     let v = verdict(&i);
     assert!(!v.headline.contains("141.98.7.5"));
+}
+
+#[test]
+fn verdict_direct_hides_real_ip_and_other_probes() {
+    let mut i = base();
+    i.ipv4 = got(ir(), direct());
+    i.dns = got(ir(), direct());
+    i.ipv6 = got(info("2a00::1", "IR", "Iran", "X"), direct());
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::CantTell);
+    assert_eq!(v.lines.len(), 1);
+    for l in &v.lines {
+        assert!(!l.contains("5.200.1.1"), "{l}");
+        assert!(!l.contains("2a00::1"), "{l}");
+    }
+    assert_eq!(
+        v.lines[0],
+        "IPv4: address not shown (routed Direct) \u{2014} via direct"
+    );
+}
+
+#[test]
+fn verdict_direct_without_group() {
+    let mut i = base();
+    i.ipv4 = got(ir(), ProbeRoute::Direct { group: None });
+    let v = verdict(&i);
+    assert_eq!(
+        v.headline,
+        "Can't tell: this check was routed Direct (always-direct app or no group)"
+    );
+    assert_eq!(v.lines, vec!["IPv4: address not shown (routed Direct)"]);
+}
+
+#[test]
+fn verdict_unknown_route_failure_is_cant_tell() {
+    let unconfirmed = "Can't tell: couldn't confirm how this check was routed";
+    for p in [failed(ProbeRoute::Unknown), refused(ProbeRoute::Unknown)] {
+        let mut i = base();
+        i.ipv4 = p;
+        let v = verdict(&i);
+        assert_eq!(v.level, Level::CantTell);
+        assert_eq!(v.headline, unconfirmed);
+    }
+    // the same for the DNS probe, even when IPv4 succeeded
+    let mut i = base();
+    i.dns = failed(ProbeRoute::Unknown);
+    assert_eq!(verdict(&i).headline, unconfirmed);
+}
+
+#[test]
+fn verdict_service_error_is_cant_tell() {
+    for r in [
+        proxy(),
+        ProbeRoute::Block {
+            group: "blk".into(),
+        },
+    ] {
+        let mut i = base();
+        i.ipv4 = refused(r);
+        let v = verdict(&i);
+        assert_eq!(v.level, Level::CantTell);
+        assert_eq!(
+            v.headline,
+            "Can't tell: the IP service answered with an error (status HTTP/1.1 429 Too Many Requests)"
+        );
+        assert!(v.lines[0].starts_with("IPv4: service error: status HTTP/1.1 429"));
+    }
+    let mut i = base();
+    i.dns = refused(proxy());
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::CantTell);
+    assert_eq!(
+        v.lines[1],
+        "DNS: service error: status HTTP/1.1 429 Too Many Requests"
+    );
+}
+
+#[test]
+fn verdict_block_failed_is_not_getting_through() {
+    let mut i = base();
+    i.ipv4 = failed(ProbeRoute::Block {
+        group: "blk".into(),
+    });
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::NoLeak);
+    assert_eq!(
+        v.headline,
+        "No leak, but proxied traffic isn't getting through"
+    );
+}
+
+#[test]
+fn verdict_proxy_down_with_unknown_dns_is_not_getting_through() {
+    // v2ray server unreachable: IPv4 fails via the proxy, the DNS query fails too.
+    let mut i = base();
+    i.ipv4 = failed(proxy());
+    i.dns = failed(ProbeRoute::Unknown);
+    assert_eq!(
+        verdict(&i).headline,
+        "No leak, but proxied traffic isn't getting through"
+    );
+}
+
+#[test]
+fn verdict_dns_subnet_ir_is_leak() {
+    let mut i = base();
+    let net: IpAddr = "5.200.1.0".parse().unwrap();
+    i.dns_subnet = Some((
+        net,
+        got(info("5.200.1.0", "IR", "Iran", "Irancell"), proxy()),
+    ));
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::Leak);
+    assert_eq!(v.headline, "LEAK: DNS appear from Iran");
+    assert_eq!(
+        v.lines[1],
+        "DNS: resolver 141.98.7.5 (Germany, Hetzner); client subnet 5.200.1.0 (Iran)"
+    );
+    // resolver and subnet both Iranian: DNS is named once
+    i.dns = got(ir(), proxy());
+    assert_eq!(verdict(&i).headline, "LEAK: DNS appear from Iran");
+}
+
+#[test]
+fn verdict_dns_subnet_foreign_is_no_leak() {
+    let mut i = base();
+    let net: IpAddr = "141.98.7.0".parse().unwrap();
+    i.dns_subnet = Some((
+        net,
+        got(info("141.98.7.0", "DE", "Germany", "Hetzner"), proxy()),
+    ));
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::NoLeak);
+    assert!(v.lines[1].ends_with("; client subnet 141.98.7.0 (Germany)"));
+    i.dns_subnet = Some((net, refused(proxy())));
+    let v = verdict(&i);
+    assert_eq!(v.level, Level::CantTell);
+    assert!(v.lines[1].ends_with(
+        "; client subnet 141.98.7.0: service error: status HTTP/1.1 429 Too Many Requests"
+    ));
+}
+
+#[test]
+fn outcome_from_error_kinds() {
+    use ProbeOutcome as O;
+    assert!(matches!(
+        O::from_error(&LeakError::Http("x".into())),
+        O::Refused(_)
+    ));
+    assert!(matches!(
+        O::from_error(&LeakError::Parse("x".into())),
+        O::Refused(_)
+    ));
+    assert!(matches!(
+        O::from_error(&LeakError::Io("x".into())),
+        O::Failed(_)
+    ));
+    assert!(matches!(O::from_error(&LeakError::Timeout), O::Failed(_)));
+}
+
+#[tokio::test]
+async fn http_eof_without_response_is_io_error() {
+    // e.g. the relay closes the connection because the proxy server is unreachable
+    let (c, _h) = serve(Vec::new()).await;
+    assert!(matches!(http_get(c, "h", "/").await, Err(LeakError::Io(_))));
 }

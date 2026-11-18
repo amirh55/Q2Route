@@ -7,18 +7,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use q2route_core::decide::Route;
-use q2route_core::ipc::{ConnInfo, Request, Response};
+use q2route_core::ipc::{ConnInfo, Request, Response, StateSnapshot};
 use q2route_core::leak::{
     http_get, ip_api_path, parse_ip_api, parse_resolver_txt, verdict, IpInfo, LeakError,
     LeakInputs, Level, Probe, ProbeOutcome, ProbeRoute, Verdict, IPV6_HOST, IPV6_PATH, IP_API_HOST,
     RESOLVER_TXT_NAME,
 };
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 use crate::client::Client;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(8);
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Every probe is cut off this long after the check starts, so a verdict is
+/// built from what finished well before `OVERALL_TIMEOUT`.
+const PROBE_BUDGET: Duration = Duration::from_secs(25);
 const LOOKUP_TRIES: u32 = 3;
 const LOOKUP_GAP: Duration = Duration::from_millis(300);
 
@@ -39,7 +43,7 @@ impl LeakCheck {
                 Err(e) => return cant_tell(format!("Can't tell: {e}")),
             };
             let v = rt
-                .block_on(tokio::time::timeout(OVERALL_TIMEOUT, run(client)))
+                .block_on(tokio::time::timeout(OVERALL_TIMEOUT, run(&client)))
                 .unwrap_or_else(|_| cant_tell("Can't tell: the check timed out".into()));
             // A hung blocking DNS call must not delay delivery of `v`.
             rt.shutdown_background();
@@ -87,34 +91,96 @@ fn cant_tell(headline: String) -> Verdict {
     }
 }
 
-/// Route of the connection `pid`/`local`, with its group's name.
-/// `groups` are (id, name) pairs.
+/// Route of this process's connection from local port `local.port()` to
+/// `remote`, with its group's name. `groups` are (id, name) pairs.
+///
+/// Relayed (proxied) connections are recorded with `local = remote_ip:port`
+/// (the NAT reflects the packet), packet-layer Direct/Block decisions with the
+/// real local address, so only the local port is compared.
 pub fn find_route(
     conns: &[ConnInfo],
     pid: u32,
     local: SocketAddr,
+    remote: SocketAddr,
     groups: &[(String, String)],
 ) -> ProbeRoute {
     // Prefer a live entry, then the most recently started one.
     let best = conns
         .iter()
-        .filter(|c| c.pid == pid && c.local == local)
+        .filter(|c| c.pid == pid && c.dst == remote && c.local.port() == local.port())
         .max_by_key(|c| (c.ended_ms.is_none(), c.started_ms));
     let Some(c) = best else {
         return ProbeRoute::Unknown;
     };
-    let group = match &c.group_id {
-        None => "no group".to_string(),
-        Some(id) => groups
+    let name = c.group_id.as_ref().map(|id| {
+        groups
             .iter()
             .find(|(gid, _)| gid == id)
-            .map_or_else(|| id.clone(), |(_, n)| n.clone()),
-    };
+            .map_or_else(|| id.clone(), |(_, n)| n.clone())
+    });
     match c.route {
-        Route::Proxy(_) => ProbeRoute::Proxy { group },
-        Route::Block => ProbeRoute::Block { group },
-        Route::Direct => ProbeRoute::Direct { group },
+        Route::Proxy(_) => ProbeRoute::Proxy {
+            group: name.unwrap_or_else(|| "no group".into()),
+        },
+        Route::Block => ProbeRoute::Block {
+            group: name.unwrap_or_else(|| "no group".into()),
+        },
+        Route::Direct => ProbeRoute::Direct { group: name },
     }
+}
+
+/// The three probes' results.
+struct Probes {
+    ipv4: Probe,
+    dns: Probe,
+    dns_subnet: Option<(IpAddr, Probe)>,
+    ipv6: Probe,
+}
+
+/// What `run` needs from the outside world, so tests can run it offline.
+trait Env {
+    async fn state(&self) -> Option<StateSnapshot>;
+    async fn flush_dns(&self);
+    /// Sends the probes: the check's only internet traffic.
+    async fn probe(&self, groups: Vec<(String, String)>, deadline: Instant) -> Probes;
+}
+
+impl Env for Client {
+    async fn state(&self) -> Option<StateSnapshot> {
+        match ask(self, Request::GetState).await {
+            Ok(Response::State(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    async fn flush_dns(&self) {
+        let _ = ask(self, Request::FlushDns).await;
+    }
+
+    async fn probe(&self, groups: Vec<(String, String)>, deadline: Instant) -> Probes {
+        let ctx = Ctx {
+            client: self.clone(),
+            groups,
+        };
+        // Each probe is capped, so one hung probe keeps the others' results.
+        let (ipv4, (dns, dns_subnet), ipv6) = tokio::join!(
+            capped(deadline, failed("timed out"), geolocate(None, &ctx)),
+            capped(deadline, (failed("timed out"), None), dns_probe(&ctx)),
+            capped(deadline, failed("timed out"), ipv6_probe(&ctx)),
+        );
+        Probes {
+            ipv4,
+            dns,
+            dns_subnet,
+            ipv6,
+        }
+    }
+}
+
+async fn capped<T>(deadline: Instant, timed_out: T, f: impl Future<Output = T>) -> T {
+    tokio::time::timeout_at(deadline, f)
+        .await
+        .unwrap_or(timed_out)
 }
 
 /// What a probe needs to ask the service where its own socket went.
@@ -126,7 +192,7 @@ struct Ctx {
 impl Ctx {
     /// Looks the probe's socket up in the connection table; the service may
     /// list it slightly late, so retry.
-    async fn route_of(&self, local: SocketAddr) -> ProbeRoute {
+    async fn route_of(&self, local: SocketAddr, remote: SocketAddr) -> ProbeRoute {
         for i in 0..LOOKUP_TRIES {
             if i > 0 {
                 tokio::time::sleep(LOOKUP_GAP).await;
@@ -134,7 +200,7 @@ impl Ctx {
             if let Ok(Response::Connections(conns)) =
                 ask(&self.client, Request::GetConnections).await
             {
-                let r = find_route(&conns, std::process::id(), local, &self.groups);
+                let r = find_route(&conns, std::process::id(), local, remote, &self.groups);
                 if r != ProbeRoute::Unknown {
                     return r;
                 }
@@ -189,7 +255,7 @@ async fn fetch_text(addr: SocketAddr, host: &str, path: &str, ctx: Option<&Ctx>)
     let body = step(http_get(&mut s, host, path)).await;
     // `s` is still open here, so the connection is listed.
     let route = match (ctx, local) {
-        (Some(c), Some(l)) => c.route_of(l).await,
+        (Some(c), Some(l)) => c.route_of(l, addr).await,
         _ => ProbeRoute::Unknown,
     };
     Fetch {
@@ -227,7 +293,7 @@ fn probe_of(f: Fetch<IpInfo>) -> Probe {
     Probe {
         outcome: match f.body {
             Ok(i) => ProbeOutcome::Got(i),
-            Err(e) => ProbeOutcome::Failed(e.to_string()),
+            Err(e) => ProbeOutcome::from_error(&e),
         },
         route: f.route,
     }
@@ -251,7 +317,8 @@ async fn geolocate(ip: Option<IpAddr>, ctx: &Ctx) -> Probe {
     }
 }
 
-async fn dns_probe(ctx: &Ctx) -> Probe {
+/// The resolver's geolocation, and the ECS subnet's when the answer has one.
+async fn dns_probe(ctx: &Ctx) -> (Probe, Option<(IpAddr, Probe)>) {
     let txt = match step(async {
         tokio::task::spawn_blocking(|| query_txt(RESOLVER_TXT_NAME))
             .await
@@ -261,12 +328,22 @@ async fn dns_probe(ctx: &Ctx) -> Probe {
     .await
     {
         Ok(t) => t,
-        Err(e) => return failed(e),
+        Err(e) => return (failed(e), None),
     };
-    match parse_resolver_txt(&txt).0 {
-        Some(ip) => geolocate(Some(ip), ctx).await,
-        None => failed("resolver address not found in TXT answer"),
-    }
+    let (ip, ecs) = parse_resolver_txt(&txt);
+    let resolver = async {
+        match ip {
+            Some(ip) => geolocate(Some(ip), ctx).await,
+            None => failed("resolver address not found in TXT answer"),
+        }
+    };
+    let subnet = async {
+        match ecs {
+            Some(net) => Some((net, geolocate(Some(net), ctx).await)),
+            None => None,
+        }
+    };
+    tokio::join!(resolver, subnet)
 }
 
 async fn ipv6_probe(ctx: &Ctx) -> Probe {
@@ -309,27 +386,31 @@ async fn ipv6_probe(ctx: &Ctx) -> Probe {
     }
 }
 
-async fn run(client: Client) -> Verdict {
-    let snap = match ask(&client, Request::GetState).await {
-        Ok(Response::State(s)) => s,
-        _ => return cant_tell("Can't tell: Q2Route service not reachable".into()),
+async fn run(env: &impl Env) -> Verdict {
+    let deadline = Instant::now() + PROBE_BUDGET;
+    let Some(snap) = env.state().await else {
+        return cant_tell("Can't tell: Q2Route service not reachable".into());
     };
+    if !snap.running {
+        // Everything would go direct: send nothing, show nothing.
+        return cant_tell("Can't tell: Q2Route is stopped (everything goes direct)".into());
+    }
     let groups = snap
         .config
         .groups
         .iter()
         .map(|g| (g.id.clone(), g.name.clone()))
         .collect();
-    let ctx = Ctx { client, groups };
-    let _ = ask(&ctx.client, Request::FlushDns).await;
-    let ipv4 = geolocate(None, &ctx).await;
-    let dns = dns_probe(&ctx).await;
-    let ipv6 = ipv6_probe(&ctx).await;
+    env.flush_dns().await;
+    // All three run concurrently; when IPv4 is routed Direct, `verdict`
+    // drops the DNS/IPv6 lines.
+    let p = env.probe(groups, deadline).await;
     verdict(&LeakInputs {
         running: snap.running,
-        ipv4,
-        dns,
-        ipv6,
+        ipv4: p.ipv4,
+        dns: p.dns,
+        dns_subnet: p.dns_subnet,
+        ipv6: p.ipv6,
     })
 }
 
@@ -353,34 +434,41 @@ fn query_txt(name: &str) -> Result<Vec<String>, String> {
             std::ptr::null_mut(),
         )
     };
+    let mut out = Vec::new();
+    if status == 0 {
+        let mut rec = list;
+        // SAFETY: walking the linked list DnsQuery returned; the TXT payload is
+        // valid for records of type DNS_TYPE_TEXT, with `dwStringCount` wide
+        // strings. The string array is a trailing variable-length array, so
+        // its pointer is derived from the raw record pointer, not a reference.
+        unsafe {
+            while !rec.is_null() {
+                if (*rec).wType == DNS_TYPE_TEXT {
+                    let count = (*rec).Data.TXT.dwStringCount as usize;
+                    let strings =
+                        std::ptr::addr_of!((*rec).Data.TXT.pStringArray) as *const *mut u16;
+                    for i in 0..count {
+                        let p = *strings.add(i);
+                        if p.is_null() {
+                            continue;
+                        }
+                        let mut n = 0;
+                        while *p.add(n) != 0 {
+                            n += 1;
+                        }
+                        out.push(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                    }
+                }
+                rec = (*rec).pNext;
+            }
+        }
+    }
+    if !list.is_null() {
+        // SAFETY: `list` came from DnsQuery_W and is freed exactly once.
+        unsafe { DnsFree(list as *const _, DnsFreeRecordList) };
+    }
     if status != 0 {
         return Err(format!("DnsQuery failed ({status})"));
-    }
-    let mut out = Vec::new();
-    let mut rec = list;
-    // SAFETY: walking the linked list DnsQuery returned; the TXT payload is
-    // valid for records of type DNS_TYPE_TEXT, with `dwStringCount` wide strings.
-    unsafe {
-        while !rec.is_null() {
-            let r = &*rec;
-            if r.wType == DNS_TYPE_TEXT {
-                let txt = &r.Data.TXT;
-                let strings = std::ptr::addr_of!(txt.pStringArray) as *const *mut u16;
-                for i in 0..txt.dwStringCount as usize {
-                    let p = *strings.add(i);
-                    if p.is_null() {
-                        continue;
-                    }
-                    let mut n = 0;
-                    while *p.add(n) != 0 {
-                        n += 1;
-                    }
-                    out.push(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
-                }
-            }
-            rec = r.pNext;
-        }
-        DnsFree(list as *const _, DnsFreeRecordList);
     }
     Ok(out)
 }
@@ -393,19 +481,23 @@ fn query_txt(_name: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use q2route_core::config::Protocol;
+    use q2route_core::config::{Config, Protocol};
     use q2route_core::decide::Route;
     use q2route_core::ipc::ConnInfo;
+    use std::cell::Cell;
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn conn(pid: u32, local: &str, route: Route, group: Option<&str>) -> ConnInfo {
+    const DST: &str = "1.2.3.4:80";
+
+    fn conn_to(pid: u32, local: &str, dst: &str, route: Route, group: Option<&str>) -> ConnInfo {
         ConnInfo {
             id: 1,
             proto: Protocol::Tcp,
             pid,
             exe: "q2route.exe".into(),
             local: local.parse().unwrap(),
-            dst: "1.2.3.4:80".parse().unwrap(),
+            dst: dst.parse().unwrap(),
             domain: None,
             route,
             group_id: group.map(Into::into),
@@ -415,6 +507,14 @@ mod tests {
             up: None,
             down: None,
         }
+    }
+
+    fn conn(pid: u32, local: &str, route: Route, group: Option<&str>) -> ConnInfo {
+        conn_to(pid, local, DST, route, group)
+    }
+
+    fn dst() -> SocketAddr {
+        DST.parse().unwrap()
     }
 
     #[test]
@@ -427,25 +527,75 @@ mod tests {
             conn(7, "10.0.0.2:5555", Route::Proxy("p".into()), Some("g1")),
         ];
         assert_eq!(
-            find_route(&conns, 7, local, &groups),
+            find_route(&conns, 7, local, dst(), &groups),
             ProbeRoute::Proxy {
                 group: "Work".into()
             }
         );
         let b = vec![conn(7, "10.0.0.2:5555", Route::Block, Some("zz"))];
         assert_eq!(
-            find_route(&b, 7, local, &groups),
+            find_route(&b, 7, local, dst(), &groups),
             ProbeRoute::Block { group: "zz".into() }
         );
         let d = vec![conn(7, "10.0.0.2:5555", Route::Direct, None)];
         assert_eq!(
-            find_route(&d, 7, local, &groups),
-            ProbeRoute::Direct {
-                group: "no group".into()
+            find_route(&d, 7, local, dst(), &groups),
+            ProbeRoute::Direct { group: None }
+        );
+        assert_eq!(
+            find_route(&d, 8, local, dst(), &groups),
+            ProbeRoute::Unknown
+        );
+        assert_eq!(
+            find_route(&[], 7, local, dst(), &groups),
+            ProbeRoute::Unknown
+        );
+    }
+
+    #[test]
+    fn route_lookup_finds_relayed_entry() {
+        // The relay records `local = dst_ip:app_port`.
+        let groups = vec![("g1".to_string(), "Work".to_string())];
+        let local: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        let conns = vec![conn(
+            7,
+            "1.2.3.4:5555",
+            Route::Proxy("p".into()),
+            Some("g1"),
+        )];
+        assert_eq!(
+            find_route(&conns, 7, local, dst(), &groups),
+            ProbeRoute::Proxy {
+                group: "Work".into()
             }
         );
-        assert_eq!(find_route(&d, 8, local, &groups), ProbeRoute::Unknown);
-        assert_eq!(find_route(&[], 7, local, &groups), ProbeRoute::Unknown);
+    }
+
+    #[test]
+    fn route_lookup_finds_packet_layer_direct() {
+        let groups = vec![("g2".to_string(), "Home".to_string())];
+        let local: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        let conns = vec![conn(7, "10.0.0.2:5555", Route::Direct, Some("g2"))];
+        assert_eq!(
+            find_route(&conns, 7, local, dst(), &groups),
+            ProbeRoute::Direct {
+                group: Some("Home".into())
+            }
+        );
+    }
+
+    #[test]
+    fn route_lookup_ignores_same_port_other_destination() {
+        let local: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        let conns = vec![
+            conn_to(7, "10.0.0.2:5555", "9.9.9.9:80", Route::Direct, None),
+            conn_to(7, "9.9.9.9:5555", "9.9.9.9:80", Route::Direct, None),
+            conn_to(7, "10.0.0.2:5555", "1.2.3.4:443", Route::Direct, None),
+        ];
+        assert_eq!(
+            find_route(&conns, 7, local, dst(), &[]),
+            ProbeRoute::Unknown
+        );
     }
 
     #[test]
@@ -456,12 +606,126 @@ mod tests {
         let mut new_ended = conn(7, "10.0.0.2:5555", Route::Block, None);
         new_ended.started_ms = 9;
         new_ended.ended_ms = Some(10);
-        let mut newer_live = conn(7, "10.0.0.2:5555", Route::Proxy("p".into()), None);
+        let mut newer_live = conn(7, "1.2.3.4:5555", Route::Proxy("p".into()), None);
         newer_live.started_ms = 5;
-        let r = find_route(&[old_live.clone(), new_ended.clone()], 7, local, &[]);
+        let r = find_route(&[old_live.clone(), new_ended.clone()], 7, local, dst(), &[]);
         assert!(matches!(r, ProbeRoute::Direct { .. }));
-        let r = find_route(&[old_live, new_ended, newer_live], 7, local, &[]);
+        let r = find_route(&[old_live, new_ended, newer_live], 7, local, dst(), &[]);
         assert!(matches!(r, ProbeRoute::Proxy { .. }));
+    }
+
+    /// Offline `Env`: counts the calls that would touch the service or the network.
+    struct FakeEnv {
+        running: Option<bool>,
+        probes: fn() -> Probes,
+        flushes: Cell<u32>,
+        probe_calls: Cell<u32>,
+    }
+
+    impl FakeEnv {
+        fn new(running: Option<bool>, probes: fn() -> Probes) -> FakeEnv {
+            FakeEnv {
+                running,
+                probes,
+                flushes: Cell::new(0),
+                probe_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Env for FakeEnv {
+        async fn state(&self) -> Option<StateSnapshot> {
+            self.running.map(|running| StateSnapshot {
+                running,
+                config: Config::seed(),
+                groups: HashMap::new(),
+                proxy_up: HashMap::new(),
+                total_up_bps: 0,
+                total_down_bps: 0,
+                proxy_servers: Vec::new(),
+            })
+        }
+        async fn flush_dns(&self) {
+            self.flushes.set(self.flushes.get() + 1);
+        }
+        async fn probe(&self, _: Vec<(String, String)>, _: Instant) -> Probes {
+            self.probe_calls.set(self.probe_calls.get() + 1);
+            (self.probes)()
+        }
+    }
+
+    fn ir_info(ip: &str) -> IpInfo {
+        IpInfo {
+            ip: ip.parse().unwrap(),
+            country: "Iran".into(),
+            country_code: "IR".into(),
+            isp: "Irancell".into(),
+        }
+    }
+
+    fn direct_probes() -> Probes {
+        let direct = ProbeRoute::Direct {
+            group: Some("Home".into()),
+        };
+        Probes {
+            ipv4: Probe {
+                outcome: ProbeOutcome::Got(ir_info("5.200.1.1")),
+                route: direct.clone(),
+            },
+            dns: Probe {
+                outcome: ProbeOutcome::Got(ir_info("5.200.9.9")),
+                route: direct.clone(),
+            },
+            dns_subnet: None,
+            ipv6: Probe {
+                outcome: ProbeOutcome::Got(ir_info("2a00::1")),
+                route: direct,
+            },
+        }
+    }
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn stopped_sends_nothing_and_shows_nothing() {
+        let env = FakeEnv::new(Some(false), direct_probes);
+        let v = block_on(run(&env));
+        assert_eq!(v.level, Level::CantTell);
+        assert_eq!(
+            v.headline,
+            "Can't tell: Q2Route is stopped (everything goes direct)"
+        );
+        assert!(v.lines.is_empty());
+        assert_eq!(env.probe_calls.get(), 0);
+        assert_eq!(env.flushes.get(), 0);
+    }
+
+    #[test]
+    fn unreachable_service_sends_nothing() {
+        let env = FakeEnv::new(None, direct_probes);
+        let v = block_on(run(&env));
+        assert_eq!(v.headline, "Can't tell: Q2Route service not reachable");
+        assert_eq!(env.probe_calls.get(), 0);
+    }
+
+    #[test]
+    fn direct_ipv4_hides_address_and_other_lines() {
+        let env = FakeEnv::new(Some(true), direct_probes);
+        let v = block_on(run(&env));
+        assert_eq!(env.probe_calls.get(), 1);
+        assert_eq!(v.level, Level::CantTell);
+        assert_eq!(
+            v.headline,
+            "Can't tell: this check was routed Direct by \"Home\""
+        );
+        assert_eq!(v.lines.len(), 1);
+        assert!(!v.lines[0].contains("5.200.1.1"));
     }
 
     #[test]
@@ -502,6 +766,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limited_answer_is_refused() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            let _ = s.read(&mut b).await;
+            s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let p = probe_of(fetch_ip_info(addr, "ip-api.com", "/json/", None).await);
+        assert!(matches!(p.outcome, ProbeOutcome::Refused(_)), "{p:?}");
+    }
+
+    #[tokio::test]
     async fn refused_connect_is_not_connected() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -510,5 +790,7 @@ mod tests {
         assert!(!f.connected);
         assert!(f.body.is_err());
         assert_eq!(f.route, ProbeRoute::Unknown);
+        let p = probe_of(f);
+        assert!(matches!(p.outcome, ProbeOutcome::Failed(_)));
     }
 }
