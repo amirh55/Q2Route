@@ -57,6 +57,17 @@ fn fixture() -> Vec<u8> {
                 domain(1, r"^ads\d+\.com$", &[]),
             ],
         ),
+        site(
+            "EMPTY",
+            &[
+                domain(0, "", &[]),
+                domain(2, "", &[]),
+                domain(2, ".", &[]),
+                domain(3, "ok.example", &[]),
+            ],
+        ),
+        site("DUP", &[domain(2, "one.com", &[])]),
+        site("DUP", &[domain(2, "two.com", &[])]),
         site("STEAM", &[domain(2, "steampowered.com", &[])]),
         site(
             "ADS",
@@ -152,4 +163,30 @@ fn real_file_smoke() {
     println!("loaded in {el:?}, {} entries", g.get("ir").unwrap().len());
     assert!(g.get("ir").unwrap().contains("digikala.com"));
     assert!(el.as_secs_f64() < 1.0);
+}
+
+#[test]
+fn empty_values_are_skipped() {
+    let g = GeoSite::parse(&fixture(), &["empty".into()]).unwrap();
+    let s = g.get("empty").unwrap();
+    assert!(!s.contains("google.com"));
+    assert!(!s.contains("") && !s.contains(".") && !s.contains(".."));
+    assert!(s.contains("ok.example"));
+    assert_eq!(s.len(), 1);
+    assert_eq!(g.skipped_regex("empty"), 3);
+    let d = q2route_core::geosite::DomainSet::from_entries(&[""], &[""], &[""]);
+    assert!(d.is_empty() && !d.contains("google.com"));
+}
+
+#[test]
+fn duplicate_code_entries_merge() {
+    let g = GeoSite::parse(&fixture(), &["dup".into()]).unwrap();
+    let s = g.get("dup").unwrap();
+    assert!(s.contains("one.com") && s.contains("two.com"));
+}
+
+#[test]
+fn absent_code_is_none() {
+    let g = GeoSite::parse(&fixture(), &["nope".into()]).unwrap();
+    assert!(g.get("nope").is_none());
 }

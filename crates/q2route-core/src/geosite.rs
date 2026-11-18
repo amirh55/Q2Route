@@ -63,11 +63,18 @@ impl DomainSet {
         self.len() == 0
     }
 
+    /// Empty entries are dropped (an empty keyword would match every host).
     pub fn from_entries(full: &[&str], roots: &[&str], keywords: &[&str]) -> DomainSet {
+        let norm = |l: &[&str]| -> Vec<String> {
+            l.iter()
+                .map(|s| normalize(s.as_bytes()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         DomainSet {
-            full: full.iter().map(|s| s.to_lowercase()).collect(),
-            roots: roots.iter().map(|s| s.to_lowercase()).collect(),
-            keywords: keywords.iter().map(|s| s.to_lowercase()).collect(),
+            full: norm(full).into_iter().collect(),
+            roots: norm(roots).into_iter().collect(),
+            keywords: norm(keywords),
             skipped_regex: 0,
         }
     }
@@ -77,6 +84,12 @@ impl DomainSet {
 #[derive(Debug, Default, Clone)]
 pub struct GeoSite {
     sets: HashMap<String, Arc<DomainSet>>,
+}
+
+/// Lowercase, trim, strip one trailing dot.
+fn normalize(v: &[u8]) -> String {
+    let l = String::from_utf8_lossy(v).trim().to_lowercase();
+    l.strip_suffix('.').unwrap_or(&l).to_string()
 }
 
 struct Domain<'a> {
@@ -133,7 +146,7 @@ impl GeoSite {
             };
             by_code.entry(code).or_default().push((key, attr));
         }
-        let mut sets = HashMap::new();
+        let mut built: HashMap<String, DomainSet> = HashMap::new();
         let mut r = Reader { b: data };
         while !r.done() {
             let (num, f) = r.field()?;
@@ -146,19 +159,25 @@ impl GeoSite {
             let Some(keys) = by_code.get(&code) else {
                 continue;
             };
-            let mut built: Vec<DomainSet> = keys.iter().map(|_| DomainSet::default()).collect();
             let mut er = Reader { b: entry };
             while !er.done() {
                 let (2, Field::Bytes(db)) = er.field()? else {
                     continue;
                 };
                 let d = decode_domain(db)?;
-                let value = String::from_utf8_lossy(d.value).to_lowercase();
-                for ((_, attr), set) in keys.iter().zip(built.iter_mut()) {
+                let value = normalize(d.value);
+                for (key, attr) in keys {
+                    // `@attr` filters on the attribute's presence, not its value.
                     if let Some(a) = attr {
                         if !d.attrs.iter().any(|x| x == a) {
                             continue;
                         }
+                    }
+                    // A code may appear more than once: merge into the same set.
+                    let set = built.entry(key.clone()).or_default();
+                    if value.is_empty() {
+                        set.skipped_regex += 1;
+                        continue;
                     }
                     match d.ty {
                         0 => set.keywords.push(value.clone()),
@@ -172,10 +191,8 @@ impl GeoSite {
                     }
                 }
             }
-            for ((key, _), set) in keys.iter().zip(built) {
-                sets.insert(key.clone(), Arc::new(set));
-            }
         }
+        let sets = built.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         Ok(GeoSite { sets })
     }
 
