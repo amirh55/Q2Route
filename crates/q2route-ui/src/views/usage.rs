@@ -116,8 +116,14 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
+/// (name, up, down) rows.
+type Table = Vec<(String, u64, u64)>;
+
 pub struct UsageView {
     report: Option<UsageReport>,
+    /// Aggregates of `report` for one period (by group, app, proxy); dropped
+    /// when a new report arrives.
+    tables: Option<(Period, [Table; 3])>,
     pending: Option<oneshot::Receiver<Response>>,
     last_sent: Option<Instant>,
     period: Period,
@@ -128,6 +134,7 @@ impl Default for UsageView {
     fn default() -> Self {
         UsageView {
             report: None,
+            tables: None,
             pending: None,
             last_sent: None,
             period: Period::Today,
@@ -143,6 +150,7 @@ impl UsageView {
             match rx.try_recv() {
                 Ok(Response::Usage(r)) => {
                     self.report = Some(r);
+                    self.tables = None;
                     self.pending = None;
                 }
                 Ok(Response::Error(e)) => {
@@ -188,11 +196,11 @@ impl UsageView {
             return;
         }
         self.poll(client, req);
-        let Some(report) = self.report.clone() else {
+        if self.report.is_none() {
             ui.add_space(8.0);
             ui.spinner();
             return;
-        };
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             for p in Period::ALL {
@@ -200,6 +208,15 @@ impl UsageView {
             }
         });
         ui.add_space(6.0);
+        if self.tables.as_ref().is_none_or(|t| t.0 != self.period) {
+            if let Some(r) = self.report.as_ref() {
+                let agg = |by| aggregate(r, self.period, &r.today, by);
+                self.tables = Some((self.period, [agg(By::Group), agg(By::App), agg(By::Proxy)]));
+            }
+        }
+        let Some((_, tables)) = self.tables.as_ref() else {
+            return;
+        };
         let group_name = |id: &str| {
             s.config
                 .groups
@@ -214,12 +231,15 @@ impl UsageView {
                 .find(|p| p.id == id)
                 .map_or_else(|| id.to_string(), |p| p.name.clone())
         };
-        for (title, by) in [
+        for (i, (title, by)) in [
             ("By group", By::Group),
             ("By app", By::App),
             ("By proxy", By::Proxy),
-        ] {
-            let rows = aggregate(&report, self.period, &report.today, by);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rows = &tables[i];
             ui.add_space(6.0);
             ui.label(RichText::new(title).strong());
             if rows.is_empty() {
@@ -234,7 +254,7 @@ impl UsageView {
                         ui.label(RichText::new(h).strong());
                     }
                     ui.end_row();
-                    for (name, up, down) in rows {
+                    for (name, up, down) in rows.iter().cloned() {
                         let shown = match by {
                             By::Group => group_name(&name),
                             By::Proxy => proxy_name(&name),
@@ -254,6 +274,10 @@ impl UsageView {
                 ui.label("Delete all data usage history?");
                 if ui.button("Yes").clicked() {
                     req.send(client, Request::ResetUsage);
+                    // A GetUsage sent before the reset must not bring the old totals back.
+                    self.pending = None;
+                    self.report = None;
+                    self.tables = None;
                     self.confirm_reset = false;
                     self.refresh_soon();
                 }

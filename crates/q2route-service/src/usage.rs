@@ -3,9 +3,9 @@
 //! while off, [`Usage::add`] is one atomic load and nothing touches the disk.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -30,8 +30,72 @@ pub struct UsageKey {
 struct PerKey {
     session_up: AtomicU64,
     session_down: AtomicU64,
-    /// "YYYY-MM-DD" -> (up, down).
+    /// Packed day (`y*10000+m*100+d`, 0 = none) that `cur_up`/`cur_down` count.
+    cur_day: AtomicU32,
+    cur_up: AtomicU64,
+    cur_down: AtomicU64,
+    /// Finished days: "YYYY-MM-DD" -> (up, down). The current day is rolled
+    /// in when the day changes and at report/save time.
     days: Mutex<BTreeMap<String, (u64, u64)>>,
+}
+
+impl PerKey {
+    /// Allocation- and lock-free while `code` is the current day.
+    fn add(&self, code: u32, up: u64, down: u64) {
+        self.session_up.fetch_add(up, Ordering::Relaxed);
+        self.session_down.fetch_add(down, Ordering::Relaxed);
+        if self.cur_day.load(Ordering::Relaxed) != code {
+            let mut days = self.days.lock().unwrap_or_else(|e| e.into_inner());
+            if self.cur_day.load(Ordering::Relaxed) != code {
+                self.flush_locked(&mut days);
+                self.cur_day.store(code, Ordering::Relaxed);
+            }
+        }
+        self.cur_up.fetch_add(up, Ordering::Relaxed);
+        self.cur_down.fetch_add(down, Ordering::Relaxed);
+    }
+
+    /// Moves the current-day counters into `days` (keeps the current day).
+    fn flush_locked(&self, days: &mut BTreeMap<String, (u64, u64)>) {
+        let code = self.cur_day.load(Ordering::Relaxed);
+        let (up, down) = (
+            self.cur_up.swap(0, Ordering::Relaxed),
+            self.cur_down.swap(0, Ordering::Relaxed),
+        );
+        if code != 0 && (up > 0 || down > 0) {
+            let d = days.entry(code_str(code)).or_default();
+            d.0 = d.0.saturating_add(up);
+            d.1 = d.1.saturating_add(down);
+        }
+    }
+
+    fn days(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (u64, u64)>> {
+        let mut days = self.days.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_locked(&mut days);
+        days
+    }
+}
+
+fn code_str(c: u32) -> String {
+    format!("{:04}-{:02}-{:02}", c / 10_000, c / 100 % 100, c % 100)
+}
+
+/// `YYYY-MM-DD` as a packed `y*10000+m*100+d`.
+fn day_code(s: &str) -> Option<u32> {
+    let mut it = s.split('-');
+    let (y, m, d) = (
+        it.next()?.parse::<u32>().ok()?,
+        it.next()?.parse::<u32>().ok()?,
+        it.next()?.parse::<u32>().ok()?,
+    );
+    (it.next().is_none() && y < 10_000 && (1..=12).contains(&m) && (1..=31).contains(&d))
+        .then_some(y * 10_000 + m * 100 + d)
+}
+
+fn local_code() -> u32 {
+    // SAFETY: GetLocalTime has no preconditions.
+    let t = unsafe { GetLocalTime() };
+    u32::from(t.wYear) * 10_000 + u32::from(t.wMonth) * 100 + u32::from(t.wDay)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -44,13 +108,17 @@ pub struct Usage {
     enabled: AtomicBool,
     dirty: AtomicBool,
     keys: DashMap<UsageKey, Arc<PerKey>>,
+    /// Serialises save and reset, so a save in flight cannot bring back
+    /// history that reset just deleted.
+    io_lock: Mutex<()>,
+    /// Cached local day (packed) and the unix second it was read.
+    day_cache: AtomicU32,
+    day_checked: AtomicU64,
 }
 
 /// Today's local date as `YYYY-MM-DD`.
 pub fn today() -> String {
-    // SAFETY: GetLocalTime has no preconditions.
-    let t = unsafe { GetLocalTime() };
-    format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay)
+    code_str(local_code())
 }
 
 /// Days since 1970-01-01 of a `YYYY-MM-DD` string.
@@ -82,19 +150,33 @@ impl Usage {
             enabled: AtomicBool::new(enabled),
             dirty: AtomicBool::new(false),
             keys: DashMap::new(),
+            io_lock: Mutex::new(()),
+            day_cache: AtomicU32::new(0),
+            day_checked: AtomicU64::new(0),
         };
         u.load();
         u
+    }
+
+    /// Keeps an unreadable or corrupt file as `.bad`, so the next save
+    /// cannot overwrite it.
+    fn set_aside(&self, why: &dyn std::fmt::Display) {
+        let bad = self.path.with_extension("json.bad");
+        tracing::warn!(
+            "{} is unusable ({why}); kept as {}, starting empty",
+            self.path.display(),
+            bad.display()
+        );
+        if let Err(e) = std::fs::rename(&self.path, &bad) {
+            tracing::warn!("cannot set the usage file aside: {e}");
+        }
     }
 
     fn load(&self) {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::warn!("cannot read {}: {e}", self.path.display());
-                return;
-            }
+            Err(e) => return self.set_aside(&e),
         };
         match serde_json::from_str::<File>(&text) {
             Ok(f) => {
@@ -113,17 +195,7 @@ impl Usage {
                     }
                 }
             }
-            Err(e) => {
-                let bad = self.path.with_extension("json.bad");
-                tracing::warn!(
-                    "{} is corrupt ({e}); kept as {}, starting empty",
-                    self.path.display(),
-                    bad.display()
-                );
-                if let Err(e) = std::fs::rename(&self.path, &bad) {
-                    tracing::warn!("cannot set the corrupt usage file aside: {e}");
-                }
-            }
+            Err(e) => self.set_aside(&e),
         }
     }
 
@@ -147,27 +219,30 @@ impl Usage {
         if !self.enabled() {
             return;
         }
-        self.add_on(&today(), key, up, down);
+        self.per_key(key).add(self.day(), up, down);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// The local day, re-read from the clock at most once a second.
+    fn day(&self) -> u32 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if self.day_checked.swap(now, Ordering::Relaxed) != now
+            || self.day_cache.load(Ordering::Relaxed) == 0
+        {
+            self.day_cache.store(local_code(), Ordering::Relaxed);
+        }
+        self.day_cache.load(Ordering::Relaxed)
     }
 
     /// [`Usage::add`] for a given day (test seam).
     pub fn add_on(&self, day: &str, key: &UsageKey, up: u64, down: u64) {
+        let Some(code) = day_code(day) else { return };
         if !self.enabled() {
             return;
         }
-        let pk = self.per_key(key);
-        pk.session_up.fetch_add(up, Ordering::Relaxed);
-        pk.session_down.fetch_add(down, Ordering::Relaxed);
-        {
-            let mut days = pk.days.lock().unwrap_or_else(|e| e.into_inner());
-            if !days.contains_key(day) {
-                days.insert(day.to_string(), (0, 0));
-            }
-            if let Some(d) = days.get_mut(day) {
-                d.0 = d.0.saturating_add(up);
-                d.1 = d.1.saturating_add(down);
-            }
-        }
+        self.per_key(key).add(code, up, down);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -190,7 +265,7 @@ impl Usage {
             if su > 0 || sd > 0 {
                 session.push(row(su, sd));
             }
-            for (day, (up, down)) in e.days.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            for (day, (up, down)) in e.days().iter() {
                 days.entry(day.clone()).or_default().push(row(*up, *down));
             }
         }
@@ -220,15 +295,14 @@ impl Usage {
             return;
         };
         for e in self.keys.iter() {
-            e.days
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            e.days()
                 .retain(|d, _| *d == today || day_number(d).is_some_and(|n| n > now - KEEP_DAYS));
         }
     }
 
     /// Writes `usage.json` atomically (tmp + rename) when something changed.
     pub fn save_if_dirty(&self) -> io::Result<()> {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
@@ -249,12 +323,16 @@ impl Usage {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &self.path)
     }
 
     /// Clears session and history and deletes the file.
     pub fn reset(&self) -> io::Result<()> {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.keys.clear();
         self.dirty.store(false, Ordering::Relaxed);
         match std::fs::remove_file(&self.path) {
@@ -438,5 +516,42 @@ mod tests {
             c.is_ascii_digit()
         }));
         assert!(day_number(&t).is_some());
+    }
+}
+
+#[cfg(test)]
+mod day_tests {
+    use super::*;
+
+    #[test]
+    fn day_change_between_adds_splits() {
+        let d = tempfile::tempdir().unwrap();
+        let u = Usage::new(d.path().join("usage.json"), true);
+        let k = UsageKey {
+            group: "g".into(),
+            app: "a.exe".into(),
+            proxy: "p".into(),
+        };
+        u.add_on("2026-03-31", &k, 1, 2);
+        u.add_on("2026-03-31", &k, 10, 20);
+        u.add_on("2026-04-01", &k, 100, 200);
+        u.add_on("2026-04-01", &k, 1, 1);
+        let r = u.report();
+        let day = |s: &str| r.days.iter().find(|x| x.0 == s).unwrap().1[0].clone();
+        assert_eq!((day("2026-03-31").up, day("2026-03-31").down), (11, 22));
+        assert_eq!((day("2026-04-01").up, day("2026-04-01").down), (101, 201));
+        assert_eq!((r.session[0].up, r.session[0].down), (112, 223));
+        // Reporting twice does not double count.
+        assert_eq!(u.report().days, r.days);
+    }
+
+    #[test]
+    fn unreadable_file_is_set_aside() {
+        let d = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading it fails (not NotFound).
+        std::fs::create_dir(d.path().join("usage.json")).unwrap();
+        let u = Usage::new(d.path().join("usage.json"), true);
+        assert!(u.report().days.is_empty());
+        assert!(d.path().join("usage.json.bad").exists());
     }
 }
