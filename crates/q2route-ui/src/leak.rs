@@ -42,8 +42,9 @@ impl LeakCheck {
                 Ok(rt) => rt,
                 Err(e) => return cant_tell(format!("Can't tell: {e}")),
             };
+            // The timeout's timer must be created inside the runtime.
             let v = rt
-                .block_on(tokio::time::timeout(OVERALL_TIMEOUT, run(&client)))
+                .block_on(async { tokio::time::timeout(OVERALL_TIMEOUT, run(&client)).await })
                 .unwrap_or_else(|_| cant_tell("Can't tell: the check timed out".into()));
             // A hung blocking DNS call must not delay delivery of `v`.
             rt.shutdown_background();
@@ -726,6 +727,23 @@ mod tests {
         );
         assert_eq!(v.lines.len(), 1);
         assert!(!v.lines[0].contains("5.200.1.1"));
+    }
+
+    /// The real `start` path (its own runtime and the overall timeout) must
+    /// not panic: with no service it ends "not reachable", not "failed unexpectedly".
+    #[test]
+    fn start_without_service_does_not_panic() {
+        let client = Client::connect(r"\\.\pipe\q2route-test-no-such-pipe");
+        let c = LeakCheck::start(&client);
+        for _ in 0..1000 {
+            if !c.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let v = c.poll().expect("finished");
+        assert_eq!(v.level, Level::CantTell);
+        assert!(!v.headline.contains("unexpectedly"), "{}", v.headline);
     }
 
     #[test]
