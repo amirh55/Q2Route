@@ -646,3 +646,29 @@ fn direct_names_reject_geosite() {
     c.settings.dns.direct_names = vec!["GEOSITE:x".into()];
     assert!(c.validate().is_err());
 }
+
+#[test]
+fn data_usage_defaults_off() {
+    assert!(!Config::seed().settings.data_usage);
+    // A config written before the setting existed loads with it off.
+    let c: Config = toml::from_str(
+        r#"
+default_proxy = "v2ray"
+[settings]
+peek_timeout_ms = 300
+"#,
+    )
+    .unwrap();
+    assert!(!c.settings.data_usage);
+}
+
+#[test]
+fn set_data_usage_roundtrips() {
+    let mut c = Config::seed();
+    c.set_data_usage(true).unwrap();
+    assert!(c.settings.data_usage);
+    let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+    assert!(back.settings.data_usage);
+    c.set_data_usage(false).unwrap();
+    assert!(!c.settings.data_usage);
+}
