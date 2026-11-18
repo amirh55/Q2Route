@@ -12,7 +12,7 @@ use crate::client::Client;
 use crate::views::dashboard::{self, action_switch, rule_summary};
 
 const HINT: &str = "One per line. Apps: steam.exe, C:\\Games\\x.exe or a folder ending in \\. \
-Domains: example.com, *.ir, keyword:steam. IPs: 1.2.3.4, 5.0.0.0/8, geoip:ir. \
+Domains: example.com, *.ir, keyword:steam, geosite:ir. IPs: 1.2.3.4, 5.0.0.0/8, geoip:ir. \
 Ports: 443 or 27000-27100.";
 const LIST_WIDTH: f32 = 300.0;
 

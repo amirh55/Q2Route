@@ -294,6 +294,15 @@ mod tests {
     }
 
     #[test]
+    fn rule_summary_geosite_attr() {
+        let rule = Rule {
+            domains: vec!["geosite:ads@ads".into()],
+            ..Rule::default()
+        };
+        assert_eq!(rule_summary(&rule), "GeoSite ADS@ADS");
+    }
+
+    #[test]
     fn catch_all_has_no_enabled_toggle() {
         let cfg = Config::seed();
         let shown: Vec<bool> = cfg.groups.iter().map(has_enabled_toggle).collect();

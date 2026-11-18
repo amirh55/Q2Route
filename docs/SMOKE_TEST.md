@@ -131,6 +131,18 @@ Install this update with `dist\Q2Route-update\Update.cmd`. On IPv6 the relay por
 | V5 | A proxied game over IPv6 (if available). | Connections shows its UDP rows with route Proxy. | |
 | V6 | With a VPN server that has no IPv6: browse a site that has IPv6 and use a non-web proxied app (e.g. a game or SSH to an IPv6-capable host). | Works. If it doesn't, turn off "Proxy IPv6 traffic" on the Proxies page → it works over IPv4. | |
 
+## M7: geosite domain lists
+
+`geosite:ir` (Iranian sites) is in the seed's "Iranian sites" rule. `geosite.dat` is copied from the running v2rayN into `%ProgramData%\Q2Route\` on Start, like `geoip.dat`.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| G1 | Click Start, then open the log. | A line `geosite:ir: <n> names` (n in the thousands). | |
+| G2 | Open `digikala.com` and `aparat.com`, then check the Connections page. Also open a what-is-my-IP page hosted in Iran. | Both domains show Direct / "Iranian sites"; the Iran-hosted page shows your Iranian IP. | |
+| G3 | `curl.exe https://ifconfig.me` | Still shows the proxy exit IP (the German one). | |
+| G4 | Stop the service, rename `%ProgramData%\Q2Route\geosite.dat`, then Start (not Restart: Start re-copies from v2rayN, so also close v2rayN or rename its copy). | The log shows a warn line `geosite:ir: no data, so these rules match nothing`; `digikala.com` now goes via the proxy. Restore the file and Restart afterwards. | |
+| G5 | Open the Groups page. | The "Iranian sites" summary reads `*.ir + GeoSite IR`. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
