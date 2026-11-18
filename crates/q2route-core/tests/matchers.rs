@@ -122,3 +122,29 @@ fn geoip_matcher() {
         ["ir"]
     );
 }
+
+#[test]
+fn geosite_matcher() {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let sites = GeoSite::from_sets([(
+        "IR".to_string(),
+        DomainSet::from_entries(&[], &["digikala.com"], &[]),
+    )]);
+    let m = DomainPattern::parse_with("geosite:ir", &sites).unwrap();
+    assert!(m.matches("www.digikala.com"));
+    assert!(!m.matches("example.com"));
+    // Without data: parses, matches nothing.
+    let none = DomainPattern::parse("geosite:ir").unwrap();
+    assert!(!none.matches("www.digikala.com"));
+    assert!(DomainPattern::parse("geosite:").is_err());
+    assert!(DomainPattern::parse("geosite:ir@").is_err());
+    assert_eq!(
+        geosite_codes(&[
+            "geosite:IR".to_string(),
+            "*.ir".into(),
+            "geosite:ir".into(),
+            "geosite:ads@Ads".into()
+        ]),
+        ["ads@ads", "ir"]
+    );
+}

@@ -141,7 +141,7 @@ impl GeoCache {
             }
         };
         drop(slot);
-        RuleSet::compile_with(cfg, &geo)
+        RuleSet::compile_with(cfg, &geo, &q2route_core::geosite::GeoSite::default())
     }
 }
 

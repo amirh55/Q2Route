@@ -1,6 +1,7 @@
 //! Domain / IP / port / app matchers compiled from config rule strings.
 
 use crate::geoip::{GeoIp, IpSet};
+use crate::geosite::{DomainSet, GeoSite};
 use globset::GlobBuilder;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -32,12 +33,28 @@ pub enum DomainPattern {
     /// `*.ir` stores `ir`.
     Suffix(String),
     Keyword(String),
+    /// `geosite:<code>[@attr]`. `set` is `None` when no geosite data has that
+    /// key: it then matches nothing (traffic falls through to later groups).
+    Geo {
+        key: String,
+        set: Option<std::sync::Arc<DomainSet>>,
+    },
 }
 
 impl DomainPattern {
+    /// Parse without geosite data (`geosite:` entries match nothing).
     pub fn parse(s: &str) -> Result<Self, MatchError> {
+        Self::parse_with(s, &GeoSite::default())
+    }
+
+    pub fn parse_with(s: &str, sites: &GeoSite) -> Result<Self, MatchError> {
         let bad = || MatchError::Domain(s.to_string());
         let t = s.trim();
+        if let Some(key) = geosite_key(t) {
+            let key = key.ok_or_else(bad)?;
+            let set = sites.get(&key);
+            return Ok(Self::Geo { key, set });
+        }
         if let Some(k) = t.strip_prefix("keyword:") {
             let k = k.trim().to_lowercase();
             return if k.is_empty() {
@@ -72,8 +89,39 @@ impl DomainPattern {
                         && h.as_bytes()[h.len() - sfx.len() - 1] == b'.')
             }
             Self::Keyword(k) => h.contains(k.as_str()),
+            Self::Geo { set, .. } => set.as_ref().is_some_and(|s| s.contains(&h)),
         }
     }
+}
+
+/// `None` if `t` is not a `geosite:` entry; `Some(None)` if it is but the code
+/// or attribute is empty; else the lowercase key (`code` or `code@attr`).
+fn geosite_key(t: &str) -> Option<Option<String>> {
+    let rest = t.strip_prefix("geosite:")?;
+    let rest = rest.trim().to_lowercase();
+    let (code, attr) = match rest.split_once('@') {
+        Some((c, a)) => (c.trim(), Some(a.trim())),
+        None => (rest.as_str(), None),
+    };
+    if code.is_empty() || attr == Some("") {
+        return Some(None);
+    }
+    Some(Some(match attr {
+        Some(a) => format!("{code}@{a}"),
+        None => code.to_string(),
+    }))
+}
+
+/// Keys referenced as `geosite:<code>[@attr]` in `domains` entries, lowercase,
+/// sorted and deduplicated.
+pub fn geosite_codes<'a>(domains: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut v: Vec<String> = domains
+        .into_iter()
+        .filter_map(|s| geosite_key(s.trim()).flatten())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

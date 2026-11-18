@@ -221,7 +221,8 @@ impl Default for Settings {
 
 /// Bumped when the seed gains something existing configs should get too
 /// (see [`Config::migrate`]). 1: `geoip:ir` in "Iranian sites".
-pub const SEED_VERSION: u32 = 1;
+/// 2: `geosite:ir` in "Iranian sites", `geosite:steam` in "Steam".
+pub const SEED_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
@@ -273,7 +274,7 @@ impl Config {
                     Action::Direct,
                     vec![
                         Rule {
-                            domains: vec!["*.ir".into()],
+                            domains: vec!["*.ir".into(), "geosite:ir".into()],
                             ..Rule::default()
                         },
                         Rule {
@@ -288,11 +289,17 @@ impl Config {
                     "Steam",
                     false,
                     Action::Direct,
-                    vec![Rule {
-                        apps: vec!["steam.exe".into()],
-                        include_children: true,
-                        ..Rule::default()
-                    }],
+                    vec![
+                        Rule {
+                            apps: vec!["steam.exe".into()],
+                            include_children: true,
+                            ..Rule::default()
+                        },
+                        Rule {
+                            domains: vec!["geosite:steam".into()],
+                            ..Rule::default()
+                        },
+                    ],
                     false,
                 ),
                 group("games", "Games", true, Action::Direct, vec![], false),
@@ -363,6 +370,39 @@ impl Config {
                 }
             }
         }
+        if self.seed_version < 2 {
+            let has = |g: &Group, code: &str| {
+                g.rules.iter().any(|r| {
+                    r.domains
+                        .iter()
+                        .any(|d| d.trim().eq_ignore_ascii_case(code))
+                })
+            };
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == "iranian-sites") {
+                if !has(g, "geosite:ir") {
+                    let holder = g.rules.iter_mut().find(|r| {
+                        r.domains
+                            .iter()
+                            .any(|d| d.trim().eq_ignore_ascii_case("*.ir"))
+                    });
+                    match holder {
+                        Some(r) => r.domains.push("geosite:ir".into()),
+                        None => g.rules.push(Rule {
+                            domains: vec!["geosite:ir".into()],
+                            ..Rule::default()
+                        }),
+                    }
+                }
+            }
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == "steam") {
+                if !has(g, "geosite:steam") {
+                    g.rules.push(Rule {
+                        domains: vec!["geosite:steam".into()],
+                        ..Rule::default()
+                    });
+                }
+            }
+        }
         self.seed_version = SEED_VERSION;
         true
     }
@@ -422,9 +462,9 @@ impl Config {
         if let Some(n) = dns
             .direct_names
             .iter()
-            .find(|n| DomainPattern::parse(n).is_err())
+            .find(|n| DomainPattern::parse(n).is_err() || n.trim().starts_with("geosite:"))
         {
-            return bad(format!("DNS direct name '{n}' is not a valid domain"));
+            return bad(format!("DNS direct name '{n}' is not a valid domain (geosite: lists are not supported here)"));
         }
         // Ruling R18: an enabled catch-all must always exist, so unmatched
         // traffic is never silently routed some other way.

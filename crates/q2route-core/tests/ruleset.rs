@@ -8,7 +8,7 @@ fn compile_seed() {
     assert_eq!(ids, vec!["iranian-sites", "games", "everything-else"]);
     assert!(rs.groups[2].catch_all);
     assert_eq!(rs.groups[2].action, Action::Proxy("v2ray".into()));
-    assert_eq!(rs.groups[0].rules[0].domains.len(), 1);
+    assert_eq!(rs.groups[0].rules[0].domains.len(), 2);
     assert_eq!(rs.always_direct.len(), 7);
     assert!(rs.lan_direct);
 }

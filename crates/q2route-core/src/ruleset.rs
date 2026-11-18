@@ -2,7 +2,10 @@
 
 use crate::config::{Action, Config, GroupId, Protocol};
 use crate::geoip::GeoIp;
-use crate::matchers::{geoip_codes, AppMatcher, DomainPattern, IpMatcher, MatchError, PortRange};
+use crate::geosite::GeoSite;
+use crate::matchers::{
+    geoip_codes, geosite_codes, AppMatcher, DomainPattern, IpMatcher, MatchError, PortRange,
+};
 
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -45,7 +48,7 @@ fn all<T>(
 impl RuleSet {
     /// Compile without geoip data (`geoip:` entries match nothing).
     pub fn compile(cfg: &Config) -> Result<RuleSet, MatchError> {
-        Self::compile_with(cfg, &GeoIp::default())
+        Self::compile_with(cfg, &GeoIp::default(), &GeoSite::default())
     }
 
     /// `geoip:` codes used by enabled groups' rules.
@@ -58,7 +61,17 @@ impl RuleSet {
         )
     }
 
-    pub fn compile_with(cfg: &Config, geo: &GeoIp) -> Result<RuleSet, MatchError> {
+    /// `geosite:` keys used by enabled groups' rules.
+    pub fn wanted_geosite(cfg: &Config) -> Vec<String> {
+        geosite_codes(
+            cfg.groups
+                .iter()
+                .filter(|g| g.enabled)
+                .flat_map(|g| g.rules.iter().flat_map(|r| r.domains.iter())),
+        )
+    }
+
+    pub fn compile_with(cfg: &Config, geo: &GeoIp, sites: &GeoSite) -> Result<RuleSet, MatchError> {
         let mut groups = Vec::new();
         for g in cfg.groups.iter().filter(|g| g.enabled) {
             let wrap = |e: MatchError| MatchError::Group {
@@ -69,7 +82,8 @@ impl RuleSet {
             for r in &g.rules {
                 rules.push(CompiledRule {
                     apps: all(&r.apps, AppMatcher::parse).map_err(wrap)?,
-                    domains: all(&r.domains, DomainPattern::parse).map_err(wrap)?,
+                    domains: all(&r.domains, |s| DomainPattern::parse_with(s, sites))
+                        .map_err(wrap)?,
                     ips: all(&r.ips, |s| IpMatcher::parse_with(s, geo)).map_err(wrap)?,
                     ports: all(&r.ports, PortRange::parse).map_err(wrap)?,
                     protocol: r.protocol,
