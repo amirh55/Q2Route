@@ -569,4 +569,6 @@ fn direct_names_reject_geosite() {
     c.settings.dns.direct_names = vec!["geosite:ir".into()];
     let e = c.validate().unwrap_err().to_string();
     assert!(e.contains("geosite"), "{e}");
+    c.settings.dns.direct_names = vec!["GEOSITE:x".into()];
+    assert!(c.validate().is_err());
 }

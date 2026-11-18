@@ -462,7 +462,7 @@ impl Config {
         if let Some(n) = dns
             .direct_names
             .iter()
-            .find(|n| DomainPattern::parse(n).is_err() || n.trim().starts_with("geosite:"))
+            .find(|n| !matches!(DomainPattern::parse(n), Ok(p) if !matches!(p, DomainPattern::Geo { .. })))
         {
             return bad(format!("DNS direct name '{n}' is not a valid domain (geosite: lists are not supported here)"));
         }

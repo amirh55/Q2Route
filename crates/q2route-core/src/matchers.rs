@@ -97,7 +97,11 @@ impl DomainPattern {
 /// `None` if `t` is not a `geosite:` entry; `Some(None)` if it is but the code
 /// or attribute is empty; else the lowercase key (`code` or `code@attr`).
 fn geosite_key(t: &str) -> Option<Option<String>> {
-    let rest = t.strip_prefix("geosite:")?;
+    let head = t.get(..8)?;
+    if !head.eq_ignore_ascii_case("geosite:") {
+        return None;
+    }
+    let rest = &t[8..];
     let rest = rest.trim().to_lowercase();
     let (code, attr) = match rest.split_once('@') {
         Some((c, a)) => (c.trim(), Some(a.trim())),

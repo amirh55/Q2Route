@@ -136,6 +136,10 @@ fn geosite_matcher() {
     // Without data: parses, matches nothing.
     let none = DomainPattern::parse("geosite:ir").unwrap();
     assert!(!none.matches("www.digikala.com"));
+    let up = DomainPattern::parse_with("GEOSITE:IR", &sites).unwrap();
+    assert!(up.matches("www.digikala.com"));
+    assert_eq!(geosite_codes(&["GEOSITE:IR".to_string()]), ["ir"]);
+    assert!(DomainPattern::parse("GeoSite:").is_err());
     assert!(DomainPattern::parse("geosite:").is_err());
     assert!(DomainPattern::parse("geosite:ir@").is_err());
     assert_eq!(

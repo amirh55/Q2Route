@@ -978,3 +978,27 @@ fn geosite_and_port_anded() {
         fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
     );
 }
+
+#[test]
+fn seed_steam_geosite_end_to_end() {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let mut c = Config::seed();
+    c.set_group_enabled("steam", true).unwrap();
+    let sites = GeoSite::from_sets([
+        (
+            "steam".to_string(),
+            DomainSet::from_entries(&[], &["steampowered.com"], &[]),
+        ),
+        (
+            "ir".to_string(),
+            DomainSet::from_entries(&[], &["digikala.com"], &[]),
+        ),
+    ]);
+    let rs = RuleSet::compile_with(&c, &q2route_core::geoip::GeoIp::default(), &sites).unwrap();
+    let go = |dst, dom| run(&rs, &HashSet::new(), Protocol::Tcp, 40, dst, dom);
+    assert_eq!(
+        go("34.160.111.145:443", Some("store.steampowered.com")),
+        fin(Route::Direct, Some("steam"), MatchReason::Own)
+    );
+    assert_eq!(go("34.160.111.145:443", None), Decision::NeedDomain);
+}
