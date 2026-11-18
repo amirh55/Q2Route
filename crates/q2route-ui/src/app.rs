@@ -89,6 +89,7 @@ pub struct App {
     dns: DnsView,
     groups: GroupsView,
     connections: ConnectionsView,
+    leak: settings_view::LeakState,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
@@ -122,6 +123,7 @@ impl App {
             dns: DnsView::default(),
             groups: GroupsView::default(),
             connections: ConnectionsView::default(),
+            leak: settings_view::LeakState::default(),
             hide_on_start: hidden && tray.is_some(),
             tray,
             exiting: false,
@@ -238,9 +240,13 @@ impl eframe::App for App {
                             .show(ui, snap.as_ref(), &self.client, &mut self.requests)
                     }
                     Page::Dns => self.dns.show(ui, snap.as_ref(), &self.client),
-                    Page::Settings => {
-                        settings_view::show(ui, &mut self.settings, &mut self.requests)
-                    }
+                    Page::Settings => settings_view::show(
+                        ui,
+                        &mut self.settings,
+                        &mut self.requests,
+                        &self.client,
+                        &mut self.leak,
+                    ),
                     _ => placeholder::show(ui, self.page.label()),
                 });
         });

@@ -143,6 +143,18 @@ Install this update with `dist\Q2Route-update\Update.cmd`. On IPv6 the relay por
 | G4 | Stop the service, rename `%ProgramData%\Q2Route\geosite.dat`, then Start (not Restart: Start re-copies from v2rayN, so also close v2rayN or rename its copy). | The log shows a warn line `geosite:ir: no data, so these rules match nothing`; `digikala.com` now goes via the proxy. Restore the file and Restart afterwards. | |
 | G5 | Open the Groups page. | The "Iranian sites" summary reads `*.ir + GeoSite IR`. | |
 
+## M8: leak check
+
+Settings page, "Leak check" section, button "Run leak check" (takes up to 30 s).
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| M8-L1 | Normal run: service Running, v2ray up, click "Run leak check". | Green "No leak: proxied apps appear as <German IP> (Germany, ...)"; the DNS resolver line shows a resolver that is not Iranian. | |
+| M8-L2 | Stop v2ray, then click "Run leak check". | "No leak, but proxied traffic isn't getting through". Start v2ray again afterwards. | |
+| M8-L3 | Click Stop on the dashboard, then "Run leak check". | Grey "Can't tell: Q2Route is stopped". Click Start afterwards. | |
+| M8-L4 | Add `q2route.exe` to a Direct group, Restart, then "Run leak check". | Grey "Can't tell: this check was routed Direct by ...". Remove it from the group and Restart afterwards. | |
+| M8-L5 | Run the check and read the IPv6 line. | It matches the M6 smoke result (V1-V3) for this machine. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
