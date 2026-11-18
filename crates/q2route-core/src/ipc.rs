@@ -38,6 +38,9 @@ pub enum Request {
     SetDns(DnsSettings),
     FlushDns,
     SetProxyIpv6 { enabled: bool },
+    GetUsage,
+    SetDataUsage { enabled: bool },
+    ResetUsage,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -71,6 +74,27 @@ pub enum Response {
     Error(String),
     Connections(Vec<ConnInfo>),
     Processes(Vec<ProcEntry>),
+    Usage(UsageReport),
+}
+
+/// Proxied bytes of one (group, app, proxy).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageRow {
+    pub group: GroupId,
+    /// Lowercase exe file name, or `?`.
+    pub app: String,
+    pub proxy: ProfileId,
+    pub up: u64,
+    pub down: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageReport {
+    pub enabled: bool,
+    /// Since the service started (or the last reset).
+    pub session: Vec<UsageRow>,
+    /// Local days `YYYY-MM-DD`, oldest first.
+    pub days: Vec<(String, Vec<UsageRow>)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

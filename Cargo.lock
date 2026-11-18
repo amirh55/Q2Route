@@ -2118,6 +2118,7 @@ dependencies = [
  "dashmap",
  "etherparse",
  "q2route-core",
+ "serde",
  "serde_json",
  "socket2",
  "tempfile",

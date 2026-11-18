@@ -500,6 +500,10 @@ impl Inner {
                 .await
             }
             // The pipe server answers Subscribe itself (via `subscribe`).
+            // Wired in the next commit.
+            Request::GetUsage | Request::SetDataUsage { .. } | Request::ResetUsage => {
+                Response::Error("data usage is not wired yet".into())
+            }
             Request::Subscribe => Response::Ok,
         }
     }
