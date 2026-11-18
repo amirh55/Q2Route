@@ -91,6 +91,9 @@ pub struct UsageRow {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UsageReport {
     pub enabled: bool,
+    /// The service's local date `YYYY-MM-DD` (the UI has no clock zone of its own).
+    #[serde(default)]
+    pub today: String,
     /// Since the service started (or the last reset).
     pub session: Vec<UsageRow>,
     /// Local days `YYYY-MM-DD`, oldest first.

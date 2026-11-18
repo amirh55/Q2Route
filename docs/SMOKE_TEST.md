@@ -158,6 +158,19 @@ Settings page, "Leak check" section, button "Run leak check" (takes up to 30 s).
 
 Limit of the method: the DNS probe sees the resolver that answers this process's query and the client subnet it forwards. A direct DNS query to a foreign anycast resolver that sends no client subnet (EDNS Client Subnet) shows a foreign resolver, so the check can't detect it; such a query still reveals your real IP to that resolver.
 
+## M9: data usage
+
+Data usage page. Counts only proxied traffic (TCP through the relay, UDP through the UDP relay); Direct traffic is not counted. The history is `%ProgramData%\Q2Route\usage.json`.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| M9-U1 | Fresh install (or no `usage.json`, `data_usage` not set in `config.toml`). Open the Data usage page, then browse. | The "Count data usage" switch is off, with the one-line explanation and nothing else; no `usage.json` exists after browsing. | |
+| M9-U2 | Switch it on and browse a proxied site. | "By app" shows the browser, "By proxy" shows v2ray, and the numbers grow (refresh every 2 s). | |
+| M9-U3 | Browse a Direct site, such as an Iranian one. | The totals do not increase. | |
+| M9-U4 | Restart the service. | Session resets to empty; Today keeps its value. | |
+| M9-U5 | Press Reset and answer Yes. | Everything is cleared and `usage.json` is deleted. | |
+| M9-U6 | Switch it off. | The numbers stop growing; the history is kept in `usage.json` (and shows again when switched back on). | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |

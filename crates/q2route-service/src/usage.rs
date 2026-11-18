@@ -207,6 +207,7 @@ impl Usage {
             .collect();
         UsageReport {
             enabled: self.enabled(),
+            today: today(),
             session,
             days,
         }
