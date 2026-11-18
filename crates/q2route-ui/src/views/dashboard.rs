@@ -25,7 +25,14 @@ pub fn rule_summary(r: &Rule) -> String {
             apps
         });
     }
-    parts.extend(r.domains.iter().cloned());
+    parts.extend(
+        r.domains
+            .iter()
+            .map(|d| match d.trim().strip_prefix("geosite:") {
+                Some(code) => format!("GeoSite {}", code.trim().to_uppercase()),
+                None => d.clone(),
+            }),
+    );
     parts.extend(r.ips.iter().map(|i| match i.trim().strip_prefix("geoip:") {
         Some(code) => format!("GeoIP {}", code.trim().to_uppercase()),
         None => i.clone(),
@@ -278,8 +285,8 @@ mod tests {
         assert_eq!(
             s,
             [
-                "*.ir; GeoIP IR",
-                "steam.exe + children",
+                "*.ir + GeoSite IR; GeoIP IR",
+                "steam.exe + children; GeoSite STEAM",
                 "No rules yet",
                 "catch-all"
             ]
