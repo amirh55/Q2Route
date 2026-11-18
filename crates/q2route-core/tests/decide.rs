@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 fn cfg() -> Config {
     let mut c = Config::seed();
+    // The shared-names exception has its own test; these index the others.
+    c.groups.remove(0);
     c.set_group_enabled("steam", true).unwrap();
     // These tests exercise the app rule; the seed's geosite:steam rule would
     // make unknown domains matter (it has its own tests).
@@ -910,6 +912,39 @@ fn geosite_ir_direct() {
             "34.160.111.145:443",
             Some("www.digikala.com")
         ),
+        fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
+    );
+}
+
+#[test]
+fn shared_names_in_geosite_ir_are_proxied_not_direct() {
+    use q2route_core::geosite::{DomainSet, GeoSite};
+    let sites = GeoSite::from_sets([(
+        "ir".to_string(),
+        DomainSet::from_entries(&[], &["co.com", "digikala.com"], &[]),
+    )]);
+    let rs = RuleSet::compile_with(
+        &Config::seed(),
+        &q2route_core::geoip::GeoIp::default(),
+        &sites,
+    )
+    .unwrap();
+    let go = |host| {
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            40,
+            "34.160.111.145:443",
+            Some(host),
+        )
+    };
+    assert_eq!(
+        go("shop.co.com"),
+        fin(proxy(), Some("not-iranian"), MatchReason::Own)
+    );
+    assert_eq!(
+        go("www.digikala.com"),
         fin(Route::Direct, Some("iranian-sites"), MatchReason::Own)
     );
 }

@@ -29,7 +29,7 @@ pub struct DomainSet {
     full: HashSet<String>,
     roots: HashSet<String>,
     keywords: Vec<String>,
-    skipped_regex: usize,
+    skipped: usize,
 }
 
 impl DomainSet {
@@ -75,7 +75,7 @@ impl DomainSet {
             full: norm(full).into_iter().collect(),
             roots: norm(roots).into_iter().collect(),
             keywords: norm(keywords),
-            skipped_regex: 0,
+            skipped: 0,
         }
     }
 }
@@ -176,7 +176,7 @@ impl GeoSite {
                     // A code may appear more than once: merge into the same set.
                     let set = built.entry(key.clone()).or_default();
                     if value.is_empty() {
-                        set.skipped_regex += 1;
+                        set.skipped += 1;
                         continue;
                     }
                     match d.ty {
@@ -187,7 +187,7 @@ impl GeoSite {
                         3 => {
                             set.full.insert(value.clone());
                         }
-                        _ => set.skipped_regex += 1,
+                        _ => set.skipped += 1,
                     }
                 }
             }
@@ -210,9 +210,7 @@ impl GeoSite {
     }
 
     /// Number of regex / unsupported-type rules dropped from list `key`.
-    pub fn skipped_regex(&self, key: &str) -> usize {
-        self.sets
-            .get(&key.to_lowercase())
-            .map_or(0, |s| s.skipped_regex)
+    pub fn skipped(&self, key: &str) -> usize {
+        self.sets.get(&key.to_lowercase()).map_or(0, |s| s.skipped)
     }
 }

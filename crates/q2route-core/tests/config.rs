@@ -11,6 +11,11 @@ fn seed_matches_spec() {
     assert_eq!(
         g,
         vec![
+            (
+                "Shared names (not Iranian)",
+                Action::Proxy("v2ray".into()),
+                true
+            ),
             ("Iranian sites", Action::Direct, true),
             ("Steam", Action::Direct, false),
             ("Games", Action::Direct, true),
@@ -18,14 +23,28 @@ fn seed_matches_spec() {
         ]
     );
     let ids: Vec<_> = c.groups.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(ids, ["iranian-sites", "steam", "games", "everything-else"]);
-    assert_eq!(c.groups[0].rules[0].domains, ["*.ir", "geosite:ir"]);
-    assert_eq!(c.groups[0].rules[1].ips, ["geoip:ir"]);
+    assert_eq!(
+        ids,
+        [
+            "not-iranian",
+            "iranian-sites",
+            "steam",
+            "games",
+            "everything-else"
+        ]
+    );
+    assert_eq!(
+        c.groups[0].rules[0].domains,
+        ["*.co.com", "*.pe.hu", "*.info.com", "*.f.com"]
+    );
+    assert!(!c.groups[0].catch_all);
+    assert_eq!(c.groups[1].rules[0].domains, ["*.ir", "geosite:ir"]);
+    assert_eq!(c.groups[1].rules[1].ips, ["geoip:ir"]);
     assert_eq!(c.seed_version, SEED_VERSION);
-    assert_eq!(c.groups[1].rules[0].apps, ["steam.exe"]);
-    assert!(c.groups[1].rules[0].include_children);
-    assert!(c.groups[2].rules.is_empty());
-    assert!(c.groups[3].catch_all && c.groups[3].rules.is_empty());
+    assert_eq!(c.groups[2].rules[0].apps, ["steam.exe"]);
+    assert!(c.groups[2].rules[0].include_children);
+    assert!(c.groups[3].rules.is_empty());
+    assert!(c.groups[4].catch_all && c.groups[4].rules.is_empty());
     assert_eq!(c.proxies.len(), 1);
     let p = &c.proxies[0];
     assert_eq!(
@@ -157,7 +176,7 @@ fn validate_rejects() {
     assert!(c.validate().is_err());
 
     let mut c = Config::seed();
-    c.groups.swap(2, 3);
+    c.groups.swap(3, 4);
     assert!(c.validate().is_err());
 
     let mut c = Config::seed();
@@ -264,13 +283,14 @@ fn migrate_adds_geoip_ir_once() {
     // An M1 config: no seed_version, "Iranian sites" has only *.ir.
     let mut old = Config::seed();
     old.seed_version = 0;
+    old.groups.remove(0);
     old.groups[0].rules.truncate(1);
     old.save(&path).unwrap();
 
     let c = Config::load(&path).unwrap();
     assert_eq!(c.seed_version, SEED_VERSION);
-    assert_eq!(c.groups[0].rules.len(), 2);
-    assert_eq!(c.groups[0].rules[1].ips, ["geoip:ir"]);
+    assert_eq!(c.groups[1].rules.len(), 2);
+    assert_eq!(c.groups[1].rules[1].ips, ["geoip:ir"]);
     // Saved, and not added again on the next load.
     let again = Config::load(&path).unwrap();
     assert_eq!(again, c);
@@ -281,13 +301,13 @@ fn migrate_respects_user_changes() {
     // geoip:ir already present (any case): not duplicated.
     let mut c = Config::seed();
     c.seed_version = 0;
-    c.groups[0].rules[1].ips = vec!["GeoIP:IR".into()];
+    c.groups[1].rules[1].ips = vec!["GeoIP:IR".into()];
     assert!(c.migrate());
-    assert_eq!(c.groups[0].rules.len(), 2);
+    assert_eq!(c.groups[1].rules.len(), 2);
     // Group removed by the user: nothing re-created.
     let mut c = Config::seed();
     c.seed_version = 0;
-    c.groups.remove(0);
+    c.groups.remove(1);
     let before = c.groups.clone();
     assert!(c.migrate());
     assert_eq!(c.groups, before);
@@ -310,6 +330,7 @@ fn add_group_inserts_before_catch_all_with_unique_id() {
     assert_eq!(
         ids,
         [
+            "not-iranian",
             "iranian-sites",
             "steam",
             "games",
@@ -326,7 +347,7 @@ fn delete_rename_move_respect_catch_all() {
     let mut c = Config::seed();
     assert!(c.delete_group("everything-else").is_err());
     assert!(c.move_group("everything-else", 0).is_err());
-    assert!(c.move_group("games", 3).is_err()); // catch-all's index
+    assert!(c.move_group("games", 4).is_err()); // catch-all's index
     c.move_group("games", 0).unwrap();
     assert_eq!(c.groups[0].id, "games");
     c.rename_group("games", "Online games").unwrap();
@@ -505,14 +526,15 @@ fn hand_edited_bad_dns_settings_rejected_at_load() {
 #[test]
 fn seed_has_geosite() {
     let c = Config::seed();
-    assert_eq!(c.groups[0].rules[0].domains, ["*.ir", "geosite:ir"]);
-    assert_eq!(c.groups[1].rules[1].domains, ["geosite:steam"]);
-    assert!(!c.groups[1].enabled);
+    assert_eq!(c.groups[1].rules[0].domains, ["*.ir", "geosite:ir"]);
+    assert_eq!(c.groups[2].rules[1].domains, ["geosite:steam"]);
+    assert!(!c.groups[2].enabled);
 }
 
 #[test]
 fn migrate_adds_geosite_once() {
     let strip = |c: &mut Config| {
+        c.groups.remove(0); // not-iranian: added back by the migration
         c.groups[0].rules[0].domains = vec!["*.ir".into()];
         c.groups[1].rules.truncate(1);
     };
@@ -535,24 +557,24 @@ fn migrate_adds_geosite_once() {
     z.groups[0].rules.truncate(1);
     z.seed_version = 0;
     assert!(z.migrate());
-    assert_eq!(z.groups[0].rules[0].domains, ["*.ir", "geosite:ir"]);
-    assert_eq!(z.groups[0].rules[1].ips, ["geoip:ir"]);
-    assert_eq!(z.groups[1].rules[1].domains, ["geosite:steam"]);
+    assert_eq!(z.groups[1].rules[0].domains, ["*.ir", "geosite:ir"]);
+    assert_eq!(z.groups[1].rules[1].ips, ["geoip:ir"]);
+    assert_eq!(z.groups[2].rules[1].domains, ["geosite:steam"]);
     // An existing GEOSITE:IR is not duplicated.
     let mut e = Config::seed();
     strip(&mut e);
     e.groups[0].rules[0].domains = vec!["*.ir".into(), "GEOSITE:IR".into()];
     e.seed_version = 1;
     assert!(e.migrate());
-    assert_eq!(e.groups[0].rules[0].domains, ["*.ir", "GEOSITE:IR"]);
-    assert_eq!(e.groups[0].rules.len(), 2);
+    assert_eq!(e.groups[1].rules[0].domains, ["*.ir", "GEOSITE:IR"]);
+    assert_eq!(e.groups[1].rules.len(), 2);
     // No steam group: only the Iranian one.
     let mut n = Config::seed();
     strip(&mut n);
     n.groups.remove(1);
     n.seed_version = 1;
     assert!(n.migrate());
-    assert_eq!(n.groups[0].rules[0].domains, ["*.ir", "geosite:ir"]);
+    assert_eq!(n.groups[1].rules[0].domains, ["*.ir", "geosite:ir"]);
     assert!(n.groups.iter().all(|g| g.id != "steam"));
     // No rule holds *.ir: a new rule is added.
     let mut m = Config::seed();
@@ -560,7 +582,59 @@ fn migrate_adds_geosite_once() {
     m.groups[0].rules[0].domains = vec!["example.ir".into()];
     m.seed_version = 1;
     assert!(m.migrate());
-    assert_eq!(m.groups[0].rules.last().unwrap().domains, ["geosite:ir"]);
+    assert_eq!(m.groups[1].rules.last().unwrap().domains, ["geosite:ir"]);
+}
+
+#[test]
+fn migrate_inserts_not_iranian_before_iranian_once() {
+    let mut c = Config::seed();
+    c.groups.remove(0);
+    c.seed_version = 1;
+    assert!(c.migrate());
+    let ids: Vec<_> = c.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "not-iranian",
+            "iranian-sites",
+            "steam",
+            "games",
+            "everything-else"
+        ]
+    );
+    assert_eq!(c.groups[0], Config::seed().groups[0]);
+    assert_eq!(c.groups[0].action, Action::Proxy(c.default_proxy.clone()));
+    // Already migrated: no duplicate.
+    c.seed_version = 1;
+    assert!(c.migrate());
+    assert_eq!(c.groups.iter().filter(|g| g.id == "not-iranian").count(), 1);
+    // No Iranian group: nothing to override, nothing inserted.
+    let mut n = Config::seed();
+    n.groups.drain(0..2);
+    n.seed_version = 1;
+    assert!(n.migrate());
+    assert!(n.groups.iter().all(|g| g.id != "not-iranian"));
+}
+
+#[test]
+fn v1_config_with_geosite_direct_name_loads_and_drops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut old = Config::seed();
+    old.seed_version = 1;
+    old.settings.dns.direct_names = vec!["geosite:foo".into(), "ok.example.com".into()];
+    old.save(&path).unwrap();
+    let c = Config::load(&path).unwrap();
+    assert_eq!(c.settings.dns.direct_names, ["ok.example.com"]);
+    assert_eq!(Config::load(&path).unwrap(), c);
+}
+
+#[test]
+fn plain_bad_direct_name_has_no_geosite_hint() {
+    let mut c = Config::seed();
+    c.settings.dns.direct_names = vec!["*.".into()];
+    let e = c.validate().unwrap_err().to_string();
+    assert!(!e.contains("geosite"), "{e}");
 }
 
 #[test]

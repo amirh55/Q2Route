@@ -167,9 +167,9 @@ impl GeoCache {
             match geo.get(key) {
                 Some(s) => {
                     tracing::info!("geosite:{key}: {} names", s.len());
-                    let n = geo.skipped_regex(key);
+                    let n = geo.skipped(key);
                     if n > 0 {
-                        tracing::info!("geosite:{key}: {n} regex entries skipped");
+                        tracing::info!("geosite:{key}: {n} entries skipped (regex or unsupported)");
                     }
                 }
                 None => tracing::warn!(
@@ -192,11 +192,11 @@ impl GeoCache {
 
     /// Compiles `cfg`, loading each geo file only when its wanted keys changed.
     pub fn compile(&self, cfg: &Config) -> Result<RuleSet, MatchError> {
-        let ip = cached(&self.ip, RuleSet::wanted_geoip(cfg), || {
-            self.load_ip(&RuleSet::wanted_geoip(cfg))
-        });
-        let site = cached(&self.site, RuleSet::wanted_geosite(cfg), || {
-            self.load_site(&RuleSet::wanted_geosite(cfg))
+        let wanted_ip = RuleSet::wanted_geoip(cfg);
+        let wanted_site = RuleSet::wanted_geosite(cfg);
+        let ip = cached(&self.ip, wanted_ip.clone(), || self.load_ip(&wanted_ip));
+        let site = cached(&self.site, wanted_site.clone(), || {
+            self.load_site(&wanted_site)
         });
         RuleSet::compile_with(cfg, &ip, &site)
     }
@@ -306,7 +306,7 @@ mod tests {
         let cache = GeoCache::new(ours.path().to_path_buf());
         let rs = cache.compile(&Config::seed()).unwrap();
         let ip = "185.188.107.12".parse().unwrap();
-        assert!(!rs.groups[0].rules[1].ips[0].matches(ip));
+        assert!(!rs.groups[1].rules[1].ips[0].matches(ip));
     }
 
     #[test]
@@ -314,7 +314,24 @@ mod tests {
         let ours = tempfile::tempdir().unwrap();
         let cache = GeoCache::new(ours.path().to_path_buf());
         let rs = cache.compile(&Config::seed()).unwrap();
-        let rule = &rs.groups[0].rules[0];
+        let rule = &rs.groups[1].rules[0];
+        assert!(!rule.domains.iter().any(|d| d.matches("www.digikala.com")));
+        assert!(rule.domains.iter().any(|d| d.matches("example.ir")));
+    }
+
+    #[test]
+    fn corrupt_geosite_matches_nothing() {
+        let ours = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ours.path().join(GEOSITE_FILE),
+            [
+                0xffu8, 0xfe, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            ],
+        )
+        .unwrap();
+        let cache = GeoCache::new(ours.path().to_path_buf());
+        let rs = cache.compile(&Config::seed()).unwrap();
+        let rule = &rs.groups[1].rules[0];
         assert!(!rule.domains.iter().any(|d| d.matches("www.digikala.com")));
         assert!(rule.domains.iter().any(|d| d.matches("example.ir")));
     }
@@ -329,7 +346,7 @@ mod tests {
         .unwrap();
         let cache = GeoCache::new(ours.path().to_path_buf());
         let rs = cache.compile(&Config::seed()).unwrap();
-        let rule = &rs.groups[0].rules[0];
+        let rule = &rs.groups[1].rules[0];
         assert!(rule.domains.iter().any(|d| d.matches("www.digikala.com")));
         assert!(!rule.domains.iter().any(|d| d.matches("example.com")));
     }

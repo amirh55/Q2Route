@@ -550,13 +550,19 @@ mod tests {
 
     #[test]
     fn move_buttons_respect_edges_and_catch_all() {
-        // Seed: three movable groups then the catch-all.
+        // Seed: four movable groups then the catch-all.
         let g = Config::seed().groups;
-        assert_eq!(g.len(), 4);
-        let m: Vec<_> = (0..4).map(|i| can_move(&g, i)).collect();
+        assert_eq!(g.len(), 5);
+        let m: Vec<_> = (0..5).map(|i| can_move(&g, i)).collect();
         assert_eq!(
             m,
-            [(false, true), (true, true), (true, false), (false, false)]
+            [
+                (false, true),
+                (true, true),
+                (true, true),
+                (true, false),
+                (false, false)
+            ]
         );
     }
 }

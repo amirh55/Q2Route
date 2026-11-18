@@ -118,7 +118,7 @@ fn only_wanted_codes_decoded() {
     let g = GeoSite::parse(&fixture(), &["ir".into()]).unwrap();
     assert!(g.get("steam").is_none());
     assert_eq!(g.get("ir").unwrap().len(), 4);
-    assert_eq!(g.skipped_regex("ir"), 1);
+    assert_eq!(g.skipped("ir"), 1);
 }
 
 #[test]
@@ -173,7 +173,7 @@ fn empty_values_are_skipped() {
     assert!(!s.contains("") && !s.contains(".") && !s.contains(".."));
     assert!(s.contains("ok.example"));
     assert_eq!(s.len(), 1);
-    assert_eq!(g.skipped_regex("empty"), 3);
+    assert_eq!(g.skipped("empty"), 3);
     let d = q2route_core::geosite::DomainSet::from_entries(&[""], &[""], &[""]);
     assert!(d.is_empty() && !d.contains("google.com"));
 }

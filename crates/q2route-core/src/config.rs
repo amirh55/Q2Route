@@ -221,8 +221,13 @@ impl Default for Settings {
 
 /// Bumped when the seed gains something existing configs should get too
 /// (see [`Config::migrate`]). 1: `geoip:ir` in "Iranian sites".
-/// 2: `geosite:ir` in "Iranian sites", `geosite:steam` in "Steam".
+/// 2: `geosite:ir` in "Iranian sites", `geosite:steam` in "Steam", the
+/// "Shared names (not Iranian)" group.
 pub const SEED_VERSION: u32 = 2;
+
+/// Roots anyone can register under; `geosite:ir` lists them, but they are
+/// not Iranian, so the seed proxies them ahead of "Iranian sites".
+const NOT_IRANIAN: [&str; 4] = ["*.co.com", "*.pe.hu", "*.info.com", "*.f.com"];
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
@@ -267,6 +272,17 @@ impl Config {
                 password: None,
             }],
             groups: vec![
+                group(
+                    "not-iranian",
+                    "Shared names (not Iranian)",
+                    true,
+                    Action::Proxy("v2ray".into()),
+                    vec![Rule {
+                        domains: NOT_IRANIAN.iter().map(|d| d.to_string()).collect(),
+                        ..Rule::default()
+                    }],
+                    false,
+                ),
                 group(
                     "iranian-sites",
                     "Iranian sites",
@@ -334,8 +350,11 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let mut c: Config = toml::from_str(&s)?;
+                // Migrate first: it drops entries older versions accepted
+                // and validation now rejects.
+                let migrated = c.migrate();
                 c.validate()?;
-                if c.migrate() {
+                if migrated {
                     c.save(path)?;
                 }
                 Ok(c)
@@ -371,6 +390,28 @@ impl Config {
             }
         }
         if self.seed_version < 2 {
+            self.settings
+                .dns
+                .direct_names
+                .retain(|n| !matches!(DomainPattern::parse(n), Ok(DomainPattern::Geo { .. })));
+            if !self.groups.iter().any(|g| g.id == "not-iranian") {
+                if let Some(at) = self.groups.iter().position(|g| g.id == "iranian-sites") {
+                    self.groups.insert(
+                        at,
+                        Group {
+                            id: "not-iranian".into(),
+                            name: "Shared names (not Iranian)".into(),
+                            enabled: true,
+                            action: Action::Proxy(self.default_proxy.clone()),
+                            rules: vec![Rule {
+                                domains: NOT_IRANIAN.iter().map(|d| d.to_string()).collect(),
+                                ..Rule::default()
+                            }],
+                            catch_all: false,
+                        },
+                    );
+                }
+            }
             let has = |g: &Group, code: &str| {
                 g.rules.iter().any(|r| {
                     r.domains
@@ -464,7 +505,12 @@ impl Config {
             .iter()
             .find(|n| !matches!(DomainPattern::parse(n), Ok(p) if !matches!(p, DomainPattern::Geo { .. })))
         {
-            return bad(format!("DNS direct name '{n}' is not a valid domain (geosite: lists are not supported here)"));
+            let hint = if matches!(DomainPattern::parse(n), Ok(DomainPattern::Geo { .. })) {
+                " (geosite: lists are not supported here)"
+            } else {
+                ""
+            };
+            return bad(format!("DNS direct name '{n}' is not a valid domain{hint}"));
         }
         // Ruling R18: an enabled catch-all must always exist, so unmatched
         // traffic is never silently routed some other way.
