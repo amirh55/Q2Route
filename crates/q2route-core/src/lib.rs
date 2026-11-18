@@ -5,6 +5,7 @@ pub mod decide;
 pub mod dns;
 pub mod domain_map;
 pub mod geoip;
+pub mod geosite;
 pub mod ipc;
 pub mod matchers;
 pub mod peek;

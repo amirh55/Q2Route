@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error("malformed geoip.dat: {0}")]
-pub struct GeoIpError(&'static str);
+pub struct GeoIpError(pub(crate) &'static str);
 
 /// Sorted, merged, inclusive address ranges.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -112,12 +112,12 @@ pub struct GeoIp {
     sets: HashMap<String, Arc<IpSet>>,
 }
 
-struct Reader<'a> {
-    b: &'a [u8],
+pub(crate) struct Reader<'a> {
+    pub(crate) b: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.b.is_empty()
     }
 
@@ -144,7 +144,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Next field: (number, wire type, payload for length-delimited / varint value).
-    fn field(&mut self) -> Result<(u64, Field<'a>), GeoIpError> {
+    pub(crate) fn field(&mut self) -> Result<(u64, Field<'a>), GeoIpError> {
         let key = self.varint()?;
         let f = match key & 7 {
             0 => Field::Varint(self.varint()?),
@@ -166,7 +166,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-enum Field<'a> {
+pub(crate) enum Field<'a> {
     Varint(u64),
     Bytes(&'a [u8]),
     Other,
