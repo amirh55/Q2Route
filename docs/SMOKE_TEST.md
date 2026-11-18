@@ -143,6 +143,21 @@ Install this update with `dist\Q2Route-update\Update.cmd`. On IPv6 the relay por
 | G4 | Stop the service, rename `%ProgramData%\Q2Route\geosite.dat`, then Start (not Restart: Start re-copies from v2rayN, so also close v2rayN or rename its copy). | The log shows a warn line `geosite:ir: no data, so these rules match nothing`; `digikala.com` now goes via the proxy. Restore the file and Restart afterwards. | |
 | G5 | Open the Groups page. | The "Iranian sites" summary reads `*.ir + GeoSite IR`. | |
 
+## M8: leak check
+
+Settings page, "Leak check" section, button "Run leak check" (takes up to 30 s).
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| M8-L1 | Normal run: service Running, v2ray up, click "Run leak check". | Green "No leak: proxied apps appear as <IP> (<country>, ...)", where the country is the v2ray server's country, not Iran. The DNS line shows a resolver (and, if listed, a client subnet) that is not Iranian. | |
+| M8-L2 | Stop v2ray, then click "Run leak check". | "No leak, but proxied traffic isn't getting through". Start v2ray again afterwards. | |
+| M8-L3 | Click Stop on the dashboard, then "Run leak check". | Grey "Can't tell: Q2Route is stopped (everything goes direct)", with no result lines and no IP shown. Click Start afterwards. | |
+| M8-L4 | Add `q2route.exe` to a Direct group, Restart, then "Run leak check". | Grey "Can't tell: this check was routed Direct by ..." (or "... routed Direct (always-direct app or no group)"); one IPv4 line reading "address not shown (routed Direct)", no IP shown. Remove it from the group and Restart afterwards. | |
+| M8-L5 | Run the check and read the IPv6 line. | It matches the M6 smoke result (V1-V3) for this machine. | |
+| M8-L6 | v2ray running, but its server unreachable (e.g. point the v2rayN profile at a dead address, or block the server IP in the firewall), then "Run leak check". | "No leak, but proxied traffic isn't getting through", shown within 30 s. Restore the profile afterwards. | |
+
+Limit of the method: the DNS probe sees the resolver that answers this process's query and the client subnet it forwards. A direct DNS query to a foreign anycast resolver that sends no client subnet (EDNS Client Subnet) shows a foreign resolver, so the check can't detect it; such a query still reveals your real IP to that resolver.
+
 ## Leak checks
 
 | # | Check | Expected | Result |

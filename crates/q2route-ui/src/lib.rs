@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod client;
+pub mod leak;
 pub mod settings;
 pub mod tray;
 pub mod tray_icon_render;

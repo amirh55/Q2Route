@@ -7,6 +7,7 @@ pub mod domain_map;
 pub mod geoip;
 pub mod geosite;
 pub mod ipc;
+pub mod leak;
 pub mod matchers;
 pub mod peek;
 pub mod process_tree;
