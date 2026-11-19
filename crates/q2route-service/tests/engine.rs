@@ -198,3 +198,97 @@ async fn get_log_answers() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+fn dir_of(p: &std::path::Path) -> PathBuf {
+    p.parent().unwrap().to_path_buf()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_replaces_config_and_keeps_backup() {
+    let path = temp_config("import");
+    let engine = Engine::new(path.clone()).unwrap();
+    let old_text = std::fs::read_to_string(&path).unwrap();
+    let mut new = Config::seed();
+    new.groups
+        .iter_mut()
+        .find(|g| g.id == "steam")
+        .unwrap()
+        .enabled = true;
+    new.settings.peek_timeout_ms = 777;
+    assert_eq!(
+        engine.handle(Request::ImportConfig(new.clone())).await,
+        Response::Ok
+    );
+    assert_eq!(Config::load(&path).unwrap(), new);
+    assert_eq!(engine.snapshot().config, new);
+    let bak = dir_of(&path).join("config.toml.bak");
+    assert_eq!(std::fs::read_to_string(bak).unwrap(), old_text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_keeps_password_when_missing() {
+    let path = temp_config("import-pw");
+    let engine = Engine::new(path.clone()).unwrap();
+    let mut cur = engine.snapshot().config;
+    cur.proxies[0].password = Some("secret".into());
+    assert_eq!(
+        engine.handle(Request::ImportConfig(cur.clone())).await,
+        Response::Ok
+    );
+
+    let mut imported = cur.clone();
+    imported.proxies[0].password = None;
+    imported.proxies[0].host = "10.0.0.9".into();
+    assert_eq!(
+        engine.handle(Request::ImportConfig(imported)).await,
+        Response::Ok
+    );
+    let got = Config::load(&path).unwrap();
+    assert_eq!(got.proxies[0].host, "10.0.0.9");
+    assert_eq!(got.proxies[0].password.as_deref(), Some("secret"));
+
+    // A new id has nothing to inherit; an explicit password wins.
+    let mut imported = got.clone();
+    imported.proxies[0].password = Some("other".into());
+    assert_eq!(
+        engine.handle(Request::ImportConfig(imported)).await,
+        Response::Ok
+    );
+    assert_eq!(
+        Config::load(&path).unwrap().proxies[0].password.as_deref(),
+        Some("other")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_invalid_changes_nothing() {
+    let path = temp_config("import-bad");
+    let engine = Engine::new(path.clone()).unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let mut bad = Config::seed();
+    bad.default_proxy = "nope".into();
+    let r = engine.handle(Request::ImportConfig(bad)).await;
+    assert!(matches!(r, Response::Error(_)), "{r:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    assert!(!dir_of(&path).join("config.toml.bak").exists());
+    assert_eq!(engine.snapshot().config, Config::load(&path).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_geo_when_stopped_does_not_start() {
+    let path = temp_config("geo");
+    let engine = Engine::new(path.clone()).unwrap();
+    std::fs::write(dir_of(&path).join("geosite.dat"), b"xx").unwrap();
+    match engine.handle(Request::GetGeoStatus).await {
+        Response::Geo(g) => {
+            // A proxy program running on this machine may have supplied geoip.
+            assert!(g.geosite.is_some());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match engine.handle(Request::UpdateGeo).await {
+        Response::Geo(g) => assert!(g.geosite.is_some()),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(!engine.is_running());
+}

@@ -409,6 +409,72 @@ impl Inner {
         }
     }
 
+    /// Copies newer geo files from running proxy programs (what Start does),
+    /// and recompiles the live rules when routing is running.
+    async fn update_geo(&self) -> Response {
+        let procs = match tokio::task::spawn_blocking(winapi::list_processes).await {
+            Ok(p) => p,
+            Err(e) => return Response::Error(e.to_string()),
+        };
+        let _g = self.cfg_lock.lock().await;
+        let updated = self.geo.reload(&procs);
+        if self.running.load(Ordering::SeqCst) {
+            let cfg = self.relay().cfg.load_full();
+            match self.geo.compile(&cfg) {
+                Ok(rules) => {
+                    self.relay().rules.store(Arc::new(rules));
+                    if let Some(s) = mutex(&self.current).as_ref() {
+                        s.cache.on_rules_changed();
+                    }
+                }
+                Err(e) => return Response::Error(e.to_string()),
+            }
+        }
+        let mut st = self.geo.status();
+        st.updated = updated;
+        Response::Geo(st)
+    }
+
+    /// Replaces the config with `new`. Validated first; the current file is
+    /// kept as `config.toml.bak`; proxies without a password keep the current
+    /// one of the same id.
+    async fn import_config(&self, new: Config) -> Response {
+        let mut new = new;
+        new.migrate();
+        if let Err(e) = new.validate() {
+            return Response::Error(e.to_string());
+        }
+        let path = self.config_path.clone();
+        let bak = tokio::task::spawn_blocking(move || {
+            let mut bak = path.clone().into_os_string();
+            bak.push(".bak");
+            match std::fs::copy(&path, bak) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        })
+        .await;
+        match bak {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Response::Error(format!("cannot back up the config: {e}")),
+            Err(e) => return Response::Error(e.to_string()),
+        }
+        self.apply(|c| {
+            for p in &mut new.proxies {
+                if p.password.is_none() {
+                    p.password = c
+                        .proxies
+                        .iter()
+                        .find(|o| o.id == p.id)
+                        .and_then(|o| o.password.clone());
+                }
+            }
+            *c = new;
+            Ok(())
+        })
+        .await
+    }
+
     fn snapshot(&self) -> StateSnapshot {
         let (groups, total_up_bps, total_down_bps) = self.relay().stats.snapshot();
         StateSnapshot {
@@ -525,6 +591,9 @@ impl Inner {
                 })
                 .await
             }
+            Request::GetGeoStatus => Response::Geo(self.geo.status()),
+            Request::UpdateGeo => self.update_geo().await,
+            Request::ImportConfig(cfg) => self.import_config(cfg).await,
             Request::GetLog { after } => Response::Log(crate::log_ring::global().since(after)),
             Request::GetUsage => Response::Usage(self.relay().usage.report()),
             Request::SetDataUsage { enabled } => {

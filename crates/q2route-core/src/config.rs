@@ -353,11 +353,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let mut c: Config = toml::from_str(&s)?;
-                // Migrate first: it drops entries older versions accepted
-                // and validation now rejects.
-                let migrated = c.migrate();
-                c.validate()?;
+                let (c, migrated) = Config::parse_migrated(&s)?;
                 if migrated {
                     c.save(path)?;
                 }
@@ -370,6 +366,21 @@ impl Config {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Parses TOML text, migrates it and validates it. Used by `load` and by
+    /// config import, so both accept exactly the same files.
+    pub fn parse(s: &str) -> Result<Config, ConfigError> {
+        Config::parse_migrated(s).map(|(c, _)| c)
+    }
+
+    fn parse_migrated(s: &str) -> Result<(Config, bool), ConfigError> {
+        let mut c: Config = toml::from_str(s)?;
+        // Migrate first: it drops entries older versions accepted
+        // and validation now rejects.
+        let migrated = c.migrate();
+        c.validate()?;
+        Ok((c, migrated))
     }
 
     /// Applies seed additions newer than `seed_version`. Returns whether

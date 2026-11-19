@@ -76,6 +76,11 @@ pub enum Request {
     GetLog {
         after: u64,
     },
+    GetGeoStatus,
+    /// Copies newer geo files from a running proxy program (no download).
+    UpdateGeo,
+    /// Replaces the whole config (all or nothing; backup kept as `.bak`).
+    ImportConfig(Config),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -111,6 +116,23 @@ pub enum Response {
     Processes(Vec<ProcEntry>),
     Usage(UsageReport),
     Log(Vec<LogEntry>),
+    Geo(GeoStatus),
+}
+
+/// One geo data file on disk.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeoFile {
+    pub modified_ms: u64,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct GeoStatus {
+    pub geoip: Option<GeoFile>,
+    pub geosite: Option<GeoFile>,
+    /// File names copied in the `UpdateGeo` call that produced this.
+    #[serde(default)]
+    pub updated: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

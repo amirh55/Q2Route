@@ -15,6 +15,7 @@ use std::time::SystemTime;
 use q2route_core::config::Config;
 use q2route_core::geoip::GeoIp;
 use q2route_core::geosite::GeoSite;
+use q2route_core::ipc::{GeoFile, GeoStatus};
 use q2route_core::matchers::MatchError;
 use q2route_core::process_tree::ProcInfo;
 use q2route_core::ruleset::RuleSet;
@@ -182,12 +183,33 @@ impl GeoCache {
     }
 
     /// Re-checks the proxy programs' geo files and reloads (used on Start).
-    pub fn reload(&self, procs: &[ProcInfo]) {
-        for file in [GEOIP_FILE, GEOSITE_FILE] {
-            self.refresh_from(file, find_external(procs, file));
-        }
+    /// Returns the names of the files that were copied in.
+    pub fn reload(&self, procs: &[ProcInfo]) -> Vec<String> {
+        let updated = [GEOIP_FILE, GEOSITE_FILE]
+            .into_iter()
+            .filter(|file| self.refresh_from(file, find_external(procs, file)))
+            .map(String::from)
+            .collect();
         *self.ip.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.site.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        updated
+    }
+
+    /// Size and modification time of our two geo files.
+    pub fn status(&self) -> GeoStatus {
+        let file = |name: &str| {
+            let m = std::fs::metadata(self.path(name)).ok()?;
+            let ms = m.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH);
+            Some(GeoFile {
+                modified_ms: ms.map_or(0, |d| d.as_millis() as u64),
+                size: m.len(),
+            })
+        };
+        GeoStatus {
+            geoip: file(GEOIP_FILE),
+            geosite: file(GEOSITE_FILE),
+            updated: Vec::new(),
+        }
     }
 
     /// Compiles `cfg`, loading each geo file only when its wanted keys changed.
@@ -291,6 +313,33 @@ mod tests {
         assert_eq!(std::fs::read(cache.path(GEOSITE_FILE)).unwrap(), b"site");
         // Same age now: not copied again.
         assert!(!cache.refresh_from(GEOSITE_FILE, find_external(&procs, GEOSITE_FILE)));
+    }
+
+    #[test]
+    fn geo_status_reports_files() {
+        let ours = tempfile::tempdir().unwrap();
+        let cache = GeoCache::new(ours.path().to_path_buf());
+        assert_eq!(cache.status(), GeoStatus::default());
+        std::fs::write(ours.path().join(GEOSITE_FILE), b"site!").unwrap();
+        let st = cache.status();
+        assert_eq!(st.geoip, None);
+        let f = st.geosite.unwrap();
+        assert_eq!(f.size, 5);
+        assert!(f.modified_ms > 1_600_000_000_000);
+        assert!(st.updated.is_empty());
+    }
+
+    #[test]
+    fn reload_returns_copied_names() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("v2rayN").join("bin");
+        std::fs::create_dir_all(bin.join("xray")).unwrap();
+        std::fs::write(bin.join(GEOIP_FILE), b"ip").unwrap();
+        let procs = [proc(&bin.join("xray").join("xray.exe"))];
+        let ours = tempfile::tempdir().unwrap();
+        let cache = GeoCache::new(ours.path().to_path_buf());
+        assert_eq!(cache.reload(&procs), [GEOIP_FILE]);
+        assert!(cache.reload(&procs).is_empty());
     }
 
     #[test]
