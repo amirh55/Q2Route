@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod client;
+pub mod dpi_guard;
 pub mod leak;
 pub mod settings;
 pub mod tray;

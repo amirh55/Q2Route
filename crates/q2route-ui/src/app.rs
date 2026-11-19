@@ -95,6 +95,8 @@ pub struct App {
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
     hide_on_start: bool,
+    /// The window has been subclassed by `dpi_guard`.
+    dpi_hooked: bool,
     /// True while we keep the window hidden in the tray.
     hidden: bool,
 }
@@ -127,6 +129,7 @@ impl App {
             connections: ConnectionsView::default(),
             leak: settings_view::LeakState::default(),
             hide_on_start: hidden && tray.is_some(),
+            dpi_hooked: false,
             tray,
             exiting: false,
             hidden: false,
@@ -165,6 +168,17 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
+        if !self.dpi_hooked && frame.winit_window().is_some() {
+            // One attempt only: the handle either exists now or never will.
+            self.dpi_hooked = true;
+            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(frame) {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
+                    let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+                    // SAFETY: eframe's own window, and we run on its UI thread.
+                    unsafe { crate::dpi_guard::install(hwnd) };
+                }
+            }
+        }
         if std::mem::take(&mut self.hide_on_start) {
             self.hide_window(ctx);
         }
@@ -203,9 +217,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.client.latest();
         let connected = self.client.connected();
+        // Slimmer nav on narrow windows to leave room for the page.
+        let narrow = ui.available_width() < 640.0;
         egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(170.0)
+            .exact_size(if narrow { 120.0 } else { 170.0 })
             .show(ui, |ui| self.nav(ui));
         if let Some(err) = self.requests.last_error.clone() {
             egui::Panel::bottom("status").show(ui, |ui| {

@@ -2138,6 +2138,7 @@ dependencies = [
  "eframe",
  "q2route-core",
  "q2route-service",
+ "raw-window-handle",
  "serde",
  "tokio",
  "tokio-util",
