@@ -215,7 +215,7 @@ impl GroupsView {
         for (i, g) in groups.iter().enumerate() {
             let (up, down) = can_move(groups, i);
             ui.horizontal(|ui| {
-                if ui.add_enabled(up, egui::Button::new("▲")).clicked() {
+                if ui.add_enabled(up, egui::Button::new("^")).clicked() {
                     let group_id = g.id.clone();
                     req.send(
                         client,
@@ -225,7 +225,7 @@ impl GroupsView {
                         },
                     );
                 }
-                if ui.add_enabled(down, egui::Button::new("▼")).clicked() {
+                if ui.add_enabled(down, egui::Button::new("v")).clicked() {
                     let group_id = g.id.clone();
                     req.send(
                         client,

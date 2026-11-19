@@ -165,12 +165,11 @@ fn header(ui: &mut egui::Ui, s: &StateSnapshot, client: &Client, req: &mut Reque
     // Wraps onto further lines instead of overflowing when the window is narrow.
     ui.horizontal_wrapped(|ui| {
         if s.running {
-            ui.label(
-                RichText::new("● Running")
-                    .strong()
-                    .size(16.0)
-                    .color(Color32::from_rgb(0x66, 0xbb, 0x6a)),
-            );
+            // Painted dot: "●" is missing from egui's default font.
+            let green = Color32::from_rgb(0x66, 0xbb, 0x6a);
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 5.0, green);
+            ui.label(RichText::new("Running").strong().size(16.0).color(green));
             if ui.button("Stop").clicked() {
                 req.send(client, Request::Stop);
             }
@@ -193,7 +192,7 @@ fn header(ui: &mut egui::Ui, s: &StateSnapshot, client: &Client, req: &mut Reque
         ui.weak(format!("Default: {default}"));
         ui.separator();
         ui.weak(format!(
-            "↑ {}  ↓ {}",
+            "Up {}  Down {}",
             format_speed(s.total_up_bps),
             format_speed(s.total_down_bps)
         ));
@@ -246,7 +245,11 @@ fn card(
                     .on_hover_text(sum);
                 let stats = s.groups.get(&g.id);
                 let (up, down) = stats.map_or((0, 0), |st| (st.up_bps, st.down_bps));
-                ui.weak(format!("↑ {}  ↓ {}", format_speed(up), format_speed(down)));
+                ui.weak(format!(
+                    "Up {}  Down {}",
+                    format_speed(up),
+                    format_speed(down)
+                ));
                 ui.add_space(4.0);
                 action_switch(ui, s, g, client, req);
             });
