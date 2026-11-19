@@ -197,16 +197,11 @@ impl ProxiesView {
             }
         });
         ui.add_space(6.0);
-        egui::Grid::new("proxies")
-            .num_columns(5)
-            .striped(true)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                for p in &s.config.proxies {
-                    self.row(ui, s, p, client, req);
-                    ui.end_row();
-                }
-            });
+        // One wrapping block per proxy (not a wide grid) so a narrow window never scrolls sideways.
+        for p in &s.config.proxies {
+            self.row(ui, s, p, client, req);
+            ui.separator();
+        }
         ui.add_space(8.0);
         // State comes from the live snapshot; the click is sent at once.
         let mut v6 = s.config.settings.proxy_ipv6;
@@ -292,14 +287,16 @@ impl ProxiesView {
         if p.id == s.config.default_proxy {
             name = RichText::new(format!("{} (default)", p.name)).strong();
         }
-        ui.label(name);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(name);
+            match s.proxy_up.get(&p.id) {
+                Some(true) => ui.colored_label(Color32::from_rgb(0x66, 0xbb, 0x6a), "Up"),
+                Some(false) => ui.colored_label(ui.visuals().error_fg_color, "Down"),
+                None => ui.weak("Not in use"),
+            };
+        });
         ui.label(format!("{} {}:{}", kind_label(p.kind), p.host, p.port));
-        match s.proxy_up.get(&p.id) {
-            Some(true) => ui.colored_label(Color32::from_rgb(0x66, 0xbb, 0x6a), "Up"),
-            Some(false) => ui.colored_label(ui.visuals().error_fg_color, "Down"),
-            None => ui.weak("Not in use"),
-        };
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let testing = matches!(self.tests.get(&p.id), Some(TestState::Running(_)));
             if ui
                 .add_enabled(!testing, egui::Button::new("Test"))
@@ -330,9 +327,7 @@ impl ProxiesView {
             Some(TestState::Done { ok: false, text }) => {
                 ui.colored_label(ui.visuals().error_fg_color, text);
             }
-            None => {
-                ui.label("");
-            }
+            None => {}
         }
     }
 }

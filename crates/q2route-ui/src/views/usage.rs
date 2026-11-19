@@ -202,7 +202,7 @@ impl UsageView {
             return;
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for p in Period::ALL {
                 ui.selectable_value(&mut self.period, p, p.label());
             }
@@ -248,7 +248,7 @@ impl UsageView {
             }
             egui::Grid::new(title)
                 .striped(true)
-                .min_col_width(80.0)
+                .min_col_width(56.0)
                 .show(ui, |ui| {
                     for h in ["Name", "Up", "Down", "Total"] {
                         ui.label(RichText::new(h).strong());
@@ -260,7 +260,7 @@ impl UsageView {
                             By::Proxy => proxy_name(&name),
                             By::App => name,
                         };
-                        ui.label(shown);
+                        ui.add(egui::Label::new(shown).truncate());
                         ui.label(fmt_bytes(up));
                         ui.label(fmt_bytes(down));
                         ui.label(fmt_bytes(up.saturating_add(down)));
@@ -270,7 +270,7 @@ impl UsageView {
         }
         ui.add_space(10.0);
         if self.confirm_reset {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Delete all data usage history?");
                 if ui.button("Yes").clicked() {
                     req.send(client, Request::ResetUsage);

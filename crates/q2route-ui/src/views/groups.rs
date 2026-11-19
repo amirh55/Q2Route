@@ -15,6 +15,8 @@ const HINT: &str = "One per line. Apps: steam.exe, C:\\Games\\x.exe or a folder 
 Domains: example.com, *.ir, keyword:steam, geosite:ir. IPs: 1.2.3.4, 5.0.0.0/8, geoip:ir. \
 Ports: 443 or 27000-27100.";
 const LIST_WIDTH: f32 = 300.0;
+/// Below this much room the group list and the editor stack vertically.
+const SPLIT_MIN_WIDTH: f32 = 560.0;
 
 /// Entries separated by newlines or commas, trimmed, blanks dropped.
 pub fn split_entries(text: &str) -> Vec<String> {
@@ -181,6 +183,18 @@ impl GroupsView {
             self.confirm_delete = false;
             self.editor = None;
         }
+        let sel = groups
+            .iter()
+            .find(|g| Some(&g.id) == self.selected.as_ref());
+        if ui.available_width() < SPLIT_MIN_WIDTH {
+            // Narrow: list on top, editor below, instead of overflowing sideways.
+            self.list(ui, s, client, req);
+            ui.separator();
+            if let Some(g) = sel {
+                self.detail(ui, s, g, client, req);
+            }
+            return;
+        }
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(LIST_WIDTH);
@@ -188,9 +202,6 @@ impl GroupsView {
             });
             ui.separator();
             ui.vertical(|ui| {
-                let sel = groups
-                    .iter()
-                    .find(|g| Some(&g.id) == self.selected.as_ref());
                 if let Some(g) = sel {
                     self.detail(ui, s, g, client, req);
                 }
@@ -235,10 +246,18 @@ impl GroupsView {
                     req.send(client, Request::SetGroupEnabled { group_id, enabled });
                 }
                 let on = Some(&g.id) == self.selected.as_ref();
-                if ui.selectable_label(on, &g.name).clicked() {
+                let (text, color) = action_badge(s, &g.action);
+                // Leave room for the badge; long names are ellipsised.
+                let name_w = (ui.available_width() - 56.0).max(60.0);
+                let r = ui
+                    .scope(|ui| {
+                        ui.set_max_width(name_w);
+                        ui.add(egui::Button::selectable(on, &g.name).truncate())
+                    })
+                    .inner;
+                if r.on_hover_text(&g.name).clicked() {
                     self.selected = Some(g.id.clone());
                 }
-                let (text, color) = action_badge(s, &g.action);
                 ui.label(RichText::new(text).color(color).small());
             });
         }
@@ -288,7 +307,7 @@ impl GroupsView {
         action_switch(ui, s, g, client, req);
         ui.add_space(6.0);
         if self.confirm_delete {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Delete '{}' and its rules?", g.name));
                 if ui.button("Yes, delete").clicked() {
                     let group_id = g.id.clone();
@@ -319,7 +338,7 @@ impl GroupsView {
         let mut edit = None;
         let mut remove = None;
         for (i, r) in g.rules.iter().enumerate() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Edit").clicked() {
                     edit = Some(i);
                 }
@@ -400,7 +419,7 @@ impl GroupsView {
             );
         }
         ui.weak(HINT);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Protocol");
             egui::ComboBox::from_id_salt("rule-protocol")
                 .selected_text(protocol_name(f.protocol))
