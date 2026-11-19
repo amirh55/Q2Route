@@ -203,6 +203,9 @@ pub struct Settings {
     /// server has no IPv6).
     #[serde(default = "yes")]
     pub proxy_ipv6: bool,
+    /// Count proxied traffic per group, app and proxy (the Data usage page). Off by default.
+    #[serde(default)]
+    pub data_usage: bool,
 }
 
 impl Default for Settings {
@@ -215,6 +218,7 @@ impl Default for Settings {
             last_running: true,
             dns: DnsSettings::default(),
             proxy_ipv6: true,
+            data_usage: false,
         }
     }
 }
@@ -538,6 +542,13 @@ impl Config {
             .iter_mut()
             .find(|g| g.id == id)
             .ok_or_else(|| ConfigError::Invalid(format!("unknown group '{id}'")))
+    }
+
+    pub fn set_data_usage(&mut self, on: bool) -> Result<(), ConfigError> {
+        self.mutate(|c| {
+            c.settings.data_usage = on;
+            Ok(())
+        })
     }
 
     pub fn set_dns(&mut self, d: DnsSettings) -> Result<(), ConfigError> {

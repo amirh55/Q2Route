@@ -23,6 +23,7 @@ use tokio::time::timeout;
 use crate::relay::RelayCtx;
 use crate::stats::Stats;
 use crate::udp_relay::InboundSink;
+use crate::usage::Usage;
 use crate::windivert::Address;
 
 pub const WAIT: Duration = Duration::from_secs(5);
@@ -68,6 +69,10 @@ pub fn ctx(cfg: Config) -> Arc<RelayCtx> {
         tree: Arc::new(RwLock::new(ProcessTree::default())),
         excluded: ArcSwap::from_pointee(HashSet::new()),
         stats: Arc::new(Stats::default()),
+        usage: Arc::new(Usage::new(
+            std::env::temp_dir().join("q2route-unit-usage-unused.json"),
+            false,
+        )),
         conns: Arc::new(Default::default()),
         own_ports: Arc::new(DashSet::new()),
         events,

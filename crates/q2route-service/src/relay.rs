@@ -47,6 +47,7 @@ use crate::conns::{ConnBytes, ConnLog, NewConn};
 use crate::dns_proxy::bootstrap_direct;
 use crate::nat::{Family, OriginalDst};
 use crate::stats::Stats;
+use crate::usage::{Usage, UsageKey};
 
 /// Maximum client bytes buffered while looking for a domain.
 const PEEK_MAX: usize = 4096;
@@ -97,6 +98,8 @@ pub struct RelayCtx {
     pub tree: Arc<RwLock<ProcessTree>>,
     pub excluded: ArcSwap<HashSet<u32>>,
     pub stats: Arc<Stats>,
+    /// Proxied-traffic data usage (off unless `settings.data_usage`).
+    pub usage: Arc<Usage>,
     pub conns: Arc<ConnLog>,
     /// (family, local port) of the relay's direct upstream sockets; capture
     /// skips them. Keyed by family: an IPv4 and an IPv6 socket may share a
@@ -429,6 +432,11 @@ async fn relay_flow(
             orig.dst
         )
     };
+    // Only proxied traffic counts as data usage; the key is built once per flow.
+    let usage = match &route {
+        Route::Proxy(id) => Some(usage_key(group, &exe, id)),
+        _ => None,
+    };
     match route {
         Route::Block => log("blocked"),
         Route::Proxy(id) => {
@@ -436,7 +444,7 @@ async fn relay_flow(
             match connect_proxy(ctx, &id, &target).await {
                 Ok(up) => {
                     log(&format!("proxied via '{id}'"));
-                    pump(client, up, buf, ctx, group, &bytes).await
+                    pump(client, up, buf, ctx, group, usage.as_ref(), &bytes).await
                 }
                 // Fail closed: drop the client, never connect direct.
                 Err(e) => log(&format!("proxy failed: {e} (closed, no direct fallback)")),
@@ -445,7 +453,7 @@ async fn relay_flow(
         Route::Direct => match connect_direct(ctx, orig.dst).await {
             Ok((up, _own)) => {
                 log("direct");
-                pump(client, up, buf, ctx, group, &bytes).await
+                pump(client, up, buf, ctx, group, None, &bytes).await
             }
             Err(e) => log(&format!("direct connect failed: {e}")),
         },
@@ -764,7 +772,21 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
         _ => "direct",
     });
     let same_route = |n: &str| dns_route(ctx, orig.pid, n).0 == route;
-    dns_pump(client, up, &first, same_route, ctx, group, &bytes).await
+    let usage = match &route {
+        Route::Proxy(id) => Some(usage_key(group, &exe, id)),
+        _ => None,
+    };
+    dns_pump(
+        client,
+        up,
+        &first,
+        same_route,
+        ctx,
+        group,
+        usage.as_ref(),
+        &bytes,
+    )
+    .await
 }
 
 /// [`pump`] for DNS over TCP: relays whole length-prefixed messages. Each
@@ -772,6 +794,8 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
 /// the first query's route) before it is sent (a query that does not parse
 /// or decides differently ends the connection); each answer feeds
 /// `ctx.domains` on its way back.
+// One argument per thing the relay loop needs; bundling them would only add a struct.
+#[allow(clippy::too_many_arguments)]
 async fn dns_pump(
     client: TcpStream,
     upstream: TcpStream,
@@ -779,6 +803,7 @@ async fn dns_pump(
     same_route: impl Fn(&str) -> bool,
     ctx: &RelayCtx,
     group: &str,
+    usage: Option<&UsageKey>,
     bytes: &ConnBytes,
 ) {
     set_keepalive(&upstream);
@@ -791,6 +816,7 @@ async fn dns_pump(
         return;
     }
     ctx.stats.add(group, first.len() as u64, 0);
+    add_usage(ctx, usage, first.len() as u64, 0);
     bytes.up.fetch_add(first.len() as u64, Ordering::Relaxed);
     let activity = Activity::new();
     let max = usize::from(u16::MAX);
@@ -808,6 +834,7 @@ async fn dns_pump(
             activity.touch();
             bytes.up.fetch_add(m.len() as u64, Ordering::Relaxed);
             ctx.stats.add(group, m.len() as u64, 0);
+            add_usage(ctx, usage, m.len() as u64, 0);
         }
         uw.shutdown().await
     };
@@ -818,10 +845,29 @@ async fn dns_pump(
             activity.touch();
             bytes.down.fetch_add(m.len() as u64, Ordering::Relaxed);
             ctx.stats.add(group, 0, m.len() as u64);
+            add_usage(ctx, usage, 0, m.len() as u64);
         }
         cw.shutdown().await
     };
     drive(up, down, &activity, ctx.idle_timeout).await
+}
+
+/// The data-usage key of a flow proxied through `proxy`: `app` is the
+/// lowercased exe file name (or `?`).
+pub(crate) fn usage_key(group: &str, exe: &str, proxy: &str) -> UsageKey {
+    UsageKey {
+        group: group.to_string(),
+        app: exe.to_lowercase(),
+        proxy: proxy.to_string(),
+    }
+}
+
+/// Counts relayed bytes as data usage; `usage` is `None` for flows that are
+/// not proxied.
+fn add_usage(ctx: &RelayCtx, usage: Option<&UsageKey>, up: u64, down: u64) {
+    if let Some(k) = usage {
+        ctx.usage.add(k, up, down);
+    }
 }
 
 fn group_of(info: &MatchInfo) -> &str {
@@ -897,6 +943,7 @@ async fn pump(
     peeked: &[u8],
     ctx: &RelayCtx,
     group: &str,
+    usage: Option<&UsageKey>,
     bytes: &ConnBytes,
 ) {
     set_keepalive(&upstream);
@@ -908,18 +955,21 @@ async fn pump(
             return;
         }
         ctx.stats.add(group, peeked.len() as u64, 0);
+        add_usage(ctx, usage, peeked.len() as u64, 0);
         bytes.up.fetch_add(peeked.len() as u64, Ordering::Relaxed);
     }
     let activity = Activity::new();
     let up = copy(&mut cr, &mut uw, |n| {
         activity.touch();
         bytes.up.fetch_add(n, Ordering::Relaxed);
-        ctx.stats.add(group, n, 0)
+        ctx.stats.add(group, n, 0);
+        add_usage(ctx, usage, n, 0)
     });
     let down = copy(&mut ur, &mut cw, |n| {
         activity.touch();
         bytes.down.fetch_add(n, Ordering::Relaxed);
-        ctx.stats.add(group, 0, n)
+        ctx.stats.add(group, 0, n);
+        add_usage(ctx, usage, 0, n)
     });
     drive(up, down, &activity, ctx.idle_timeout).await
 }

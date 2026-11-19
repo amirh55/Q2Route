@@ -649,3 +649,62 @@ fn inbound_packet_unmaps_v4_mapped_source() {
     let v4: SocketAddr = "203.0.113.9:4000".parse().unwrap();
     assert!(inbound_packet(v4, l6, b"hi").is_none());
 }
+
+#[tokio::test]
+async fn relayed_udp_bytes_are_counted() {
+    let m = mock(MockOpts::default()).await;
+    let (echo_addr, mut seen) = echo().await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    s.ctx
+        .tree
+        .write()
+        .unwrap()
+        .insert(q2route_core::process_tree::ProcInfo {
+            pid: 4242,
+            parent: 1,
+            exe: r"C:\Apps\Game.EXE".into(),
+            start_time: 0,
+        });
+    s.ctx.usage.set_enabled(true);
+    s.relay.submit(dg(echo_addr, b"ping!"));
+    assert_eq!(recv(&mut seen).await, b"ping!");
+    recv(&mut s.injected).await;
+    let row = timeout(WAIT, async {
+        loop {
+            let r = s.ctx.usage.report();
+            if let Some(row) = r.session.first() {
+                if row.down >= 5 {
+                    return row.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("usage row");
+    assert_eq!(
+        (row.group.as_str(), row.app.as_str(), row.proxy.as_str()),
+        ("g", "game.exe", "mock")
+    );
+    assert_eq!((row.up, row.down), (5, 5));
+    assert_eq!(s.ctx.usage.report().session.len(), 1);
+}
+
+#[tokio::test]
+async fn udp_bytes_not_counted_when_usage_is_off() {
+    let m = mock(MockOpts::default()).await;
+    let (echo_addr, mut seen) = echo().await;
+    let mut s = setup(
+        config(profile(ProxyKind::Socks5, m.port)),
+        UdpRelayConfig::default(),
+    );
+    s.relay.submit(dg(echo_addr, b"ping!"));
+    assert_eq!(recv(&mut seen).await, b"ping!");
+    recv(&mut s.injected).await;
+    assert_eq!(s.ctx.stats.bytes("g"), (5, 5));
+    let r = s.ctx.usage.report();
+    assert!(!r.enabled && r.session.is_empty() && r.days.is_empty());
+}

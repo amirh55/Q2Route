@@ -17,5 +17,6 @@ pub mod stats;
 mod test_util;
 pub mod udp_packet;
 pub mod udp_relay;
+pub mod usage;
 pub mod winapi;
 pub mod windivert;

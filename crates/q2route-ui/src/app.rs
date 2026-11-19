@@ -11,7 +11,7 @@ use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
 use crate::views::{
     connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, placeholder,
-    proxies::ProxiesView, settings as settings_view,
+    proxies::ProxiesView, settings as settings_view, usage::UsageView,
 };
 
 /// How often the UI and the tray refresh from `Client::latest()`.
@@ -87,6 +87,7 @@ pub struct App {
     pub requests: Requests,
     proxies: ProxiesView,
     dns: DnsView,
+    usage: UsageView,
     groups: GroupsView,
     connections: ConnectionsView,
     leak: settings_view::LeakState,
@@ -121,6 +122,7 @@ impl App {
             requests,
             proxies: ProxiesView::default(),
             dns: DnsView::default(),
+            usage: UsageView::default(),
             groups: GroupsView::default(),
             connections: ConnectionsView::default(),
             leak: settings_view::LeakState::default(),
@@ -240,6 +242,10 @@ impl eframe::App for App {
                             .show(ui, snap.as_ref(), &self.client, &mut self.requests)
                     }
                     Page::Dns => self.dns.show(ui, snap.as_ref(), &self.client),
+                    Page::DataUsage => {
+                        self.usage
+                            .show(ui, snap.as_ref(), &self.client, &mut self.requests)
+                    }
                     Page::Settings => settings_view::show(
                         ui,
                         &mut self.settings,

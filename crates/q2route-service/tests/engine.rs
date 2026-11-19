@@ -112,3 +112,79 @@ async fn set_proxy_ipv6_persists() {
     assert_eq!(r, Response::Ok);
     assert!(Config::load(&path).unwrap().settings.proxy_ipv6);
 }
+
+fn key(group: &str) -> q2route_service::usage::UsageKey {
+    q2route_service::usage::UsageKey {
+        group: group.into(),
+        app: "app.exe".into(),
+        proxy: "v2ray".into(),
+    }
+}
+
+async fn usage_report(engine: &Engine) -> q2route_core::ipc::UsageReport {
+    match engine.handle(Request::GetUsage).await {
+        Response::Usage(r) => r,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_ipc_get_set_reset() {
+    let path = temp_config("usage-ipc");
+    let usage_path = path.with_file_name("usage.json");
+    let engine = Engine::new(path.clone()).unwrap();
+    let r = usage_report(&engine).await;
+    assert!(!r.enabled && r.session.is_empty() && r.days.is_empty());
+    // Off: nothing counted, nothing written.
+    engine.usage().add(&key("g"), 5, 5);
+    assert!(usage_report(&engine).await.session.is_empty());
+    assert!(!usage_path.exists());
+
+    let r = engine.handle(Request::SetDataUsage { enabled: true }).await;
+    assert_eq!(r, Response::Ok);
+    assert!(Config::load(&path).unwrap().settings.data_usage);
+    engine.usage().add(&key("g"), 5, 7);
+    let r = usage_report(&engine).await;
+    assert!(r.enabled);
+    assert_eq!((r.session[0].up, r.session[0].down), (5, 7));
+    assert_eq!(r.days.len(), 1);
+
+    engine.usage().save_if_dirty().unwrap();
+    assert!(usage_path.exists());
+    assert_eq!(engine.handle(Request::ResetUsage).await, Response::Ok);
+    let r = usage_report(&engine).await;
+    assert!(r.enabled && r.session.is_empty() && r.days.is_empty());
+    assert!(!usage_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggle_keeps_history() {
+    let path = temp_config("usage-toggle");
+    let usage_path = path.with_file_name("usage.json");
+    let engine = Engine::new(path.clone()).unwrap();
+    engine.handle(Request::SetDataUsage { enabled: true }).await;
+    engine.usage().add(&key("g"), 10, 20);
+    // Turning it off saves, keeps the history and the session, and stops counting.
+    engine
+        .handle(Request::SetDataUsage { enabled: false })
+        .await;
+    assert!(usage_path.exists(), "saved when turned off");
+    engine.usage().add(&key("g"), 1000, 1000);
+    let r = usage_report(&engine).await;
+    assert!(!r.enabled);
+    assert_eq!((r.session[0].up, r.session[0].down), (10, 20));
+    assert_eq!((r.days[0].1[0].up, r.days[0].1[0].down), (10, 20));
+    // Back on: continues from the same totals.
+    engine.handle(Request::SetDataUsage { enabled: true }).await;
+    engine.usage().add(&key("g"), 1, 2);
+    let r = usage_report(&engine).await;
+    assert_eq!((r.session[0].up, r.session[0].down), (11, 22));
+    // A restart loads the history (session starts empty), even while off.
+    engine
+        .handle(Request::SetDataUsage { enabled: false })
+        .await;
+    let again = Engine::new(path).unwrap();
+    let r = usage_report(&again).await;
+    assert!(!r.enabled && r.session.is_empty());
+    assert_eq!((r.days[0].1[0].up, r.days[0].1[0].down), (11, 22));
+}

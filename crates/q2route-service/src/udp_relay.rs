@@ -40,7 +40,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::conns::{ConnBytes, NewConn};
 use crate::nat::Family;
-use crate::relay::{exe_name, RelayCtx, NO_GROUP};
+use crate::relay::{exe_name, usage_key, RelayCtx, NO_GROUP};
 use crate::udp_packet::{build_inbound_udp, build_inbound_udp6};
 use crate::windivert::Address;
 
@@ -596,6 +596,8 @@ impl Session {
     ) {
         let group = self.group.as_deref().unwrap_or(NO_GROUP);
         let _active = self.ctx.stats.open(group);
+        // Built once per session (app and proxy are fixed for it).
+        let usage = usage_key(group, &self.exe(), &self.profile);
         let mut buf = vec![0u8; RECV_BUF];
         let mut ctl = [0u8; 64];
         let mut deadline = Instant::now() + self.cfg.idle;
@@ -622,6 +624,7 @@ impl Session {
                                 b.up.fetch_add(n, Ordering::Relaxed);
                             }
                             self.ctx.stats.add(group, n, 0);
+                            self.ctx.usage.add(&usage, n, 0);
                             deadline = Instant::now() + self.cfg.idle;
                         }
                         Err(e) => tracing::debug!("udp relay send failed: {e}"),
@@ -640,6 +643,7 @@ impl Session {
                         b.down.fetch_add(len, Ordering::Relaxed);
                     }
                     self.ctx.stats.add(group, 0, len);
+                    self.ctx.usage.add(&usage, 0, len);
                     self.sink.inject(pkt, &self.addr);
                     deadline = Instant::now() + self.cfg.idle;
                 }

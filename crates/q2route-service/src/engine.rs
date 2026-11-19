@@ -37,6 +37,7 @@ use crate::proxy_servers::{self, ServerCache};
 use crate::relay::{bind_relay, run_relay, RelayCtx, RELAY_IDLE_TIMEOUT};
 use crate::stats::Stats;
 use crate::udp_relay::UdpRelay;
+use crate::usage::Usage;
 use crate::winapi;
 use crate::windivert::{Handle, Layer, FLAG_RECV_ONLY, FLAG_SNIFF};
 
@@ -47,6 +48,7 @@ const PROCESS_POLL: Duration = Duration::from_secs(1);
 const EXCLUSION_POLL: Duration = Duration::from_secs(5);
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
 const SNAPSHOT_EVERY: Duration = Duration::from_millis(250);
+const USAGE_SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Time for the relay's FIN/RST to reach apps before the handles close.
 const STOP_DRAIN: Duration = Duration::from_millis(200);
 
@@ -87,7 +89,8 @@ impl Engine {
     pub fn new(config_path: PathBuf) -> Result<Engine> {
         let cfg = Config::load(&config_path)?;
         let dir = config_path.parent().map(PathBuf::from).unwrap_or_default();
-        let geo = GeoCache::new(dir);
+        let data_usage = cfg.settings.data_usage;
+        let geo = GeoCache::new(dir.clone());
         geo.reload(&winapi::list_processes());
         let rules = geo.compile(&cfg)?;
         let (events, _) = broadcast::channel(64);
@@ -97,6 +100,7 @@ impl Engine {
             tree: Arc::new(RwLock::new(ProcessTree::default())),
             excluded: ArcSwap::from_pointee(HashSet::new()),
             stats: Arc::new(Stats::default()),
+            usage: Arc::new(Usage::new(dir.join("usage.json"), data_usage)),
             conns: Arc::new(ConnLog::default()),
             own_ports: Arc::new(DashSet::new()),
             events,
@@ -156,6 +160,11 @@ impl Engine {
         self.inner.stop().await
     }
 
+    /// The data usage store (counters, report, save).
+    pub fn usage(&self) -> Arc<Usage> {
+        self.inner.shared.relay.usage.clone()
+    }
+
     pub fn snapshot(&self) -> StateSnapshot {
         self.inner.snapshot()
     }
@@ -183,6 +192,7 @@ impl Inner {
         self.geo.reload(&procs);
         let rules = self.geo.compile(&cfg)?;
         self.relay().rules.store(Arc::new(rules));
+        self.relay().usage.set_enabled(cfg.settings.data_usage);
         self.relay().cfg.store(Arc::new(cfg));
         drop(_g);
 
@@ -302,7 +312,23 @@ impl Inner {
         Ok(())
     }
 
+    /// Stops routing, then saves the data usage (also when already stopped).
     async fn stop(&self) -> Result<()> {
+        let r = self.stop_routing().await;
+        self.save_usage().await;
+        r
+    }
+
+    async fn save_usage(&self) {
+        let usage = self.relay().usage.clone();
+        match tokio::task::spawn_blocking(move || usage.save_if_dirty()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("cannot save data usage: {e}"),
+            Err(e) => tracing::warn!("data usage save task failed: {e}"),
+        }
+    }
+
+    async fn stop_routing(&self) -> Result<()> {
         let mut run = self.run.lock().await;
         let Some(r) = run.take() else { return Ok(()) };
         // 1. Close every proxied connection (the relay's FIN/RST is still
@@ -499,6 +525,25 @@ impl Inner {
                 })
                 .await
             }
+            Request::GetUsage => Response::Usage(self.relay().usage.report()),
+            Request::SetDataUsage { enabled } => {
+                let r = self.apply(|c| c.set_data_usage(enabled)).await;
+                if matches!(r, Response::Ok) {
+                    self.relay().usage.set_enabled(enabled);
+                    if !enabled {
+                        self.save_usage().await;
+                    }
+                }
+                r
+            }
+            Request::ResetUsage => {
+                let usage = self.relay().usage.clone();
+                match tokio::task::spawn_blocking(move || usage.reset()).await {
+                    Ok(Ok(())) => Response::Ok,
+                    Ok(Err(e)) => Response::Error(format!("cannot delete the usage file: {e}")),
+                    Err(e) => Response::Error(e.to_string()),
+                }
+            }
             // The pipe server answers Subscribe itself (via `subscribe`).
             Request::Subscribe => Response::Ok,
         }
@@ -537,6 +582,17 @@ impl Inner {
                     }
                     Event::Snapshot(_) => {}
                 }
+            }
+        });
+        // Data usage: save every 60 s while something changed.
+        let saver = me.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(USAGE_SAVE_EVERY);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(inner) = saver.upgrade() else { return };
+                inner.save_usage().await;
             }
         });
         tokio::spawn(async move {

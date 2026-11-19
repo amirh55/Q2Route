@@ -19,6 +19,7 @@ use q2route_service::relay::{
     bind_relay, bind_relay_with, run_relay, OrigDstLookup, RelayCtx, RELAY_BIND_ATTEMPTS,
 };
 use q2route_service::stats::Stats;
+use q2route_service::usage::Usage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
@@ -145,6 +146,10 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
         tree: Arc::new(RwLock::new(ProcessTree::default())),
         excluded: ArcSwap::from_pointee(HashSet::new()),
         stats: Arc::new(Stats::default()),
+        usage: Arc::new(Usage::new(
+            std::env::temp_dir().join("q2route-it-usage-unused.json"),
+            false,
+        )),
         conns: Arc::new(Default::default()),
         own_ports: Arc::new(DashSet::new()),
         events,
@@ -494,6 +499,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
         tree: c.tree.clone(),
         excluded: ArcSwap::new(c.excluded.load_full()),
         stats: c.stats.clone(),
+        usage: c.usage.clone(),
         conns: c.conns.clone(),
         own_ports: c.own_ports.clone(),
         events: c.events.clone(),
@@ -1669,5 +1675,117 @@ async fn ipv6_tcp_dns_routed_by_name() {
     assert_eq!(recv_t(&mut seen).await, q);
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
     assert!(targets.try_recv().is_err(), "went through the proxy");
+    r.cancel.cancel();
+}
+
+/// Multi-connection mock SOCKS5 (no auth) that echoes every tunnelled byte.
+async fn mock_socks_echo() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut g = [0u8; 3];
+                s.read_exact(&mut g).await.unwrap();
+                s.write_all(&[5, 0]).await.unwrap();
+                let mut h = [0u8; 4];
+                s.read_exact(&mut h).await.unwrap();
+                let rest = match h[3] {
+                    1 => 4 + 2,
+                    4 => 16 + 2,
+                    _ => {
+                        let mut n = [0u8; 1];
+                        s.read_exact(&mut n).await.unwrap();
+                        n[0] as usize + 2
+                    }
+                };
+                let mut skip = vec![0u8; rest];
+                s.read_exact(&mut skip).await.unwrap();
+                s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    port
+}
+
+/// Sends `n` bytes through the relay and reads them back.
+async fn round_trip(r: &Relay, n: usize) {
+    let mut c = TcpStream::connect(r.addr).await.unwrap();
+    let data = vec![0u8; n];
+    c.write_all(&data).await.unwrap();
+    let mut back = vec![0u8; n];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn insert_browser(c: &RelayCtx) {
+    c.tree.write().unwrap().insert(ProcInfo {
+        pid: 4242,
+        parent: 1,
+        exe: r"C:\Apps\Browser.EXE".into(),
+        start_time: 0,
+    });
+}
+
+#[tokio::test]
+async fn relayed_tcp_bytes_are_counted() {
+    let sport = mock_socks_echo().await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("vpn", Action::Proxy("mock".into()), &[], true)],
+    );
+    let c = ctx(cfg);
+    insert_browser(&c);
+    c.usage.set_enabled(true);
+    let r = start("5.5.5.5:9000".parse().unwrap(), c.clone()).await;
+    round_trip(&r, 300).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let row = loop {
+        if let Some(row) = c.usage.report().session.first().cloned() {
+            if row.up >= 300 && row.down >= 300 {
+                break row;
+            }
+        }
+        assert!(Instant::now() < deadline, "usage not counted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        (row.group.as_str(), row.app.as_str(), row.proxy.as_str()),
+        ("vpn", "browser.exe", "mock")
+    );
+    assert_eq!(c.usage.report().session.len(), 1);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn tcp_bytes_not_counted_when_usage_is_off_or_direct() {
+    // Off: a proxied flow adds nothing.
+    let sport = mock_socks_echo().await;
+    let cfg = config(
+        vec![socks_profile(sport)],
+        vec![group("vpn", Action::Proxy("mock".into()), &[], true)],
+    );
+    let c = ctx(cfg);
+    let r = start("5.5.5.5:9000".parse().unwrap(), c.clone()).await;
+    round_trip(&r, 100).await;
+    assert!(c.stats.bytes("vpn").0 >= 100);
+    let rep = c.usage.report();
+    assert!(!rep.enabled && rep.session.is_empty() && rep.days.is_empty());
+    r.cancel.cancel();
+
+    // On, but Direct: not proxied, so not counted.
+    let (origin, _, _peers) = mock_origin().await;
+    let cfg = config(vec![], vec![group("rest", Action::Direct, &[], true)]);
+    let c = ctx(cfg);
+    c.usage.set_enabled(true);
+    let r = start(v4(origin), c.clone()).await;
+    round_trip(&r, 100).await;
+    assert!(c.stats.bytes("rest").0 >= 100);
+    assert!(c.usage.report().session.is_empty());
     r.cancel.cancel();
 }
