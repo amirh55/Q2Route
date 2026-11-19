@@ -92,6 +92,7 @@ pub struct App {
     connections: ConnectionsView,
     log: LogView,
     leak: settings_view::LeakState,
+    backup: settings_view::BackupState,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
@@ -113,7 +114,7 @@ impl App {
         hidden: bool,
     ) -> App {
         let ctx = &cc.egui_ctx;
-        ctx.set_theme(egui::Theme::Dark);
+        ctx.set_theme(settings.theme.preference());
         let mut requests = Requests::default();
         let tray = Tray::new(ctx)
             .map_err(|e| requests.last_error = Some(format!("Tray icon: {e}")))
@@ -130,6 +131,7 @@ impl App {
             connections: ConnectionsView::default(),
             log: LogView::default(),
             leak: settings_view::LeakState::default(),
+            backup: settings_view::BackupState::default(),
             hide_on_start: hidden && tray.is_some(),
             dpi_hooked: false,
             tray,
@@ -178,6 +180,7 @@ impl eframe::App for App {
                     let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
                     // SAFETY: eframe's own window, and we run on its UI thread.
                     unsafe { crate::dpi_guard::install(hwnd) };
+                    crate::file_dialog::set_owner(hwnd);
                 }
             }
         }
@@ -192,7 +195,7 @@ impl eframe::App for App {
         }
         let actions = match self.tray.as_mut() {
             Some(tray) => {
-                tray.tick(self.client.latest().as_ref());
+                tray.tick(self.client.latest().as_ref(), self.settings.tray_graph);
                 tray.poll()
             }
             None => vec![],
@@ -275,6 +278,7 @@ impl eframe::App for App {
                         &mut self.requests,
                         &self.client,
                         &mut self.leak,
+                        &mut self.backup,
                     ),
                     _ => placeholder::show(ui, self.page.label()),
                 });

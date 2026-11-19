@@ -116,7 +116,7 @@ fn level_text(l: LogLevel) -> &'static str {
 }
 
 /// Local time zone offset east of UTC, in minutes (0 if unknown).
-fn local_offset_min() -> i32 {
+pub(crate) fn local_offset_min() -> i32 {
     use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
     // SAFETY: an all-zero TIME_ZONE_INFORMATION is valid plain data that the
     // call overwrites.

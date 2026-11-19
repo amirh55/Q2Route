@@ -672,3 +672,42 @@ fn set_data_usage_roundtrips() {
     c.set_data_usage(false).unwrap();
     assert!(!c.settings.data_usage);
 }
+
+#[test]
+fn parse_rejects_bad_toml() {
+    assert!(matches!(
+        Config::parse("not [valid toml"),
+        Err(ConfigError::Parse(_))
+    ));
+    assert!(Config::parse("\u{0}\u{1}\u{2}binary").is_err());
+    assert!(Config::parse("").is_err());
+}
+
+#[test]
+fn parse_migrates_old_version() {
+    let mut old = Config::seed();
+    old.seed_version = 1;
+    old.settings.dns.direct_names = vec!["geosite:ir".into(), "example.ir".into()];
+    let text = toml::to_string_pretty(&old).unwrap();
+    let c = Config::parse(&text).unwrap();
+    assert_eq!(c.seed_version, SEED_VERSION);
+    assert_eq!(c.settings.dns.direct_names, ["example.ir"]);
+}
+
+#[test]
+fn load_and_parse_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut old = Config::seed();
+    old.seed_version = 1;
+    old.settings.dns.direct_names = vec!["geosite:ir".into()];
+    let text = toml::to_string_pretty(&old).unwrap();
+    std::fs::write(&path, &text).unwrap();
+    let parsed = Config::parse(&text).unwrap();
+    assert_eq!(Config::load(&path).unwrap(), parsed);
+    // load re-saved the migrated config
+    assert_eq!(
+        Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+        parsed
+    );
+}

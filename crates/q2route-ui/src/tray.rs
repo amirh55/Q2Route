@@ -189,7 +189,7 @@ impl Tray {
 
     /// Redraws the icon and tooltip (at most 4x/s) and rebuilds the menu when
     /// the groups, proxies or run state changed.
-    pub fn tick(&mut self, snap: Option<&StateSnapshot>) {
+    pub fn tick(&mut self, snap: Option<&StateSnapshot>, graph: bool) {
         if self.last_tick.is_some_and(|t| t.elapsed() < TICK) {
             return;
         }
@@ -197,7 +197,13 @@ impl Tray {
         let (up, down) = snap.map_or((0, 0), |s| (s.total_up_bps, s.total_down_bps));
         self.history.push(up, down);
         let running = snap.is_some_and(|s| s.running);
-        let _ = self.icon.set_icon(Some(icon(&self.history, running)));
+        // Graph off: the plain icon is the one drawn from an empty history.
+        let shown = if graph {
+            icon(&self.history, running)
+        } else {
+            icon(&TrafficHistory::default(), running)
+        };
+        let _ = self.icon.set_icon(Some(shown));
         let _ = self.icon.set_tooltip(Some(tooltip(snap)));
         let model = MenuModel::of(snap);
         if self.model.as_ref() != Some(&model) {
