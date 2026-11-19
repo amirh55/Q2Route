@@ -16,7 +16,7 @@ Domains: example.com, *.ir, keyword:steam, geosite:ir. IPs: 1.2.3.4, 5.0.0.0/8, 
 Ports: 443 or 27000-27100.";
 const LIST_WIDTH: f32 = 300.0;
 /// Below this much room the group list and the editor stack vertically.
-const SPLIT_MIN_WIDTH: f32 = 560.0;
+const SPLIT_MIN_WIDTH: f32 = 640.0;
 
 /// Entries separated by newlines or commas, trimmed, blanks dropped.
 pub fn split_entries(text: &str) -> Vec<String> {

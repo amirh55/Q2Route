@@ -168,9 +168,15 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
-        if !self.dpi_hooked {
-            if let Some(w) = frame.winit_window() {
-                self.dpi_hooked = crate::dpi_guard::install(&w.title());
+        if !self.dpi_hooked && frame.winit_window().is_some() {
+            // One attempt only: the handle either exists now or never will.
+            self.dpi_hooked = true;
+            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(frame) {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
+                    let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+                    // SAFETY: eframe's own window, and we run on its UI thread.
+                    unsafe { crate::dpi_guard::install(hwnd) };
+                }
             }
         }
         if std::mem::take(&mut self.hide_on_start) {

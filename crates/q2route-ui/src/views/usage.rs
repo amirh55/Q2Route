@@ -246,6 +246,8 @@ impl UsageView {
                 ui.weak("Nothing yet");
                 continue;
             }
+            // Cap the Name cell so Up/Down/Total always stay on screen.
+            let name_w = (ui.available_width() - 3.0 * 70.0).max(80.0);
             egui::Grid::new(title)
                 .striped(true)
                 .min_col_width(56.0)
@@ -260,7 +262,10 @@ impl UsageView {
                             By::Proxy => proxy_name(&name),
                             By::App => name,
                         };
-                        ui.add(egui::Label::new(shown).truncate());
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_w);
+                            ui.add(egui::Label::new(shown).truncate());
+                        });
                         ui.label(fmt_bytes(up));
                         ui.label(fmt_bytes(down));
                         ui.label(fmt_bytes(up.saturating_add(down)));
