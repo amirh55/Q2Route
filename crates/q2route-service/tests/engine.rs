@@ -188,3 +188,13 @@ async fn toggle_keeps_history() {
     assert!(!r.enabled && r.session.is_empty());
     assert_eq!((r.days[0].1[0].up, r.days[0].1[0].down), (11, 22));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_log_answers() {
+    let path = temp_config("get-log");
+    let engine = Engine::new(path).unwrap();
+    match engine.handle(Request::GetLog { after: u64::MAX }).await {
+        Response::Log(v) => assert!(v.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+}

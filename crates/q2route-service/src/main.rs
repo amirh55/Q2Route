@@ -40,11 +40,22 @@ fn init_logging(console: bool) -> Option<WorkerGuard> {
     let logs = data_dir().join("logs");
     let (file, guard) = match std::fs::create_dir_all(&logs) {
         Ok(()) => {
-            let (w, g) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
-                &logs,
-                "q2route.log",
-            ));
-            (Some(fmt::layer().with_writer(w).with_ansi(false)), Some(g))
+            match tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("q2route")
+                .filename_suffix("log")
+                .max_log_files(14)
+                .build(&logs)
+            {
+                Ok(appender) => {
+                    let (w, g) = tracing_appender::non_blocking(appender);
+                    (Some(fmt::layer().with_writer(w).with_ansi(false)), Some(g))
+                }
+                Err(e) => {
+                    eprintln!("cannot open log file in {}: {e}", logs.display());
+                    (None, None)
+                }
+            }
         }
         Err(e) => {
             eprintln!("cannot create {}: {e}", logs.display());
@@ -55,6 +66,7 @@ fn init_logging(console: bool) -> Option<WorkerGuard> {
     let _ = tracing_subscriber::registry()
         .with(filter())
         .with(file)
+        .with(q2route_service::log_ring::global().layer())
         .with(stdout)
         .try_init();
     guard
