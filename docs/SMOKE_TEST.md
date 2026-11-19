@@ -31,7 +31,8 @@ the folder while it is installed (run Uninstall first).
 stops the service, copies the new files into `dist\Q2Route`, and starts the
 service and the UI again. Settings are kept.
 
-Logs: `%ProgramData%\Q2Route\logs\q2route.log.<date>`. Each decided flow logs
+Logs: `%ProgramData%\Q2Route\logs\q2route.<date>.log` (the last 14 days
+are kept; the Log page shows them live). Each decided flow logs
 one `flow ...` line (packet layer) and, for relayed flows, one `relay ...`
 line with domain, route, group, reason and outcome.
 
