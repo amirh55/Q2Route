@@ -10,8 +10,8 @@ use crate::client::Client;
 use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
 use crate::views::{
-    connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, placeholder,
-    proxies::ProxiesView, settings as settings_view, usage::UsageView,
+    connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, log::LogView,
+    placeholder, proxies::ProxiesView, settings as settings_view, usage::UsageView,
 };
 
 /// How often the UI and the tray refresh from `Client::latest()`.
@@ -90,6 +90,7 @@ pub struct App {
     usage: UsageView,
     groups: GroupsView,
     connections: ConnectionsView,
+    log: LogView,
     leak: settings_view::LeakState,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
@@ -127,6 +128,7 @@ impl App {
             usage: UsageView::default(),
             groups: GroupsView::default(),
             connections: ConnectionsView::default(),
+            log: LogView::default(),
             leak: settings_view::LeakState::default(),
             hide_on_start: hidden && tray.is_some(),
             dpi_hooked: false,
@@ -241,6 +243,11 @@ impl eframe::App for App {
                 // Has its own virtualised scroll area.
                 self.connections
                     .show(ui, snap.as_ref(), &self.client, &mut self.requests);
+                return;
+            }
+            if self.page == Page::Log {
+                // Has its own virtualised scroll area.
+                self.log.show(ui, &self.client);
                 return;
             }
             egui::ScrollArea::vertical()

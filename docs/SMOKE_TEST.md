@@ -171,6 +171,21 @@ Data usage page. Counts only proxied traffic (TCP through the relay, UDP through
 | M9-U5 | Press Reset and answer Yes. | Everything is cleared and `usage.json` is deleted. | |
 | M9-U6 | Switch it off. | The numbers stop growing; the history is kept in `usage.json` (and shows again when switched back on). | |
 
+## M11: log page
+
+Log page. Shows the service's last 2000 log lines, polled every second while the page is open. Files are in `%ProgramData%\Q2Route\logs` (14 days kept).
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| L1 | Open the Log page. | Recent service lines appear within 1 s. | |
+| L2 | Start/Stop routing from the dashboard, then return to Log. | The new lines appear live. | |
+| L3 | Choose the Errors filter. | Info lines are hidden (Warnings shows warnings and errors). | |
+| L4 | Type part of a module name or message in Search. | The rows narrow to the matches. | |
+| L5 | Press Pause, wait for new lines to be logged, then Resume. | Pause freezes the view; Resume catches up. | |
+| L6 | Press Copy, then paste into Notepad. | The shown rows are pasted as text lines. | |
+| L7 | Press "Open log folder". | Explorer opens `%ProgramData%\Q2Route\logs`. | |
+| L8 | Restart the service with the page open. | Fresh lines appear without duplicates; the page does not stall. | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |
