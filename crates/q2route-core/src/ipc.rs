@@ -21,26 +21,61 @@ pub enum Request {
     GetState,
     Start,
     Stop,
-    SetGroupAction { group_id: GroupId, action: Action },
-    SetGroupEnabled { group_id: GroupId, enabled: bool },
+    SetGroupAction {
+        group_id: GroupId,
+        action: Action,
+    },
+    SetGroupEnabled {
+        group_id: GroupId,
+        enabled: bool,
+    },
     UpsertProxy(ProxyProfile),
-    DeleteProxy { id: ProfileId },
-    TestProxy { id: ProfileId },
+    DeleteProxy {
+        id: ProfileId,
+    },
+    TestProxy {
+        id: ProfileId,
+    },
     Subscribe,
-    AddGroup { name: String, action: Action },
-    RenameGroup { group_id: GroupId, name: String },
-    DeleteGroup { group_id: GroupId },
-    MoveGroup { group_id: GroupId, to: usize },
-    SetGroupRules { group_id: GroupId, rules: Vec<Rule> },
-    AddRule { group_id: GroupId, rule: Rule },
+    AddGroup {
+        name: String,
+        action: Action,
+    },
+    RenameGroup {
+        group_id: GroupId,
+        name: String,
+    },
+    DeleteGroup {
+        group_id: GroupId,
+    },
+    MoveGroup {
+        group_id: GroupId,
+        to: usize,
+    },
+    SetGroupRules {
+        group_id: GroupId,
+        rules: Vec<Rule>,
+    },
+    AddRule {
+        group_id: GroupId,
+        rule: Rule,
+    },
     GetConnections,
     ListProcesses,
     SetDns(DnsSettings),
     FlushDns,
-    SetProxyIpv6 { enabled: bool },
+    SetProxyIpv6 {
+        enabled: bool,
+    },
     GetUsage,
-    SetDataUsage { enabled: bool },
+    SetDataUsage {
+        enabled: bool,
+    },
     ResetUsage,
+    /// Log entries with `seq > after`, oldest first.
+    GetLog {
+        after: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -75,6 +110,26 @@ pub enum Response {
     Connections(Vec<ConnInfo>),
     Processes(Vec<ProcEntry>),
     Usage(UsageReport),
+    Log(Vec<LogEntry>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LogEntry {
+    pub seq: u64,
+    /// Unix ms.
+    pub ms: u64,
+    pub level: LogLevel,
+    pub target: String,
+    pub msg: String,
 }
 
 /// Proxied bytes of one (group, app, proxy).

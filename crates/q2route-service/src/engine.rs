@@ -525,6 +525,7 @@ impl Inner {
                 })
                 .await
             }
+            Request::GetLog { after } => Response::Log(crate::log_ring::global().since(after)),
             Request::GetUsage => Response::Usage(self.relay().usage.report()),
             Request::SetDataUsage { enabled } => {
                 let r = self.apply(|c| c.set_data_usage(enabled)).await;

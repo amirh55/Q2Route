@@ -8,6 +8,7 @@ pub mod engine;
 pub mod flows;
 pub mod geo;
 pub mod ipc_server;
+pub mod log_ring;
 pub mod nat;
 pub mod packet_loop;
 pub mod proxy_servers;
