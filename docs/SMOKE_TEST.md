@@ -187,6 +187,19 @@ Log page. Shows the service's last 2000 log lines, polled every second while the
 | L7 | Press "Open log folder". | Explorer opens `%ProgramData%\Q2Route\logs`. | |
 | L8 | Restart the service with the page open. | Fresh lines appear without duplicates; the page does not stall. | |
 
+## M12: settings
+
+Settings page: theme, tray graph, geo data update, export and import. The file dialogs are the Windows pickers and are not covered by unit tests.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| S1 | Settings > Appearance: choose Light, then Follow Windows, then Dark. Close and reopen the UI. | Each choice applies immediately; the last choice is still selected after reopening. | |
+| S2 | Untick "Traffic graph in the tray icon". | The tray icon becomes plain (no traffic bars); the tooltip and menu are unchanged. Ticking it brings the bars back. | |
+| S3 | Open Settings > Geo data. With v2rayN running after its own geo update, press Update now. Press it again, or press it with no proxy program running. | The section shows dates such as `geoip.dat: 2026-11-15 (4.1 MB)`. The first press shows `Updated: ...`; without newer files it shows `No newer geo files found (v2rayN, xray, v2ray or sing-box must be running).` | |
+| S4 | Backup: leave "Include proxy passwords" off, press Export and save `q2route-config.toml`. | The file has no `password` lines. Ticking the box shows `The file will contain your proxy passwords in plain text.` | |
+| S5 | Change a group (for example rename it), then Import the exported file. | The confirmation `Replace all groups, rules and proxies with this file? A backup is kept as config.toml.bak.` appears. After Yes the group is back, `config.toml.bak` exists next to `config.toml` and the proxies still connect. | |
+| S6 | Rename a random `.txt` file to `.toml` and Import it. | A red `Import failed: ...` line appears and nothing changes. A file over 1 MiB gives `Import failed: the file is bigger than 1 MiB.` | |
+
 ## Leak checks
 
 | # | Check | Expected | Result |

@@ -13,12 +13,52 @@ use windows_sys::Win32::System::Registry::{
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Q2Route";
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+/// Colour theme; `System` follows Windows.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+impl Theme {
+    pub fn preference(self) -> eframe::egui::ThemePreference {
+        match self {
+            Theme::Dark => eframe::egui::ThemePreference::Dark,
+            Theme::Light => eframe::egui::ThemePreference::Light,
+            Theme::System => eframe::egui::ThemePreference::System,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiSettings {
     #[serde(default)]
     pub start_with_windows: bool,
     #[serde(default)]
     pub close_to_tray: bool,
+    #[serde(default)]
+    pub theme: Theme,
+    /// Traffic bars in the tray icon.
+    #[serde(default = "yes")]
+    pub tray_graph: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        UiSettings {
+            start_with_windows: false,
+            close_to_tray: false,
+            theme: Theme::Dark,
+            tray_graph: true,
+        }
+    }
 }
 
 fn path() -> Option<PathBuf> {
@@ -79,5 +119,36 @@ pub fn set_autostart(on: bool) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(rc as i32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_settings_defaults_for_old_file() {
+        let s: UiSettings = toml::from_str(
+            "start_with_windows = true
+close_to_tray = true
+",
+        )
+        .unwrap();
+        assert!(s.start_with_windows && s.close_to_tray);
+        assert_eq!(s.theme, Theme::Dark);
+        assert!(s.tray_graph);
+        let empty: UiSettings = toml::from_str("").unwrap();
+        assert_eq!(empty, UiSettings::default());
+    }
+
+    #[test]
+    fn theme_roundtrips() {
+        let s = UiSettings {
+            theme: Theme::System,
+            tray_graph: false,
+            ..Default::default()
+        };
+        let back: UiSettings = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 }
