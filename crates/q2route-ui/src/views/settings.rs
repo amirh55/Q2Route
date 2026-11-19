@@ -68,7 +68,9 @@ pub fn read_import(path: &Path) -> Result<Config, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Import failed: {e}"))?;
     let text = String::from_utf8(bytes)
         .map_err(|_| "Import failed: the file is not a text (TOML) file.".to_string())?;
-    Config::parse(&text).map_err(|e| format!("Import failed: {e}"))
+    // Some editors save UTF-8 with a BOM, which TOML does not allow.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    Config::parse(text).map_err(|e| format!("Import failed: {e}"))
 }
 
 /// (year, month, day) of a day count since 1970-01-01 (proleptic Gregorian).
