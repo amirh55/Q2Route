@@ -122,8 +122,8 @@ begin
   if not Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then begin
     LoadStringFromFile(OutFile, Output);
     SuppressibleMsgBox('Q2Route service install failed (exit code ' + IntToStr(Code) + '):'#13#10#13#10 +
-      String(Output), mbError, MB_OK, IDOK);
-    Abort;
+      String(Output) + #13#10 + 'Run Setup again after fixing the cause.', mbError, MB_OK, IDOK);
+    { No Abort here: at ssPostInstall it cannot roll back, the files are already in place. }
   end;
 end;
 
