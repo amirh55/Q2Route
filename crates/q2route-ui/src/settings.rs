@@ -44,6 +44,9 @@ pub struct UiSettings {
     /// Traffic bars in the tray icon.
     #[serde(default = "yes")]
     pub tray_graph: bool,
+    /// Check GitHub for a newer release on start and every 24 h.
+    #[serde(default = "yes")]
+    pub check_updates: bool,
 }
 
 fn yes() -> bool {
@@ -57,6 +60,7 @@ impl Default for UiSettings {
             close_to_tray: false,
             theme: Theme::Dark,
             tray_graph: true,
+            check_updates: true,
         }
     }
 }
@@ -88,6 +92,15 @@ impl UiSettings {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// Rewrites the Run value with the current exe path when autostart is on, so
+/// a move (zip folder to Program Files) keeps it working. Errors are ignored:
+/// it runs once at startup and there is nobody to tell.
+pub fn refresh_autostart(s: &UiSettings) {
+    if s.start_with_windows {
+        let _ = set_autostart(true);
+    }
 }
 
 /// Adds or removes `HKCU\...\Run\Q2Route = "<exe>" --minimized`.
@@ -127,6 +140,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn check_updates_defaults_on_for_old_file() {
+        let s: UiSettings = toml::from_str("theme = \"light\"\n").unwrap();
+        assert!(s.check_updates);
+        let off: UiSettings = toml::from_str("check_updates = false\n").unwrap();
+        assert!(!off.check_updates);
+    }
+
+    #[test]
     fn ui_settings_defaults_for_old_file() {
         let s: UiSettings = toml::from_str(
             "start_with_windows = true
@@ -137,6 +158,7 @@ close_to_tray = true
         assert!(s.start_with_windows && s.close_to_tray);
         assert_eq!(s.theme, Theme::Dark);
         assert!(s.tray_graph);
+        assert!(s.check_updates);
         let empty: UiSettings = toml::from_str("").unwrap();
         assert_eq!(empty, UiSettings::default());
     }

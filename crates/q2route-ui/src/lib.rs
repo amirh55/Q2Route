@@ -8,6 +8,7 @@ pub mod leak;
 pub mod settings;
 pub mod tray;
 pub mod tray_icon_render;
+pub mod update;
 pub mod views;
 
 /// Formats a byte rate: `512 B/s`, `120 KB/s`, `2.4 MB/s` (decimal units).

@@ -276,3 +276,6 @@ Build with `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Setup`
 ```powershell
 sc qc Q2Route
 ```
+| U7 | With release v0.2.1 published (the next one), start a 0.2.0 install. | The banner "Q2Route 0.2.1 is available." with Install update, Release notes and Later shows within about 10 s of start. Later hides it until the next start. | |
+| U8 | Click Install update. | Progress text "Downloading… x / y MB", then the UAC prompt; the setup runs silently, Q2Route reopens, and Settings shows `Version 0.2.1`. | |
+| U9 | Disconnect the network. Click "Check now" in Settings > Updates; restart with automatic checks on. | "Check now" shows `Could not check for updates: <reason>`; the automatic check shows nothing. | |

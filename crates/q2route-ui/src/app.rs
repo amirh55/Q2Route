@@ -1,6 +1,6 @@
 //! App shell: left navigation, page routing, request bookkeeping.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use q2route_core::ipc::{Request, Response};
@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use crate::client::Client;
 use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
+use crate::update::Updater;
 use crate::views::{
     connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, log::LogView,
     placeholder, proxies::ProxiesView, settings as settings_view, usage::UsageView,
@@ -93,6 +94,7 @@ pub struct App {
     log: LogView,
     leak: settings_view::LeakState,
     backup: settings_view::BackupState,
+    updater: Updater,
     tray: Option<Tray>,
     /// Set by the tray's Exit: the next close request is not turned into hide.
     exiting: bool,
@@ -132,6 +134,7 @@ impl App {
             log: LogView::default(),
             leak: settings_view::LeakState::default(),
             backup: settings_view::BackupState::default(),
+            updater: Updater::new(Instant::now()),
             hide_on_start: hidden && tray.is_some(),
             dpi_hooked: false,
             tray,
@@ -172,6 +175,11 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
+        if self.updater.poll(ctx, self.settings.check_updates) {
+            // The setup was started (UAC accepted); it relaunches the UI.
+            self.exiting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if !self.dpi_hooked && frame.winit_window().is_some() {
             // One attempt only: the handle either exists now or never will.
             self.dpi_hooked = true;
@@ -239,6 +247,7 @@ impl eframe::App for App {
             });
         }
         egui::CentralPanel::default_margins().show(ui, |ui| {
+            self.updater.banner(ui);
             if !connected {
                 dashboard::service_banner(ui);
             }
@@ -279,6 +288,7 @@ impl eframe::App for App {
                         &self.client,
                         &mut self.leak,
                         &mut self.backup,
+                        &mut self.updater,
                     ),
                     _ => placeholder::show(ui, self.page.label()),
                 });
