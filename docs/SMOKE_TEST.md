@@ -259,3 +259,20 @@ taskkill /F /IM q2route-service.exe
 ```powershell
 Get-NetFirewallRule -DisplayName "Q2Route relay"
 ```
+
+## M13 installer
+
+Build with `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Setup`; the setup is `dist\Q2Route-Setup-0.2.0.exe`.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| I1 | Run the setup on a PC without Q2Route. | Installs to `C:\Program Files\Q2Route`, service `Q2Route` is registered from there, Start menu shortcut exists, the UI opens. | |
+| I2 | Install over an old zip install (service registered from the zip folder). | `sc qc Q2Route` shows a path in Program Files; groups, rules and settings are unchanged. | |
+| I3 | Run the setup while routing is on. | Setup removes the service before copying, finishes without file-in-use errors, and routing can be started again afterwards. | |
+| I4 | Turn on "Start with Windows" in the zip build, then move to the installed build. | After the update to the installed build, autostart still launches Q2Route at login. | |
+| I5 | Uninstall from Apps, once answering No and once Yes to "Also delete Q2Route's settings, rules and logs?". | No keeps `%ProgramData%\Q2Route`; Yes removes it (and `%APPDATA%\Q2Route`). The service and firewall rule are gone either way. | |
+| I6 | Start Proxifier, then run the setup. | Setup stops with "Proxifier is running. Exit it fully (tray icon too), then run Setup again." and installs nothing. | |
+
+```powershell
+sc qc Q2Route
+```

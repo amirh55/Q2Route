@@ -2098,7 +2098,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "q2route-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "ipnet",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "q2route-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "q2route-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "q2route-core",
