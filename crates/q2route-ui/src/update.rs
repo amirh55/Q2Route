@@ -561,7 +561,13 @@ impl Updater {
                         Ok(path) => {
                             let args = "/SILENT /SUPPRESSMSGBOXES /NORESTART";
                             if shell_open(&path.to_string_lossy(), Some(args)) {
+                                // Setup closes this window itself once it is really
+                                // installing (after UAC); if UAC is cancelled we stay open.
                                 launched = true;
+                                self.install_error = Some(
+                                    "Setup started. Accept the Windows prompt; Q2Route closes and reopens when it installs."
+                                        .into(),
+                                );
                             } else {
                                 self.install_error =
                                     Some("Could not start the setup (was it cancelled?).".into());

@@ -175,11 +175,9 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
-        if self.updater.poll(ctx, self.settings.check_updates) {
-            // The setup was started (UAC accepted); it relaunches the UI.
-            self.exiting = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+        // A started setup closes and relaunches the UI itself (taskkill in
+        // PrepareToInstall); exiting here would lose the window if UAC is cancelled.
+        let _ = self.updater.poll(ctx, self.settings.check_updates);
         if !self.dpi_hooked && frame.winit_window().is_some() {
             // One attempt only: the handle either exists now or never will.
             self.dpi_hooked = true;
