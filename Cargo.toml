@@ -4,4 +4,4 @@ members = ["crates/q2route-core", "crates/q2route-service", "crates/q2route-ui"]
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.2.1"

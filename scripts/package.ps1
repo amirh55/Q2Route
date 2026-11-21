@@ -42,15 +42,16 @@ if ($Setup) {
         ForEach-Object { Join-Path $_ 'ISCC.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) { throw "ISCC.exe not found. Install Inno Setup 6: winget install -e --id JRSoftware.InnoSetup" }
 
-    $stage = Join-Path $root 'dist\setup-stage'
-    $zipDir = Join-Path $root 'dist\setup-zip'
+    # Per-version folders: a q2route.exe started from an older stage stays locked.
+    $stage = Join-Path $root "dist\setup-stage-$ver"
+    $zipDir = Join-Path $root "dist\setup-zip-$ver"
     foreach ($d in $stage, $zipDir) { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
     $inner = Join-Path $zipDir 'Q2Route'
     New-Item -ItemType Directory -Force $stage, $inner | Out-Null
     foreach ($f in $files) { Copy-Item (Join-Path $root "target\release\$f") $stage -Force }
     Copy-Item (Join-Path $root 'vendor\windivert\LICENSE') (Join-Path $stage 'WinDivert-LICENSE.txt') -Force
 
-    & $iscc "/DAppVersion=$ver" (Join-Path $root 'installer\q2route.iss')
+    & $iscc "/DAppVersion=$ver" "/DStageDir=$stage" (Join-Path $root 'installer\q2route.iss')
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
     Copy-Item (Join-Path $stage '*') $inner -Force

@@ -2,6 +2,9 @@
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
+#ifndef StageDir
+  #define StageDir "..\dist\setup-stage-" + AppVersion
+#endif
 
 [Setup]
 ; Never change this AppId: it is how Setup recognises an earlier install.
@@ -27,13 +30,15 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 
 [Files]
 ; Source: the staged folder built by scripts\package.ps1 -Setup
-Source: "..\dist\setup-stage\q2route.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\setup-stage\q2route-service.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\setup-stage\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\setup-stage\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\setup-stage\WinDivert-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\q2route.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\q2route-service.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\WinDivert-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; Copy of the new service exe so PrepareToInstall can remove an old service before files are replaced.
-Source: "..\dist\setup-stage\q2route-service.exe"; DestDir: "{tmp}"; Flags: dontcopy
+Source: "{#StageDir}\q2route-service.exe"; DestDir: "{tmp}"; Flags: dontcopy
+; The service exe imports WinDivert.dll at load time, so the temp copy needs it beside it.
+Source: "{#StageDir}\WinDivert.dll"; DestDir: "{tmp}"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\Q2Route"; Filename: "{app}\q2route.exe"
@@ -102,6 +107,7 @@ begin
   if ServiceExists then begin
     { The new exe works by service name, wherever the old copy lives. }
     ExtractTemporaryFile('q2route-service.exe');
+    ExtractTemporaryFile('WinDivert.dll');
     Tmp := ExpandConstant('{tmp}\q2route-service.exe');
     if not Exec(Tmp, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then begin
       Result := 'Could not remove the existing Q2Route service (exit code ' + IntToStr(Code) + ').';
