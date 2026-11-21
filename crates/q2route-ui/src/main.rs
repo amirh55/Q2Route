@@ -103,6 +103,7 @@ fn main() -> eframe::Result {
     }
     let hidden = std::env::args().any(|a| a == "--minimized");
     let settings = UiSettings::load();
+    q2route_ui::settings::refresh_autostart(&settings);
     let client = Client::connect(PIPE_NAME);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

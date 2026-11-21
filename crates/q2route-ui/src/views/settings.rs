@@ -1,4 +1,4 @@
-//! Settings page: General, Appearance, Geo data, Backup, Leak check.
+//! Settings page: General, Appearance, Geo data, Backup, Updates, Leak check.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use crate::client::Client;
 use crate::file_dialog;
 use crate::leak::LeakCheck;
 use crate::settings::{set_autostart, Theme, UiSettings};
+use crate::update::{self, Updater};
 use crate::views::dashboard::{BLOCK, DIRECT};
 use crate::views::log::local_offset_min;
 use crate::views::usage::fmt_bytes;
@@ -121,6 +122,7 @@ pub fn show(
     client: &Client,
     leak: &mut LeakState,
     backup: &mut BackupState,
+    updater: &mut Updater,
 ) {
     ui.heading("Settings");
     ui.add_space(8.0);
@@ -146,6 +148,7 @@ pub fn show(
     appearance_section(ui, s, req);
     geo_section(ui, client, req, backup);
     backup_section(ui, client, backup);
+    updates_section(ui, s, req, updater);
     leak_section(ui, client, leak);
 }
 
@@ -323,6 +326,39 @@ fn backup_section(ui: &mut egui::Ui, client: &Client, b: &mut BackupState) {
         ui.add_space(6.0);
         if *bad {
             ui.colored_label(BLOCK, m);
+        } else {
+            ui.label(m);
+        }
+    }
+}
+
+fn updates_section(ui: &mut egui::Ui, s: &mut UiSettings, req: &mut Requests, u: &mut Updater) {
+    ui.add_space(16.0);
+    ui.heading("Updates");
+    ui.add_space(8.0);
+    if ui
+        .checkbox(&mut s.check_updates, "Check for updates automatically")
+        .changed()
+    {
+        if let Err(e) = s.save() {
+            req.last_error = Some(format!("Saving settings: {e}"));
+        }
+    }
+    ui.label(format!("Version {}", update::CURRENT));
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!u.busy(), egui::Button::new("Check now"))
+            .clicked()
+        {
+            u.check_now(ui.ctx());
+        }
+        if u.busy() {
+            ui.spinner();
+        }
+    });
+    if let Some((bad, m)) = &u.manual_msg {
+        if *bad {
+            ui.colored_label(update::ERROR_COLOR, m);
         } else {
             ui.label(m);
         }

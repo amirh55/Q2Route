@@ -86,7 +86,7 @@ pub fn summary(g: &Group) -> String {
     }
 }
 
-fn banner(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui)) {
+pub fn banner(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(fill)
         .corner_radius(6)
