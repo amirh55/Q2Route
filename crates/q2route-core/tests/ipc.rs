@@ -154,6 +154,7 @@ fn new_variants_round_trip() {
         proto: Protocol::Tcp,
         pid: 4,
         exe: "a.exe".into(),
+        exe_path: r"C:\Example\a.exe".into(),
         local: "127.0.0.1:5000".parse().unwrap(),
         dst: "1.2.3.4:443".parse().unwrap(),
         domain: Some("x.com".into()),
@@ -176,6 +177,22 @@ fn new_variants_round_trip() {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
     }
+}
+
+#[test]
+fn connection_exe_path_is_optional_on_wire_and_preserved() {
+    let legacy = serde_json::json!({
+        "id": 1, "proto": "tcp", "pid": 4, "exe": "a.exe",
+        "local": "127.0.0.1:5000", "dst": "1.2.3.4:443", "domain": null,
+        "route": "Direct", "group_id": null, "reason": "own", "started_ms": 10,
+        "ended_ms": null, "up": null, "down": null
+    });
+    let mut conn: ConnInfo = serde_json::from_value(legacy).unwrap();
+    assert!(conn.exe_path.is_empty());
+    conn.exe_path = r"C:\Program Files\Example\a.exe".into();
+    let encoded = serde_json::to_value(&conn).unwrap();
+    assert_eq!(encoded["exe_path"], r"C:\Program Files\Example\a.exe");
+    assert_eq!(serde_json::from_value::<ConnInfo>(encoded).unwrap(), conn);
 }
 
 #[test]

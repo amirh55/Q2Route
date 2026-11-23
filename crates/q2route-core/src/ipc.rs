@@ -184,6 +184,9 @@ pub struct ConnInfo {
     pub pid: u32,
     /// File name; "System" / "?" when unknown.
     pub exe: String,
+    /// Full executable path from the process tree; empty when unavailable.
+    #[serde(default)]
+    pub exe_path: String,
     pub local: SocketAddr,
     pub dst: SocketAddr,
     pub domain: Option<String>,
