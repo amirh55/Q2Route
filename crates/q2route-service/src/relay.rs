@@ -26,7 +26,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashSet;
 use q2route_core::config::{Config, ProfileId, Protocol};
 use q2route_core::decide::{
-    decide, decide_dns, decide_mapped_no_peek, Decision, FlowInfo, MatchInfo, MatchReason, Route,
+    decide, decide_dns_for_process, decide_mapped_no_peek, Decision, FlowInfo, MatchInfo,
+    MatchReason, Route,
 };
 use q2route_core::dns::{answers, parse_query, response_id};
 use q2route_core::domain_map::DomainMap;
@@ -178,6 +179,27 @@ mod policy_tests {
     use super::*;
     use q2route_core::config::AppRule;
     use q2route_core::process_tree::ProcInfo;
+
+    #[test]
+    fn tcp_dns_obeys_app_block_but_preserves_bootstrap() {
+        let mut cfg = Config::seed();
+        cfg.app_rules = vec![AppRule {
+            app: "target.exe".into(),
+            action: q2route_core::config::Action::Block,
+            enabled: true,
+        }];
+        cfg.proxies[0].host = "proxy.example.net".into();
+        let bootstrap = cfg.proxies[0].host.clone();
+        let ctx = crate::test_util::ctx(cfg);
+        ctx.tree.write().unwrap().insert(ProcInfo {
+            pid: 71,
+            parent: 0,
+            start_time: 1,
+            exe: r"C:\Apps\target.exe".into(),
+        });
+        assert_eq!(dns_route(&ctx, 71, "example.org").0, Route::Block);
+        assert_eq!(dns_route(&ctx, 71, &bootstrap).0, Route::Direct);
+    }
 
     async fn cancels_pending_flow(proto: Protocol) {
         let ctx = crate::test_util::ctx(Config::seed());
@@ -712,7 +734,7 @@ pub fn proxy_program(
 
 /// Route of a DNS query for `name` from `pid`: the proxy program's own
 /// queries ([`proxy_program`]) and bootstrap names ([`bootstrap_direct`])
-/// are Direct, anything else by [`decide_dns`] (the queried name only).
+/// are Direct, anything else by process-aware app rules then domain rules.
 fn dns_route(ctx: &RelayCtx, pid: u32, name: &str) -> (Route, MatchInfo) {
     let bootstrap = MatchInfo {
         group_id: None,
@@ -730,7 +752,13 @@ fn dns_route(ctx: &RelayCtx, pid: u32, name: &str) -> (Route, MatchInfo) {
         tracing::debug!("dns name={name} pid={pid} via=direct ({why})");
         return (Route::Direct, bootstrap);
     }
-    decide_dns(&ctx.rules.load(), name)
+    decide_dns_for_process(
+        &ctx.rules.load(),
+        &ctx.tree.read().unwrap_or_else(|e| e.into_inner()),
+        &ctx.excluded.load(),
+        pid,
+        name,
+    )
 }
 
 /// What the first bytes of a relayed TCP/53 connection turned out to be.
