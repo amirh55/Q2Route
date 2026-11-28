@@ -87,14 +87,22 @@ impl Engine {
     /// Loads (or seeds) the config at `config_path` and compiles it. Nothing
     /// is captured until [`Engine::start`].
     pub fn new(config_path: PathBuf) -> Result<Engine> {
+        Self::with_processes(config_path, &winapi::list_processes())
+    }
+
+    fn with_processes(
+        config_path: PathBuf,
+        procs: &[q2route_core::process_tree::ProcInfo],
+    ) -> Result<Engine> {
         let cfg = Config::load(&config_path)?;
         let dir = config_path.parent().map(PathBuf::from).unwrap_or_default();
         let data_usage = cfg.settings.data_usage;
         let geo = GeoCache::new(dir.clone());
-        geo.reload(&winapi::list_processes());
+        geo.reload(procs);
         let rules = geo.compile(&cfg)?;
         let (events, _) = broadcast::channel(64);
         let relay = Arc::new(RelayCtx {
+            rules_changed: tokio::sync::watch::channel(()).0,
             rules: ArcSwap::from_pointee(rules),
             cfg: ArcSwap::from_pointee(cfg),
             tree: Arc::new(RwLock::new(ProcessTree::default())),
@@ -392,6 +400,7 @@ impl Inner {
         if let Some(s) = mutex(&self.current).as_ref() {
             s.cache.on_rules_changed();
         }
+        self.relay().rules_changed.send_replace(());
         Ok(())
     }
 
@@ -400,9 +409,12 @@ impl Inner {
         &self,
         f: impl FnOnce(&mut Config) -> std::result::Result<(), ConfigError>,
     ) -> Response {
+        let proxies = self.relay().cfg.load().proxies.clone();
         match self.mutate(f).await {
             Ok(()) => {
-                refresh_exclusions(&self.shared).await;
+                if self.relay().cfg.load().proxies != proxies {
+                    refresh_exclusions(&self.shared).await;
+                }
                 Response::Ok
             }
             Err(e) => Response::Error(e.to_string()),
@@ -495,6 +507,13 @@ impl Inner {
             Err(e) => Response::Error(e.to_string()),
         };
         match r {
+            Request::SetAppRules(rules) => {
+                self.apply(|c| {
+                    c.app_rules = rules;
+                    Ok(())
+                })
+                .await
+            }
             Request::GetState => Response::State(self.snapshot()),
             Request::Start => {
                 let r = match self.start().await {
@@ -826,4 +845,104 @@ fn spawn_periodic(shared: Arc<Shared>, state: Arc<RunState>, cancel: Cancellatio
             }
         }
     });
+}
+
+#[cfg(test)]
+mod app_rule_tests {
+    use super::*;
+    use q2route_core::config::{Action, AppRule, Protocol};
+    use q2route_core::decide::{decide, Decision, FlowInfo, Route};
+    use q2route_core::process_tree::ProcInfo;
+
+    #[tokio::test]
+    async fn app_rules_replace_persist_compile_and_rollback_without_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let engine = Engine::with_processes(path.clone(), &[]).unwrap();
+        // Avoid starting even background snapshot tasks; no live process/config reads.
+        engine.inner.background.store(true, Ordering::SeqCst);
+        let state = Arc::new(RunState::new(0, false));
+        *mutex(&engine.inner.current) = Some(state.clone());
+        engine.inner.relay().tree.write().unwrap().insert(ProcInfo {
+            pid: 71,
+            parent: 0,
+            start_time: 1,
+            exe: r"C:\Apps\target.exe".into(),
+        });
+        let route = || {
+            let relay = engine.inner.relay();
+            decide(
+                &relay.rules.load(),
+                &relay.tree.read().unwrap(),
+                &HashSet::new(),
+                &FlowInfo {
+                    proto: Protocol::Tcp,
+                    pid: 71,
+                    dst: "203.0.113.1:443".parse().unwrap(),
+                    domain: Some(""),
+                },
+            )
+        };
+        let rules = vec![AppRule {
+            app: "target.exe".into(),
+            action: Action::Block,
+            enabled: true,
+        }];
+        let generation = state.cache.generation();
+        assert_eq!(
+            engine.handle(Request::SetAppRules(rules.clone())).await,
+            Response::Ok
+        );
+        assert_eq!(Config::load(&path).unwrap().app_rules, rules);
+        assert_eq!(engine.snapshot().config.app_rules, rules);
+        assert!(state.cache.generation() > generation);
+        assert!(matches!(route(), Decision::Final(Route::Block, _)));
+        let before = std::fs::read(&path).unwrap();
+        let generation = state.cache.generation();
+        let changes = engine.inner.relay().rules_changed.subscribe();
+        let invalid = vec![AppRule {
+            app: String::new(),
+            action: Action::Direct,
+            enabled: true,
+        }];
+        assert!(matches!(
+            engine.handle(Request::SetAppRules(invalid)).await,
+            Response::Error(_)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(engine.snapshot().config.app_rules, rules);
+        assert_eq!(state.cache.generation(), generation);
+        assert!(!changes.has_changed().unwrap());
+        assert!(matches!(route(), Decision::Final(Route::Block, _)));
+        // Force persistence failure using only this test's temporary path.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            engine.handle(Request::SetAppRules(vec![])).await,
+            Response::Error(_)
+        ));
+        assert_eq!(engine.snapshot().config.app_rules, rules);
+        assert_eq!(state.cache.generation(), generation);
+        assert!(!changes.has_changed().unwrap());
+        assert!(matches!(route(), Decision::Final(Route::Block, _)));
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            engine.handle(Request::SetAppRules(vec![])).await,
+            Response::Ok
+        );
+        assert!(engine.snapshot().config.app_rules.is_empty());
+        assert!(Config::load(&path).unwrap().app_rules.is_empty());
+        assert_eq!(
+            engine
+                .handle(Request::SetAppRules(vec![AppRule {
+                    app: "target.exe".into(),
+                    action: Action::Proxy("deleted".into()),
+                    enabled: true,
+                }]))
+                .await,
+            Response::Ok
+        );
+        assert!(matches!(route(), Decision::Final(Route::Block, _)));
+        assert!(!engine.is_running());
+    }
 }

@@ -29,6 +29,8 @@ pub struct NewConn {
     pub proto: Protocol,
     pub pid: u32,
     pub exe: String,
+    /// Full executable path; never substitute the display name when unknown.
+    pub exe_path: String,
     pub local: SocketAddr,
     pub dst: SocketAddr,
     pub domain: Option<String>,
@@ -117,6 +119,9 @@ impl ConnLog {
             a.info.group_id = c.group_id;
             a.info.reason = c.reason;
             a.info.domain = c.domain;
+            if !c.exe_path.is_empty() {
+                a.info.exe_path = c.exe_path;
+            }
             if bytes.is_some() {
                 a.bytes = bytes;
             }
@@ -129,6 +134,7 @@ impl ConnLog {
             proto: c.proto,
             pid: c.pid,
             exe: c.exe,
+            exe_path: c.exe_path,
             local: c.local,
             dst: c.dst,
             domain: c.domain,
@@ -194,6 +200,7 @@ mod tests {
             proto: Protocol::Tcp,
             pid: 1,
             exe: "a.exe".into(),
+            exe_path: r"C:\Example\a.exe".into(),
             local: "10.0.0.1:1000".parse().unwrap(),
             dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(i as u32)), 443),
             domain: None,
@@ -205,6 +212,24 @@ mod tests {
 
     fn local(c: &mut NewConn, port: u16) {
         c.local = SocketAddr::new("10.0.0.1".parse().unwrap(), port);
+    }
+
+    #[test]
+    fn executable_path_survives_updates_and_close() {
+        let log = ConnLog::default();
+        let mut first = conn(1);
+        first.exe_path.clear();
+        let id = log.open(first, None);
+        assert!(log.list()[0].exe_path.is_empty());
+        let mut known = conn(1);
+        known.exe_path = r"D:\Program Files\Example\a.exe".into();
+        assert_eq!(log.open(known, None), id);
+        let mut unknown = conn(1);
+        unknown.exe_path.clear();
+        assert_eq!(log.open(unknown, None), id);
+        log.close(id);
+        assert_eq!(log.list()[0].exe_path, r"D:\Program Files\Example\a.exe");
+        assert_eq!(log.list()[0].exe, "a.exe");
     }
 
     #[test]

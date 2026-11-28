@@ -11,8 +11,9 @@ use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
 use crate::update::Updater;
 use crate::views::{
-    connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, log::LogView,
-    placeholder, proxies::ProxiesView, settings as settings_view, usage::UsageView,
+    app_rules::AppRulesView, connections::ConnectionsView, dashboard, dns::DnsView,
+    groups::GroupsView, log::LogView, placeholder, proxies::ProxiesView, settings as settings_view,
+    usage::UsageView,
 };
 
 /// How often the UI and the tray refresh from `Client::latest()`.
@@ -23,6 +24,7 @@ pub enum Page {
     Dashboard,
     Connections,
     Groups,
+    AppRules,
     Proxies,
     Dns,
     DataUsage,
@@ -31,10 +33,11 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 8] = [
+    pub const ALL: [Page; 9] = [
         Page::Dashboard,
         Page::Connections,
         Page::Groups,
+        Page::AppRules,
         Page::Proxies,
         Page::Dns,
         Page::DataUsage,
@@ -47,6 +50,7 @@ impl Page {
             Page::Dashboard => "Dashboard",
             Page::Connections => "Connections",
             Page::Groups => "Groups & rules",
+            Page::AppRules => "App rules",
             Page::Proxies => "Proxies",
             Page::Dns => "DNS",
             Page::DataUsage => "Data usage",
@@ -61,9 +65,87 @@ impl Page {
 pub struct Requests {
     pending: Vec<oneshot::Receiver<Response>>,
     pub last_error: Option<String>,
+    app_rule_write: Option<AppRuleWrite>,
+    app_rules: Option<Vec<q2route_core::config::AppRule>>,
+    observed_app_rules: Option<Vec<q2route_core::config::AppRule>>,
+}
+
+/// One global gate, shared by every app-rule editor, including while hidden.
+enum AppRuleWrite {
+    Saving(oneshot::Receiver<Response>),
+    Refreshing(oneshot::Receiver<Response>),
 }
 
 impl Requests {
+    pub fn app_rules_ready(&self) -> bool {
+        self.app_rules.is_some() && self.app_rule_write.is_none()
+    }
+
+    pub fn app_rules(&self) -> &[q2route_core::config::AppRule] {
+        self.app_rules.as_deref().unwrap_or_default()
+    }
+
+    /// The snapshot cache has no revision. Never adopt a changed cache value
+    /// directly: a queued pre-write event may arrive after the write's response.
+    /// GetState is ordered after our write and provides the authoritative base.
+    fn observe_app_rules(
+        &mut self,
+        snap: &q2route_core::ipc::StateSnapshot,
+        send: impl FnOnce(Request) -> oneshot::Receiver<Response>,
+    ) {
+        let rules = &snap.config.app_rules;
+        let first = self.observed_app_rules.is_none();
+        let changed = self.observed_app_rules.as_ref() != Some(rules);
+        self.observed_app_rules = Some(rules.clone());
+        if first && self.app_rule_write.is_none() {
+            self.app_rules = Some(rules.clone());
+        } else if self.app_rule_write.is_none() && (changed || self.app_rules.is_none()) {
+            self.app_rule_write = Some(AppRuleWrite::Refreshing(send(Request::GetState)));
+        }
+    }
+
+    pub fn write_app_rules(
+        &mut self,
+        rules: Vec<q2route_core::config::AppRule>,
+        send: impl FnOnce(Request) -> oneshot::Receiver<Response>,
+    ) {
+        if self.app_rules_ready() {
+            self.app_rule_write = Some(AppRuleWrite::Saving(send(Request::SetAppRules(rules))));
+        }
+    }
+
+    fn poll_app_rules(&mut self, send: impl FnOnce(Request) -> oneshot::Receiver<Response>) {
+        let Some(write) = self.app_rule_write.as_mut() else {
+            return;
+        };
+        let refreshing = matches!(write, AppRuleWrite::Refreshing(_));
+        let rx = match write {
+            AppRuleWrite::Saving(rx) | AppRuleWrite::Refreshing(rx) => rx,
+        };
+        let result = rx.try_recv();
+        if matches!(result, Err(oneshot::error::TryRecvError::Empty)) {
+            return;
+        }
+        self.app_rule_write = None;
+        match result {
+            Ok(Response::Ok) if !refreshing => {
+                self.app_rule_write = Some(AppRuleWrite::Refreshing(send(Request::GetState)));
+            }
+            Ok(Response::State(snap)) if refreshing => {
+                self.app_rules = Some(snap.config.app_rules);
+            }
+            other => {
+                self.last_error = Some(match other {
+                    Ok(Response::Error(e)) => e,
+                    _ => "App rules update was not acknowledged".into(),
+                });
+                // A failed/closed write may have reached the service; require
+                // an authoritative refresh before allowing another replacement.
+                self.app_rules = None;
+            }
+        }
+    }
+
     pub fn send(&mut self, client: &Client, r: Request) {
         self.pending.push(client.send(r));
     }
@@ -90,6 +172,7 @@ pub struct App {
     dns: DnsView,
     usage: UsageView,
     groups: GroupsView,
+    app_rules: AppRulesView,
     connections: ConnectionsView,
     log: LogView,
     leak: settings_view::LeakState,
@@ -130,6 +213,7 @@ impl App {
             dns: DnsView::default(),
             usage: UsageView::default(),
             groups: GroupsView::default(),
+            app_rules: AppRulesView::default(),
             connections: ConnectionsView::default(),
             log: LogView::default(),
             leak: settings_view::LeakState::default(),
@@ -175,6 +259,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.requests.poll();
+        self.requests.poll_app_rules(|r| self.client.send(r));
         // A started setup closes and relaunches the UI itself (taskkill in
         // PrepareToInstall); exiting here would lose the window if UAC is cancelled.
         let _ = self.updater.poll(ctx, self.settings.check_updates);
@@ -228,6 +313,13 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.client.latest();
         let connected = self.client.connected();
+        if let Some(snap) = snap.as_ref().filter(|_| connected) {
+            self.requests
+                .observe_app_rules(snap, |r| self.client.send(r));
+        } else {
+            self.requests.app_rules = None;
+            self.requests.observed_app_rules = None;
+        }
         // Slimmer nav on narrow windows to leave room for the page.
         let narrow = ui.available_width() < 640.0;
         egui::Panel::left("nav")
@@ -270,6 +362,10 @@ impl eframe::App for App {
                         self.groups
                             .show(ui, snap.as_ref(), &self.client, &mut self.requests)
                     }
+                    Page::AppRules => {
+                        self.app_rules
+                            .show(ui, snap.as_ref(), &self.client, &mut self.requests)
+                    }
                     Page::Proxies => {
                         self.proxies
                             .show(ui, snap.as_ref(), &self.client, &mut self.requests)
@@ -291,5 +387,134 @@ impl eframe::App for App {
                     _ => placeholder::show(ui, self.page.label()),
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod app_rule_write_tests {
+    use super::*;
+    use q2route_core::config::Config;
+    use q2route_core::ipc::StateSnapshot;
+
+    fn snapshot(rules: Vec<q2route_core::config::AppRule>) -> StateSnapshot {
+        StateSnapshot {
+            running: false,
+            config: Config {
+                app_rules: rules,
+                ..Config::seed()
+            },
+            groups: Default::default(),
+            proxy_up: Default::default(),
+            total_up_bps: 0,
+            total_down_bps: 0,
+            proxy_servers: vec![],
+        }
+    }
+
+    #[test]
+    fn rapid_blocks_are_globally_gated_then_use_fresh_rules() {
+        let mut req = Requests::default();
+        let mut sent = vec![];
+        let mut replies = vec![];
+        let mut send = |r| {
+            sent.push(r);
+            let (tx, rx) = oneshot::channel();
+            replies.push(tx);
+            rx
+        };
+        req.observe_app_rules(&snapshot(vec![]), &mut send);
+        let mut a = req.app_rules().to_vec();
+        crate::views::app_rules::set_internet(&mut a, r"C:\A.exe", false).unwrap();
+        req.write_app_rules(a.clone(), &mut send);
+        assert!(!req.app_rules_ready());
+        req.write_app_rules(vec![], &mut send); // Another page cannot overwrite A.
+        drop(send);
+        assert_eq!(sent.len(), 1);
+        replies.remove(0).send(Response::Ok).unwrap();
+        let (tx, rx) = oneshot::channel();
+        req.poll_app_rules(|r| {
+            assert_eq!(r, Request::GetState);
+            rx
+        });
+        assert!(!req.app_rules_ready());
+        tx.send(Response::State(snapshot(a.clone()))).unwrap();
+        req.poll_app_rules(|_| panic!("no request"));
+        assert!(req.app_rules_ready());
+        let mut b = req.app_rules().to_vec();
+        crate::views::app_rules::set_internet(&mut b, r"C:\B.exe", false).unwrap();
+        assert_eq!(b.len(), 2);
+        assert!(b.contains(&a[0]));
+        let (_tx, rx) = oneshot::channel();
+        req.write_app_rules(b.clone(), |r| {
+            assert_eq!(r, Request::SetAppRules(b));
+            rx
+        });
+        assert!(!req.app_rules_ready());
+    }
+
+    #[test]
+    fn delayed_stale_event_requires_ordered_read_not_cache_adoption() {
+        let mut req = Requests::default();
+        let mut rules = vec![];
+        crate::views::app_rules::set_internet(&mut rules, r"C:\A.exe", false).unwrap();
+        req.observe_app_rules(&snapshot(rules.clone()), |_| panic!("initial"));
+        let (tx, rx) = oneshot::channel();
+        req.observe_app_rules(&snapshot(vec![]), |r| {
+            assert_eq!(r, Request::GetState);
+            rx
+        });
+        assert!(!req.app_rules_ready());
+        assert_eq!(req.app_rules(), rules);
+        tx.send(Response::State(snapshot(rules.clone()))).unwrap();
+        req.poll_app_rules(|_| panic!("no request"));
+        assert!(req.app_rules_ready());
+        assert_eq!(req.app_rules(), rules);
+    }
+
+    #[test]
+    fn closed_write_requires_refresh_and_recovers() {
+        let mut req = Requests::default();
+        let snap = snapshot(vec![]);
+        req.observe_app_rules(&snap, |_| panic!("initial"));
+        let (tx, rx) = oneshot::channel();
+        req.write_app_rules(vec![], |_| rx);
+        drop(tx);
+        req.poll_app_rules(|_| panic!("no request"));
+        assert!(!req.app_rules_ready());
+        assert!(req.last_error.is_some());
+        let (tx, rx) = oneshot::channel();
+        req.observe_app_rules(&snap, |_| rx);
+        tx.send(Response::State(snap)).unwrap();
+        req.poll_app_rules(|_| panic!("no request"));
+        assert!(req.app_rules_ready());
+    }
+
+    #[test]
+    fn cross_page_supersession_and_stale_snapshot_do_not_freeze_or_regress() {
+        let mut req = Requests::default();
+        let old = snapshot(vec![]);
+        req.observe_app_rules(&old, |_| panic!("initial snapshot needs no read"));
+        let mut submitted = vec![];
+        crate::views::app_rules::set_internet(&mut submitted, r"C:\A.exe", false).unwrap();
+        let (tx, rx) = oneshot::channel();
+        req.write_app_rules(submitted.clone(), |_| rx);
+        tx.send(Response::Ok).unwrap();
+        let (tx, rx) = oneshot::channel();
+        req.poll_app_rules(|_| rx);
+        // Fresh state can supersede the submitted historical value.
+        let mut fresh = submitted;
+        crate::views::app_rules::set_internet(&mut fresh, r"C:\B.exe", false).unwrap();
+        tx.send(Response::State(snapshot(fresh.clone()))).unwrap();
+        req.poll_app_rules(|_| panic!("no request"));
+        req.observe_app_rules(&old, |_| panic!("unchanged stale cache ignored"));
+        assert!(req.app_rules_ready());
+        assert_eq!(req.app_rules(), fresh);
+        fresh[0].enabled = false; // App rules edit starts from coordinator, not old page state.
+        let (_tx, rx) = oneshot::channel();
+        req.write_app_rules(fresh.clone(), |r| {
+            assert_eq!(r, Request::SetAppRules(fresh));
+            rx
+        });
+        assert!(!req.app_rules_ready());
     }
 }

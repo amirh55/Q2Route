@@ -1037,3 +1037,186 @@ fn seed_steam_geosite_end_to_end() {
     );
     assert_eq!(go("34.160.111.145:443", None), Decision::NeedDomain);
 }
+
+fn app_rule(app: &str, action: Action, enabled: bool) -> AppRule {
+    AppRule {
+        app: app.into(),
+        action,
+        enabled,
+    }
+}
+
+fn app_route(c: &Config, pid: u32) -> Decision {
+    run(
+        &RuleSet::compile(c).unwrap(),
+        &HashSet::new(),
+        Protocol::Tcp,
+        pid,
+        "8.8.8.8:443",
+        Some("example.ir"),
+    )
+}
+
+#[test]
+fn app_rules_precede_matching_groups_and_first_match_wins() {
+    let mut c = cfg();
+    c.app_rules = vec![
+        app_rule("steam.exe", Action::Block, true),
+        app_rule("steam*.exe", Action::Direct, true),
+    ];
+    assert_eq!(
+        app_route(&c, 10),
+        Decision::Final(
+            Route::Block,
+            MatchInfo {
+                group_id: None,
+                reason: MatchReason::Own
+            }
+        )
+    );
+    c.app_rules.swap(0, 1);
+    assert!(matches!(
+        app_route(&c, 10),
+        Decision::Final(Route::Direct, _)
+    ));
+}
+
+#[test]
+fn app_rules_disabled_ignored_and_do_not_inherit() {
+    let mut c = cfg();
+    c.app_rules = vec![app_rule("steam.exe", Action::Block, false)];
+    assert!(matches!(
+        app_route(&c, 10),
+        Decision::Final(Route::Direct, _)
+    ));
+    c.app_rules[0].enabled = true;
+    assert!(matches!(
+        app_route(&c, 20),
+        Decision::Final(Route::Direct, _)
+    ));
+    // Even when no ancestor/group can route it, the child's own exe is required.
+    c.groups.retain(|g| g.catch_all);
+    assert!(matches!(
+        app_route(&c, 20),
+        Decision::Final(Route::Proxy(_), _)
+    ));
+}
+
+#[test]
+fn app_rules_folder_matches_descendants_not_sibling_prefix() {
+    let mut c = cfg();
+    c.app_rules = vec![app_rule(
+        r"c:/PROGRAM FILES (x86)/Steam/",
+        Action::Block,
+        true,
+    )];
+    assert!(matches!(
+        app_route(&c, 20),
+        Decision::Final(Route::Block, _)
+    ));
+    c.app_rules[0].app = r"C:\Program Files (x86)\Stea\".into();
+    assert!(matches!(
+        app_route(&c, 20),
+        Decision::Final(Route::Direct, _)
+    ));
+}
+
+#[test]
+fn app_rules_deleted_proxy_is_block_not_fallback() {
+    let mut c = cfg();
+    let mut proxy = c.proxies[0].clone();
+    proxy.id = "deleted".into();
+    c.upsert_proxy(proxy).unwrap();
+    c.app_rules = vec![app_rule("steam.exe", Action::Proxy("deleted".into()), true)];
+    c.delete_proxy("deleted").unwrap();
+    c.validate().unwrap();
+    assert!(matches!(
+        app_route(&c, 10),
+        Decision::Final(Route::Block, _)
+    ));
+}
+
+#[test]
+fn app_rules_preserve_infrastructure_and_proxy_guards() {
+    let mut c = cfg();
+    c.app_rules = vec![app_rule("*.exe", Action::Block, true)];
+    let rs = RuleSet::compile(&c).unwrap();
+    for (pid, dst, ex, reason) in [
+        (
+            10,
+            "192.168.1.1:80",
+            HashSet::new(),
+            MatchReason::AlwaysDirectDst,
+        ),
+        (
+            10,
+            "8.8.8.8:80",
+            HashSet::from([10]),
+            MatchReason::ExcludedPid,
+        ),
+        (
+            50,
+            "8.8.8.8:80",
+            HashSet::new(),
+            MatchReason::AlwaysDirectApp,
+        ),
+    ] {
+        assert_eq!(
+            run(&rs, &ex, Protocol::Tcp, pid, dst, None),
+            Decision::Final(
+                Route::Direct,
+                MatchInfo {
+                    group_id: None,
+                    reason
+                }
+            )
+        );
+    }
+    c.app_rules = vec![app_rule("steam.exe", Action::Proxy("v2ray".into()), true)];
+    let rs = RuleSet::compile(&c).unwrap();
+    assert_eq!(
+        run(&rs, &HashSet::new(), Protocol::Tcp, 10, "8.8.8.8:443", None),
+        Decision::NeedDomain
+    );
+    assert!(matches!(
+        run(
+            &rs,
+            &HashSet::new(),
+            Protocol::Tcp,
+            10,
+            "8.8.8.8:443",
+            Some("dns.google")
+        ),
+        Decision::Final(Route::Block, _)
+    ));
+    assert!(matches!(
+        run(&rs, &HashSet::new(), Protocol::Udp, 10, "8.8.8.8:443", None),
+        Decision::Final(Route::Block, _)
+    ));
+}
+
+#[test]
+fn app_rules_dns_process_priority_disabled_children_and_exclusions() {
+    let mut c = cfg();
+    c.app_rules = vec![app_rule("steam.exe", Action::Block, true)];
+    let query = |c: &Config, pid, ex: &HashSet<u32>| {
+        decide_dns_for_process(
+            &RuleSet::compile(c).unwrap(),
+            &tree(),
+            ex,
+            pid,
+            "example.ir",
+        )
+        .0
+    };
+    assert_eq!(query(&c, 10, &HashSet::new()), Route::Block);
+    assert_eq!(query(&c, 20, &HashSet::new()), Route::Direct);
+    assert_eq!(query(&c, 10, &HashSet::from([10])), Route::Direct);
+    c.app_rules[0].enabled = false;
+    assert_eq!(query(&c, 10, &HashSet::new()), Route::Direct);
+    c.app_rules = vec![app_rule("*.exe", Action::Proxy("deleted".into()), true)];
+    assert_eq!(query(&c, 10, &HashSet::new()), Route::Block);
+    assert_eq!(query(&c, 50, &HashSet::new()), Route::Direct);
+    c.app_rules[0].action = Action::Proxy("v2ray".into());
+    assert_eq!(query(&c, 10, &HashSet::new()), Route::Proxy("v2ray".into()));
+}

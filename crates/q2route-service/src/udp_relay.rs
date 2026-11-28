@@ -416,11 +416,14 @@ impl Manager {
         let _ = tx.try_send(d);
         let st = stop.clone();
         let port_guard = PortGuard::new(&self.ports, port_key);
+        let ctx = session.ctx.clone();
+        let pid = session.pid;
+        let remote = session.first_remote;
         self.tracker.spawn(async move {
             let _port_guard = port_guard;
             tokio::select! {
                 _ = st.cancelled() => {}
-                _ = session.run(rx) => {}
+                _ = ctx.until_blocked(pid, Protocol::Udp, remote, session.run(rx)) => {}
             }
         });
         self.sessions.insert(
@@ -517,6 +520,14 @@ impl Session {
                             proto: Protocol::Udp,
                             pid: self.pid,
                             exe: self.exe(),
+                            exe_path: self
+                                .ctx
+                                .tree
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(self.pid)
+                                .map(|p| p.exe.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
                             local: self.local,
                             dst: remote,
                             domain: None,

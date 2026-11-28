@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use q2route_core::config::{Config, ProfileId, Protocol};
 use q2route_core::decide::{
-    decide_dns, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
+    decide_dns_for_process, decide_mapped, Decision, FlowInfo, MatchInfo, MatchReason, Route,
 };
 use q2route_core::dns::{answers, parse_query, refused, response_id, Query};
 use q2route_core::domain_map::DomainMap;
@@ -613,12 +613,25 @@ enum DnsVerdict {
 
 /// Routes a UDP/53 query by its name: a bootstrap name ([`bootstrap_direct`]:
 /// proxy hosts, `direct_names`, the detected proxy servers in `auto`)
-/// passes, anything else by [`decide_dns`].
+/// passes, anything else by process-aware app rules then domain rules.
+#[cfg(test)]
 fn dns_verdict(rules: &RuleSet, cfg: &Config, auto: &[String], q: &Query) -> DnsVerdict {
+    dns_verdict_for_process(rules, cfg, auto, q, &Default::default(), &HashSet::new(), 0)
+}
+
+fn dns_verdict_for_process(
+    rules: &RuleSet,
+    cfg: &Config,
+    auto: &[String],
+    q: &Query,
+    tree: &q2route_core::process_tree::ProcessTree,
+    excluded: &HashSet<u32>,
+    pid: u32,
+) -> DnsVerdict {
     if let Some(why) = bootstrap_direct(cfg, auto, &q.name) {
         return DnsVerdict::Bootstrap(why);
     }
-    match decide_dns(rules, &q.name).0 {
+    match decide_dns_for_process(rules, tree, excluded, pid, &q.name).0 {
         Route::Direct => DnsVerdict::Pass,
         Route::Block => DnsVerdict::Refuse,
         Route::Proxy(id) => DnsVerdict::Proxy(id),
@@ -669,11 +682,14 @@ fn dns_packet(
         );
         return None;
     };
-    let v = dns_verdict(
+    let v = dns_verdict_for_process(
         &shared.relay.rules.load(),
         &shared.relay.cfg.load(),
         &shared.relay.proxy_servers.load(),
         &q,
+        &shared.relay.tree.read().unwrap_or_else(|e| e.into_inner()),
+        &shared.relay.excluded.load(),
+        pid,
     );
     let via = match &v {
         DnsVerdict::Pass => "direct".to_string(),
@@ -848,6 +864,10 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
                     proto,
                     pid,
                     exe,
+                    exe_path: tree
+                        .get(pid)
+                        .map(|p| p.exe.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     local: f.local,
                     dst: f.remote,
                     domain: None,
@@ -1088,6 +1108,43 @@ mod tests {
     fn verdict(rules: &RuleSet, cfg: &Config, auto: &[String], name: &str) -> DnsVerdict {
         let q = dns_query(name);
         dns_verdict(rules, cfg, auto, &parse_query(&q).unwrap())
+    }
+
+    #[test]
+    fn udp_dns_app_block_preserves_bootstrap() {
+        let mut cfg = Config::seed();
+        cfg.proxies[0].host = "proxy.example.net".into();
+        cfg.app_rules = vec![q2route_core::config::AppRule {
+            app: "target.exe".into(),
+            action: q2route_core::config::Action::Block,
+            enabled: true,
+        }];
+        let mut tree = q2route_core::process_tree::ProcessTree::default();
+        tree.insert(q2route_core::process_tree::ProcInfo {
+            pid: 71,
+            parent: 0,
+            start_time: 1,
+            exe: r"C:\Apps\target.exe".into(),
+        });
+        let rules = RuleSet::compile(&cfg).unwrap();
+        for (name, expected) in [
+            ("example.org", DnsVerdict::Refuse),
+            ("proxy.example.net", DnsVerdict::Bootstrap("proxy host")),
+        ] {
+            let msg = dns_query(name);
+            assert_eq!(
+                dns_verdict_for_process(
+                    &rules,
+                    &cfg,
+                    &[],
+                    &parse_query(&msg).unwrap(),
+                    &tree,
+                    &HashSet::new(),
+                    71
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

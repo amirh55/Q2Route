@@ -50,6 +50,14 @@ pub enum Action {
     Proxy(ProfileId),
 }
 
+/// Ordered own-process routing override; children are never inherited.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AppRule {
+    pub app: String,
+    pub action: Action,
+    pub enabled: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -243,6 +251,8 @@ pub struct Config {
     #[serde(default)]
     pub groups: Vec<Group>,
     #[serde(default)]
+    pub app_rules: Vec<AppRule>,
+    #[serde(default)]
     pub always_direct: Vec<String>,
     pub default_proxy: ProfileId,
     #[serde(default)]
@@ -266,6 +276,7 @@ impl Config {
         };
         Config {
             seed_version: SEED_VERSION,
+            app_rules: Vec::new(),
             proxies: vec![ProxyProfile {
                 id: "v2ray".into(),
                 name: "V2Ray".into(),
@@ -493,6 +504,11 @@ impl Config {
                 "default_proxy '{}' is not a known proxy",
                 self.default_proxy
             ));
+        }
+        // Deleted proxy references remain editable and compile to Block.
+        // Validate disabled patterns too, so enabling one cannot reveal bad input.
+        for rule in &self.app_rules {
+            AppMatcher::parse(&rule.app).map_err(|e| ConfigError::Invalid(e.to_string()))?;
         }
         let mut gids = HashSet::new();
         for (i, g) in self.groups.iter().enumerate() {
