@@ -260,6 +260,26 @@ taskkill /F /IM q2route-service.exe
 Get-NetFirewallRule -DisplayName "Q2Route relay"
 ```
 
+## M14: app rules
+
+Manual checks below are pending; they were not run against the live installation during development.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| A1 | Open App rules in the left navigation. | Immediately after Groups & rules; English table with On, App, Route and Remove. | |
+| A2 | Click Add running process…; filter and select a running app. | Exact executable path added; filename displayed with full-path tooltip; processes with the same name in different folders are distinct. | |
+| A3 | Click Add exe…; select an exe, then repeat and cancel. | Native exe-filtered picker; selected app added; cancel changes nothing. | |
+| A4 | Click Add folder…; select a folder containing executables in subfolders. | Folder rule ends in a backslash and matches executables below it, not adjacent similarly named folders. Cancel changes nothing. | |
+| A5 | Add the same executable or folder again using different path case. | Short duplicate message; list unchanged. | |
+| A6 | Choose Direct, each named proxy, and Block on an app that matches a group. | Enabled app rule wins before groups; proxy failure never falls back to Direct. | |
+| A7 | Set Block then turn its checkbox off. | App resumes normal group routing, not forced Direct; child processes are unaffected by the app rule. | |
+| A8 | Remove a proxy referenced by an app rule. | Row is red, reads proxy deleted, and routes Block. Selecting a valid route repairs it. | |
+| A9 | Right-click a Connections row and choose Block internet for the exe. | Exact-path Block rule created/enabled at highest app-rule priority; same-named executables elsewhere unaffected. Unknown full paths cannot be targeted. | |
+| A10 | Block an app with established direct TCP, proxied TCP and UDP traffic. | Verify existing flows stop, not only new connections; with Active only enabled, no continuing traffic for that app. Any retained history has no increasing byte counts. | |
+| A11 | Right-click and choose Allow internet for the exe. | Exact-path app rule disabled; normal routing resumes on new connections. No Direct rule is invented. | |
+| A12 | Click Remove on an app rule. | Rule removed and normal group routing restored. | |
+| A13 | Settings > Backup: export then import a configuration containing enabled/disabled app rules. | Patterns, routes, enabled flags and order survive; old backups without app_rules load with an empty list. | |
+
 ## M13 installer
 
 Build with `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Setup`; the setup is `dist\Q2Route-Setup-0.2.0.exe`.
