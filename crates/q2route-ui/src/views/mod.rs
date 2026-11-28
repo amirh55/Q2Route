@@ -1,5 +1,6 @@
 //! Page views.
 
+pub mod app_rules;
 pub mod connections;
 pub mod dashboard;
 pub mod dns;

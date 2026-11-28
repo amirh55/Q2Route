@@ -497,6 +497,7 @@ mod tests {
             proto: Protocol::Tcp,
             pid,
             exe: "q2route.exe".into(),
+            exe_path: r"C:\Apps\q2route.exe".into(),
             local: local.parse().unwrap(),
             dst: dst.parse().unwrap(),
             domain: None,

@@ -11,8 +11,9 @@ use crate::settings::UiSettings;
 use crate::tray::{Tray, TrayAction};
 use crate::update::Updater;
 use crate::views::{
-    connections::ConnectionsView, dashboard, dns::DnsView, groups::GroupsView, log::LogView,
-    placeholder, proxies::ProxiesView, settings as settings_view, usage::UsageView,
+    app_rules::AppRulesView, connections::ConnectionsView, dashboard, dns::DnsView,
+    groups::GroupsView, log::LogView, placeholder, proxies::ProxiesView, settings as settings_view,
+    usage::UsageView,
 };
 
 /// How often the UI and the tray refresh from `Client::latest()`.
@@ -23,6 +24,7 @@ pub enum Page {
     Dashboard,
     Connections,
     Groups,
+    AppRules,
     Proxies,
     Dns,
     DataUsage,
@@ -31,10 +33,11 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 8] = [
+    pub const ALL: [Page; 9] = [
         Page::Dashboard,
         Page::Connections,
         Page::Groups,
+        Page::AppRules,
         Page::Proxies,
         Page::Dns,
         Page::DataUsage,
@@ -47,6 +50,7 @@ impl Page {
             Page::Dashboard => "Dashboard",
             Page::Connections => "Connections",
             Page::Groups => "Groups & rules",
+            Page::AppRules => "App rules",
             Page::Proxies => "Proxies",
             Page::Dns => "DNS",
             Page::DataUsage => "Data usage",
@@ -90,6 +94,7 @@ pub struct App {
     dns: DnsView,
     usage: UsageView,
     groups: GroupsView,
+    app_rules: AppRulesView,
     connections: ConnectionsView,
     log: LogView,
     leak: settings_view::LeakState,
@@ -130,6 +135,7 @@ impl App {
             dns: DnsView::default(),
             usage: UsageView::default(),
             groups: GroupsView::default(),
+            app_rules: AppRulesView::default(),
             connections: ConnectionsView::default(),
             log: LogView::default(),
             leak: settings_view::LeakState::default(),
@@ -268,6 +274,10 @@ impl eframe::App for App {
                     }
                     Page::Groups => {
                         self.groups
+                            .show(ui, snap.as_ref(), &self.client, &mut self.requests)
+                    }
+                    Page::AppRules => {
+                        self.app_rules
                             .show(ui, snap.as_ref(), &self.client, &mut self.requests)
                     }
                     Page::Proxies => {

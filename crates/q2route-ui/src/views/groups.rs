@@ -140,10 +140,84 @@ struct RuleEditor {
     picking: Option<ProcPicker>,
 }
 
-struct ProcPicker {
+pub(super) struct ProcPicker {
     rx: Option<oneshot::Receiver<Response>>,
     procs: Vec<ProcEntry>,
     filter: String,
+    error: Option<String>,
+}
+
+impl ProcPicker {
+    pub(super) fn new(client: &Client) -> Self {
+        Self {
+            rx: Some(client.send(Request::ListProcesses)),
+            procs: vec![],
+            filter: String::new(),
+            error: None,
+        }
+    }
+
+    /// Shared picker: groups use names; app rules retain exact executable paths.
+    pub(super) fn show(&mut self, ui: &mut egui::Ui, full_path: bool) -> (bool, Option<String>) {
+        if let Some(rx) = self.rx.as_mut() {
+            match rx.try_recv() {
+                Ok(Response::Processes(v)) => {
+                    self.procs = v;
+                    self.rx = None;
+                }
+                Ok(Response::Error(e)) => {
+                    self.error = Some(e);
+                    self.rx = None;
+                }
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                    self.error = Some("Could not list processes".into());
+                    self.rx = None;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        let (mut close, mut picked) = (false, None);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("Filter");
+                ui.text_edit_singleline(&mut self.filter);
+                close = ui.button("Close").clicked();
+            });
+            if self.rx.is_some() {
+                ui.spinner();
+            }
+            if let Some(error) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            let needle = self.filter.to_lowercase();
+            let mut seen = HashSet::new();
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .id_salt("procs")
+                .show(ui, |ui| {
+                    for e in &self.procs {
+                        let value = if full_path { &e.path } else { &e.name };
+                        let hit = e.name.to_lowercase().contains(&needle)
+                            || e.path.to_lowercase().contains(&needle);
+                        if hit && !value.is_empty() && seen.insert(value.to_lowercase()) {
+                            let label = if full_path {
+                                format!("{} ({})", e.name, e.path)
+                            } else {
+                                e.name.clone()
+                            };
+                            if ui
+                                .selectable_label(false, label)
+                                .on_hover_text(&e.path)
+                                .clicked()
+                            {
+                                picked = Some(value.clone());
+                            }
+                        }
+                    }
+                });
+        });
+        (close, picked)
+    }
 }
 
 #[derive(Default)]
@@ -431,51 +505,10 @@ impl GroupsView {
             ui.checkbox(&mut f.include_children, "Include child processes");
         });
         if ui.button("Pick running app…").clicked() && ed.picking.is_none() {
-            ed.picking = Some(ProcPicker {
-                rx: Some(client.send(Request::ListProcesses)),
-                procs: vec![],
-                filter: String::new(),
-            });
+            ed.picking = Some(ProcPicker::new(client));
         }
         if let Some(p) = ed.picking.as_mut() {
-            if let Some(rx) = p.rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(Response::Processes(v)) => {
-                        p.procs = v;
-                        p.rx = None;
-                    }
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => p.rx = None,
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                }
-            }
-            let (mut close, mut picked) = (false, None);
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Filter");
-                    ui.text_edit_singleline(&mut p.filter);
-                    close = ui.button("Close").clicked();
-                });
-                if p.rx.is_some() {
-                    ui.spinner();
-                }
-                let needle = p.filter.to_lowercase();
-                let mut seen = HashSet::new();
-                egui::ScrollArea::vertical()
-                    .max_height(160.0)
-                    .id_salt("procs")
-                    .show(ui, |ui| {
-                        for e in &p.procs {
-                            let hit = e.name.to_lowercase().contains(&needle)
-                                || e.path.to_lowercase().contains(&needle);
-                            if hit && seen.insert(e.name.to_lowercase()) {
-                                let r = ui.selectable_label(false, &e.name);
-                                if r.on_hover_text(&e.path).clicked() {
-                                    picked = Some(e.name.clone());
-                                }
-                            }
-                        }
-                    });
-            });
+            let (close, picked) = p.show(ui, false);
             if let Some(name) = picked {
                 let mut apps = split_entries(&ed.form.apps);
                 if !apps.iter().any(|a| a.eq_ignore_ascii_case(&name)) {

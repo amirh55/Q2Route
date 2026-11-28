@@ -28,8 +28,8 @@ const HEADERS: [&str; 10] = [
     "Route",
     "Group",
     "Why",
-    "\u{2191}",
-    "\u{2193}",
+    "Up",
+    "Down",
     "Duration",
 ];
 
@@ -194,13 +194,13 @@ impl ConnectionsView {
                     .max_height((scroll_h - ROW_HEIGHT - 12.0).max(ROW_HEIGHT))
                     .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
                         for c in &rows[range] {
-                            if let Some((group_id, rule)) = row(ui, c, snap, now) {
-                                req.send(client, Request::AddRule { group_id, rule });
+                            if let Some(request) = row(ui, c, snap, now) {
+                                req.send(client, request);
                             }
                         }
                     });
             });
-        ui.weak("Changing a rule applies to new connections; open ones keep their route.");
+        ui.weak("Block internet applies live. Allow disables the exact app rule and restores normal routing.");
     }
 }
 
@@ -213,12 +213,7 @@ fn group_name(snap: Option<&StateSnapshot>, c: &ConnInfo) -> String {
 }
 
 /// One table row; returns the (group, rule) picked in its context menu.
-fn row(
-    ui: &mut egui::Ui,
-    c: &ConnInfo,
-    snap: Option<&StateSnapshot>,
-    now: u64,
-) -> Option<(GroupId, Rule)> {
+fn row(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>, now: u64) -> Option<Request> {
     let ended = c.ended_ms.is_some();
     let dest = match &c.domain {
         Some(d) => format!("{d} {}", c.dst),
@@ -277,7 +272,33 @@ fn group_items(
     }
 }
 
-fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option<(GroupId, Rule)> {
+fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option<Request> {
+    if let Some(s) = snap {
+        let known = super::app_rules::exact_exe(&c.exe_path);
+        let mut allow = None;
+        ui.add_enabled_ui(known, |ui| {
+            if ui.button(format!("Block internet for {}", c.exe)).clicked() {
+                allow = Some(false);
+            }
+            if ui.button(format!("Allow internet for {}", c.exe)).clicked() {
+                allow = Some(true);
+            }
+        })
+        .response
+        .on_hover_text(if known {
+            &c.exe_path
+        } else {
+            "Full executable path is unavailable"
+        });
+        if let Some(allow) = allow {
+            let mut rules = s.config.app_rules.clone();
+            if super::app_rules::set_internet(&mut rules, &c.exe_path, allow).is_ok() {
+                ui.close();
+                return Some(Request::SetAppRules(rules));
+            }
+        }
+        ui.separator();
+    }
     let mut pick = None;
     if let Some(rule) = app_rule(&c.exe) {
         let label = if rule.include_children {
@@ -315,7 +336,7 @@ fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option
             }
         });
     }
-    pick
+    pick.map(|(group_id, rule)| Request::AddRule { group_id, rule })
 }
 
 #[cfg(test)]
@@ -335,6 +356,7 @@ mod tests {
             proto: Protocol::Tcp,
             pid: 1,
             exe: exe.into(),
+            exe_path: format!(r"C:\Apps\{exe}"),
             local: "127.0.0.1:5000".parse().unwrap(),
             dst: dst.parse().unwrap(),
             domain: domain.map(String::from),
