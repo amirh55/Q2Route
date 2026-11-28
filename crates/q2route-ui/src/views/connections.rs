@@ -194,7 +194,7 @@ impl ConnectionsView {
                     .max_height((scroll_h - ROW_HEIGHT - 12.0).max(ROW_HEIGHT))
                     .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
                         for c in &rows[range] {
-                            if let Some(request) = row(ui, c, snap, now) {
+                            if let Some(request) = row(ui, c, snap, now, client, req) {
                                 req.send(client, request);
                             }
                         }
@@ -213,7 +213,14 @@ fn group_name(snap: Option<&StateSnapshot>, c: &ConnInfo) -> String {
 }
 
 /// One table row; returns the (group, rule) picked in its context menu.
-fn row(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>, now: u64) -> Option<Request> {
+fn row(
+    ui: &mut egui::Ui,
+    c: &ConnInfo,
+    snap: Option<&StateSnapshot>,
+    now: u64,
+    client: &Client,
+    req: &mut Requests,
+) -> Option<Request> {
     let ended = c.ended_ms.is_some();
     let dest = match &c.domain {
         Some(d) => format!("{d} {}", c.dst),
@@ -253,7 +260,7 @@ fn row(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>, now: u64) 
         egui::Sense::click(),
     );
     let mut pick = None;
-    resp.context_menu(|ui| pick = menu(ui, c, snap));
+    resp.context_menu(|ui| pick = menu(ui, c, snap, client, req));
     pick
 }
 
@@ -272,11 +279,17 @@ fn group_items(
     }
 }
 
-fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option<Request> {
-    if let Some(s) = snap {
+fn menu(
+    ui: &mut egui::Ui,
+    c: &ConnInfo,
+    snap: Option<&StateSnapshot>,
+    client: &Client,
+    req: &mut Requests,
+) -> Option<Request> {
+    if snap.is_some() {
         let known = super::app_rules::exact_exe(&c.exe_path);
         let mut allow = None;
-        ui.add_enabled_ui(known, |ui| {
+        ui.add_enabled_ui(known && client.connected() && req.app_rules_ready(), |ui| {
             if ui.button(format!("Block internet for {}", c.exe)).clicked() {
                 allow = Some(false);
             }
@@ -291,11 +304,15 @@ fn menu(ui: &mut egui::Ui, c: &ConnInfo, snap: Option<&StateSnapshot>) -> Option
             "Full executable path is unavailable"
         });
         if let Some(allow) = allow {
-            let mut rules = s.config.app_rules.clone();
+            let mut rules = req.app_rules().to_vec();
             if super::app_rules::set_internet(&mut rules, &c.exe_path, allow).is_ok() {
                 ui.close();
-                return Some(Request::SetAppRules(rules));
+                req.write_app_rules(rules, |r| client.send(r));
+                return None;
             }
+        }
+        if !req.app_rules_ready() {
+            ui.weak("Waiting for service state…");
         }
         ui.separator();
     }

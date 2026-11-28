@@ -2,9 +2,8 @@
 
 use eframe::egui;
 use q2route_core::config::{Action, AppRule, Config};
-use q2route_core::ipc::{Request, Response, StateSnapshot};
+use q2route_core::ipc::StateSnapshot;
 use q2route_core::matchers::AppMatcher;
-use tokio::sync::oneshot;
 
 use super::groups::ProcPicker;
 use crate::{app::Requests, client::Client, file_dialog};
@@ -76,8 +75,6 @@ pub fn proxy_deleted(cfg: &Config, action: &Action) -> bool {
 #[derive(Default)]
 pub struct AppRulesView {
     picking: Option<ProcPicker>,
-    saving: Option<oneshot::Receiver<Response>>,
-    submitted: Option<Vec<AppRule>>,
     message: Option<String>,
 }
 
@@ -92,27 +89,8 @@ impl AppRulesView {
         ui.heading("App rules");
         ui.weak("Rules apply to the app itself, not child processes. First matching enabled rule wins before groups.");
         let Some(snap) = snap else { return };
-        if let Some(rx) = self.saving.as_mut() {
-            match rx.try_recv() {
-                Ok(Response::Ok) => self.saving = None,
-                Ok(Response::Error(e)) => {
-                    req.last_error = Some(e);
-                    self.saving = None;
-                    self.submitted = None;
-                }
-                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                    req.last_error = Some("App rules update was not acknowledged".into());
-                    self.saving = None;
-                    self.submitted = None;
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
-            }
-        }
-        if self.saving.is_none() && self.submitted.as_ref() == Some(&snap.config.app_rules) {
-            self.submitted = None;
-        }
-        let ready = self.saving.is_none() && self.submitted.is_none() && client.connected();
-        let mut rules = snap.config.app_rules.clone();
+        let ready = req.app_rules_ready() && client.connected();
+        let mut rules = req.app_rules().to_vec();
         let mut changed = false;
         ui.add_enabled_ui(ready, |ui| {
             let mut app = None;
@@ -234,8 +212,7 @@ impl AppRulesView {
             }
         });
         if changed {
-            self.submitted = Some(rules.clone());
-            self.saving = Some(client.send(Request::SetAppRules(rules)));
+            req.write_app_rules(rules, |r| client.send(r));
         }
         if !ready {
             ui.weak("Waiting for service state…");
