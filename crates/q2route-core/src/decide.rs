@@ -134,7 +134,8 @@ fn direct(reason: MatchReason) -> Decision {
 }
 
 /// Decide the route for a new flow. Steps run in order: always-direct destination,
-/// excluded pid, always-direct app (own exe), own rules, inherited rules, catch-all
+/// excluded pid, always-direct app (own exe), app overrides, own group rules,
+/// inherited group rules, catch-all
 /// (or Block when there is none).
 /// Returns `NeedDomain` only when the route may depend on a domain not yet known.
 pub fn decide(
@@ -188,7 +189,10 @@ pub fn decide(
             }
         }
     }
-    let d = eval_from(rs, &cands, f);
+    let d = match own_exe.and_then(|exe| app_action(rs, exe)) {
+        Some(action) => finalize(rs, action, f, own_app_info()),
+        None => eval_from(rs, &cands, f),
+    };
     // A proxied TCP/443 flow with no domain yet could be DoH: peek the SNI so
     // `finalize` can check it (this also covers eval_from's no-peek shortcut).
     if rs.block_doh
@@ -200,6 +204,61 @@ pub fn decide(
         return Decision::NeedDomain;
     }
     d
+}
+
+fn own_app_info() -> MatchInfo {
+    MatchInfo {
+        group_id: None,
+        reason: MatchReason::Own,
+    }
+}
+
+fn app_action<'a>(rs: &'a RuleSet, exe: &Path) -> Option<&'a Action> {
+    rs.app_rules
+        .iter()
+        .find(|r| r.app.matches(exe))
+        .map(|r| &r.action)
+}
+
+/// Process-aware DNS routing. Infrastructure/bootstrap name exceptions belong
+/// ahead of this call in the DNS transport; own-exe overrides precede domain
+/// groups and never apply to descendants. Transport guards are not applied.
+pub fn decide_dns_for_process(
+    rs: &RuleSet,
+    tree: &ProcessTree,
+    excluded_pids: &HashSet<u32>,
+    pid: u32,
+    name: &str,
+) -> (Route, MatchInfo) {
+    if excluded_pids.contains(&pid) {
+        return (
+            Route::Direct,
+            MatchInfo {
+                group_id: None,
+                reason: MatchReason::ExcludedPid,
+            },
+        );
+    }
+    if let Some(proc) = tree.get(pid) {
+        if rs.always_direct.iter().any(|m| m.matches(&proc.exe)) {
+            return (
+                Route::Direct,
+                MatchInfo {
+                    group_id: None,
+                    reason: MatchReason::AlwaysDirectApp,
+                },
+            );
+        }
+        if let Some(action) = app_action(rs, &proc.exe) {
+            let route = match action {
+                Action::Direct => Route::Direct,
+                Action::Block => Route::Block,
+                Action::Proxy(id) => Route::Proxy(id.clone()),
+            };
+            return (route, own_app_info());
+        }
+    }
+    decide_dns(rs, name)
 }
 
 type Candidate<'r> = (&'r CompiledGroup, &'r CompiledRule, MatchReason);

@@ -648,6 +648,38 @@ fn direct_names_reject_geosite() {
 }
 
 #[test]
+fn app_rules_old_config_load_and_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut value = toml::Value::try_from(Config::seed()).unwrap();
+    value.as_table_mut().unwrap().remove("app_rules");
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+    let mut c = Config::load(&path).unwrap();
+    assert!(c.app_rules.is_empty());
+    c.app_rules = vec![AppRule {
+        app: "a.exe".into(),
+        action: Action::Proxy("deleted".into()),
+        enabled: false,
+    }];
+    c.save(&path).unwrap();
+    assert_eq!(Config::load(&path).unwrap(), c);
+}
+
+#[test]
+fn app_rules_invalid_pattern_rejected_even_if_disabled() {
+    for app in ["", "  ", "["] {
+        let mut c = Config::seed();
+        c.app_rules = vec![AppRule {
+            app: app.into(),
+            action: Action::Block,
+            enabled: false,
+        }];
+        assert!(c.validate().is_err(), "accepted {app:?}");
+        assert!(Config::parse(&toml::to_string(&c).unwrap()).is_err());
+    }
+}
+
+#[test]
 fn data_usage_defaults_off() {
     assert!(!Config::seed().settings.data_usage);
     // A config written before the setting existed loads with it off.

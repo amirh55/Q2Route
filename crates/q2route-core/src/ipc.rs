@@ -1,7 +1,7 @@
 //! UI <-> service IPC: u32-LE length-prefixed JSON frames over a named pipe.
 
 use crate::config::{
-    Action, Config, DnsSettings, GroupId, ProfileId, Protocol, ProxyProfile, Rule,
+    Action, AppRule, Config, DnsSettings, GroupId, ProfileId, Protocol, ProxyProfile, Rule,
 };
 use crate::decide::Route;
 use crate::proxy::ProxyTestResult;
@@ -19,6 +19,7 @@ pub const MAX_MSG: usize = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Request {
     GetState,
+    SetAppRules(Vec<AppRule>),
     Start,
     Stop,
     SetGroupAction {

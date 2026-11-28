@@ -26,7 +26,15 @@ pub struct CompiledGroup {
 }
 
 #[derive(Debug, Clone)]
+pub struct CompiledAppRule {
+    pub app: AppMatcher,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuleSet {
+    /// Enabled own-process overrides only, in config order.
+    pub app_rules: Vec<CompiledAppRule>,
     /// Enabled groups only, in config order.
     pub groups: Vec<CompiledGroup>,
     pub always_direct: Vec<AppMatcher>,
@@ -72,6 +80,21 @@ impl RuleSet {
     }
 
     pub fn compile_with(cfg: &Config, geo: &GeoIp, sites: &GeoSite) -> Result<RuleSet, MatchError> {
+        let app_rules = cfg
+            .app_rules
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| {
+                let action = match &r.action {
+                    Action::Proxy(id) if !cfg.proxies.iter().any(|p| &p.id == id) => Action::Block,
+                    action => action.clone(),
+                };
+                Ok(CompiledAppRule {
+                    app: AppMatcher::parse(&r.app)?,
+                    action,
+                })
+            })
+            .collect::<Result<Vec<_>, MatchError>>()?;
         let mut groups = Vec::new();
         for g in cfg.groups.iter().filter(|g| g.enabled) {
             let wrap = |e: MatchError| MatchError::Group {
@@ -99,6 +122,7 @@ impl RuleSet {
         }
         let always_direct = all(&cfg.always_direct, AppMatcher::parse)?;
         Ok(RuleSet {
+            app_rules,
             groups,
             always_direct,
             lan_direct: true,

@@ -104,6 +104,23 @@ async fn eof_and_bad_json() {
     assert_eq!(e.kind(), ErrorKind::InvalidData);
 }
 
+#[tokio::test]
+async fn app_rules_ipc_roundtrip() {
+    for rules in [
+        vec![],
+        vec![q2route_core::AppRule {
+            app: r"C:\Apps\a.exe".into(),
+            action: Action::Proxy("deleted".into()),
+            enabled: false,
+        }],
+    ] {
+        let request = Request::SetAppRules(rules);
+        let (mut a, mut b) = duplex(4096);
+        write_msg(&mut a, &request).await.unwrap();
+        assert_eq!(read_msg::<_, Request>(&mut b).await.unwrap(), request);
+    }
+}
+
 #[test]
 fn pipe_name() {
     assert_eq!(PIPE_NAME, r"\\.\pipe\q2route");
