@@ -848,6 +848,10 @@ fn decide_flow(shared: &Shared, run: &RunState, f: &FlowId) -> (u32, Decision) {
                     proto,
                     pid,
                     exe,
+                    exe_path: tree
+                        .get(pid)
+                        .map(|p| p.exe.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     local: f.local,
                     dst: f.remote,
                     domain: None,

@@ -105,6 +105,7 @@ fn socks_profile(port: u16) -> ProxyProfile {
 
 fn config(proxies: Vec<ProxyProfile>, groups: Vec<Group>) -> Config {
     Config {
+        app_rules: vec![],
         seed_version: q2route_core::SEED_VERSION,
         proxies,
         groups,
@@ -141,6 +142,7 @@ fn ctx(cfg: Config) -> Arc<RelayCtx> {
     rules.lan_direct = false;
     let (events, _) = broadcast::channel(16);
     Arc::new(RelayCtx {
+        rules_changed: tokio::sync::watch::channel(()).0,
         rules: ArcSwap::from_pointee(rules),
         cfg: ArcSwap::from_pointee(cfg),
         tree: Arc::new(RwLock::new(ProcessTree::default())),
@@ -493,6 +495,7 @@ async fn idle_connection_is_closed_after_idle_timeout() {
     let c = ctx(cfg);
     // Same RelayCtx shape as production, with a short idle timeout.
     let c = Arc::new(RelayCtx {
+        rules_changed: tokio::sync::watch::channel(()).0,
         idle_timeout: Duration::from_millis(400),
         rules: ArcSwap::new(c.rules.load_full()),
         cfg: ArcSwap::new(c.cfg.load_full()),

@@ -54,6 +54,7 @@ pub fn config(p: ProxyProfile) -> Config {
         seed_version: q2route_core::SEED_VERSION,
         proxies: vec![p],
         groups: vec![],
+        app_rules: vec![],
         always_direct: vec![],
         default_proxy: "mock".into(),
         settings: Settings::default(),
@@ -64,6 +65,7 @@ pub fn ctx(cfg: Config) -> Arc<RelayCtx> {
     let rules = RuleSet::compile(&cfg).unwrap();
     let (events, _) = broadcast::channel(16);
     Arc::new(RelayCtx {
+        rules_changed: tokio::sync::watch::channel(()).0,
         rules: ArcSwap::from_pointee(rules),
         cfg: ArcSwap::from_pointee(cfg),
         tree: Arc::new(RwLock::new(ProcessTree::default())),

@@ -93,6 +93,8 @@ impl Drop for ConnGuard<'_> {
 }
 
 pub struct RelayCtx {
+    /// Successful policy swaps wake existing TCP/UDP tasks for re-evaluation.
+    pub rules_changed: tokio::sync::watch::Sender<()>,
     pub rules: ArcSwap<RuleSet>,
     pub cfg: ArcSwap<Config>,
     pub tree: Arc<RwLock<ProcessTree>>,
@@ -126,6 +128,142 @@ pub struct RelayCtx {
 
 /// See [`RelayCtx::direct_dial_override`].
 pub type DialOverride = Arc<dyn Fn(SocketAddr) -> SocketAddr + Send + Sync>;
+
+impl RelayCtx {
+    pub(crate) async fn until_blocked(
+        &self,
+        pid: u32,
+        proto: Protocol,
+        dst: SocketAddr,
+        task: impl std::future::Future<Output = ()>,
+    ) {
+        let mut changed = self.rules_changed.subscribe();
+        tokio::pin!(task);
+        loop {
+            // Subscribe before the first check so a concurrent swap cannot
+            // be missed. Never downgrade an established proxy flow to Direct.
+            let blocked = {
+                let rules = self.rules.load();
+                let excluded = self.excluded.load();
+                let tree = self.tree.read().unwrap_or_else(|e| e.into_inner());
+                matches!(
+                    decide(
+                        &rules,
+                        &tree,
+                        &excluded,
+                        &FlowInfo {
+                            proto,
+                            pid,
+                            dst,
+                            domain: None,
+                        }
+                    ),
+                    Decision::Final(Route::Block, _)
+                )
+            };
+            if blocked {
+                return; // Dropping the future closes both sockets/guards.
+            }
+            tokio::select! {
+                biased;
+                r = changed.changed() => if r.is_err() { return; },
+                _ = &mut task => return,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use q2route_core::config::AppRule;
+    use q2route_core::process_tree::ProcInfo;
+
+    async fn cancels_pending_flow(proto: Protocol) {
+        let ctx = crate::test_util::ctx(Config::seed());
+        ctx.tree.write().unwrap().insert(ProcInfo {
+            pid: 71,
+            parent: 0,
+            start_time: 1,
+            exe: r"C:\Apps\target.exe".into(),
+        });
+        let task_ctx = ctx.clone();
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            task_ctx
+                .until_blocked(71, proto, "203.0.113.1:8443".parse().unwrap(), async {
+                    let _ = ready.send(());
+                    std::future::pending().await
+                })
+                .await;
+        });
+        wait.await.unwrap();
+        let mut cfg = Config::seed();
+        cfg.app_rules = vec![AppRule {
+            app: "target.exe".into(),
+            action: q2route_core::config::Action::Block,
+            enabled: true,
+        }];
+        ctx.rules.store(Arc::new(RuleSet::compile(&cfg).unwrap()));
+        ctx.rules_changed.send_replace(());
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("blocked task must end")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_block_cancels_pending_tcp_without_network() {
+        cancels_pending_flow(Protocol::Tcp).await;
+    }
+
+    #[tokio::test]
+    async fn app_block_cancels_pending_udp_without_network() {
+        cancels_pending_flow(Protocol::Udp).await;
+    }
+
+    #[tokio::test]
+    async fn unrelated_block_does_not_cancel_pending_flow() {
+        let ctx = crate::test_util::ctx(Config::seed());
+        ctx.tree.write().unwrap().insert(ProcInfo {
+            pid: 71,
+            parent: 0,
+            start_time: 1,
+            exe: r"C:\Apps\target.exe".into(),
+        });
+        let task_ctx = ctx.clone();
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let (finish, done) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            task_ctx
+                .until_blocked(
+                    71,
+                    Protocol::Tcp,
+                    "203.0.113.1:443".parse().unwrap(),
+                    async {
+                        let _ = ready.send(());
+                        done.await.unwrap();
+                    },
+                )
+                .await;
+        });
+        wait.await.unwrap();
+        let mut cfg = Config::seed();
+        cfg.app_rules = vec![AppRule {
+            app: "other.exe".into(),
+            action: q2route_core::config::Action::Block,
+            enabled: true,
+        }];
+        ctx.rules.store(Arc::new(RuleSet::compile(&cfg).unwrap()));
+        ctx.rules_changed.send_replace(());
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        finish
+            .send(())
+            .expect("unrelated policy must preserve the task");
+        task.await.unwrap();
+    }
+}
 
 /// Production idle timeout of a relayed connection.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -354,24 +492,27 @@ async fn handle(
         peer,
         token,
     };
-    set_keepalive(&client);
-    if orig.dst.port() == 53 {
-        return handle_dns(client, peer, &orig, ctx).await;
-    }
-    let mut buf = Vec::new();
-    let mut domain = String::new();
-    let mut decision = decide_flow(ctx, &orig, None);
-    if decision == Decision::NeedDomain {
-        let limit = Duration::from_millis(ctx.cfg.load().settings.peek_timeout_ms);
-        domain = peek(&mut client, &mut buf, limit).await.unwrap_or_default();
-        decision = if domain.is_empty() {
-            decide_after_empty_peek(ctx, &orig)
-        } else {
-            // A domain is set, so this cannot be NeedDomain again.
-            decide_flow(ctx, &orig, Some(&domain))
-        };
-    }
-    relay_flow(client, peer, &orig, ctx, &buf, domain, decision).await
+    ctx.until_blocked(orig.pid, Protocol::Tcp, orig.dst, async {
+        set_keepalive(&client);
+        if orig.dst.port() == 53 {
+            return handle_dns(client, peer, &orig, ctx).await;
+        }
+        let mut buf = Vec::new();
+        let mut domain = String::new();
+        let mut decision = decide_flow(ctx, &orig, None);
+        if decision == Decision::NeedDomain {
+            let limit = Duration::from_millis(ctx.cfg.load().settings.peek_timeout_ms);
+            domain = peek(&mut client, &mut buf, limit).await.unwrap_or_default();
+            decision = if domain.is_empty() {
+                decide_after_empty_peek(ctx, &orig)
+            } else {
+                // A domain is set, so this cannot be NeedDomain again.
+                decide_flow(ctx, &orig, Some(&domain))
+            };
+        }
+        relay_flow(client, peer, &orig, ctx, &buf, domain, decision).await
+    })
+    .await;
 }
 
 /// Carries out `decision` for a relayed flow: `buf` (client bytes already
@@ -407,6 +548,13 @@ async fn relay_flow(
                 proto: Protocol::Tcp,
                 pid: orig.pid,
                 exe: exe.clone(),
+                exe_path: ctx
+                    .tree
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(orig.pid)
+                    .map(|p| p.exe.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 local: peer,
                 dst: orig.dst,
                 domain: (!domain.is_empty()).then(|| domain.clone()),
@@ -732,6 +880,13 @@ async fn handle_dns(mut client: TcpStream, peer: SocketAddr, orig: &OriginalDst,
                 proto: Protocol::Tcp,
                 pid: orig.pid,
                 exe: exe.clone(),
+                exe_path: ctx
+                    .tree
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(orig.pid)
+                    .map(|p| p.exe.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 local: peer,
                 dst: orig.dst,
                 domain: Some(name.clone()),
