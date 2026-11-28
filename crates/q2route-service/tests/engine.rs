@@ -15,6 +15,46 @@ fn temp_config(test: &str) -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_app_rules_replaces_live_snapshot_and_persists() {
+    use q2route_core::config::AppRule;
+    let path = temp_config("app-rules-ipc");
+    let engine = Engine::new(path.clone()).unwrap();
+    let rules = vec![AppRule {
+        app: r"C:\Apps\sample.exe".into(),
+        action: Action::Block,
+        enabled: true,
+    }];
+    assert_eq!(
+        engine.handle(Request::SetAppRules(rules.clone())).await,
+        Response::Ok
+    );
+    assert_eq!(engine.snapshot().config.app_rules, rules);
+    assert_eq!(Config::load(&path).unwrap().app_rules, rules);
+    assert!(
+        !engine.is_running(),
+        "capture must never start in this test"
+    );
+    let before = std::fs::read_to_string(&path).unwrap();
+    let invalid = vec![AppRule {
+        app: String::new(),
+        ..rules[0].clone()
+    }];
+    assert!(matches!(
+        engine.handle(Request::SetAppRules(invalid)).await,
+        Response::Error(_)
+    ));
+    assert_eq!(engine.snapshot().config.app_rules, rules);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    assert_eq!(
+        engine.handle(Request::SetAppRules(vec![])).await,
+        Response::Ok
+    );
+    assert!(engine.snapshot().config.app_rules.is_empty());
+    assert!(Config::load(&path).unwrap().app_rules.is_empty());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutations_persist_and_failures_change_nothing() {
     let path = temp_config("mutate");
     let engine = Engine::new(path.clone()).unwrap();
